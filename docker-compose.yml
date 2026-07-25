@@ -44,8 +44,6 @@ services:
     container_name: trading-dashboard
     ports:
       - "80:80"
-    environment:
-      - VITE_OPENALGO_URL=http://localhost:5000
     depends_on:
       openalgo:
         condition: service_healthy
