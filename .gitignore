@@ -3,6 +3,7 @@ dist/
 .env
 .env.local
 *.log
+package-lock.json
 data/raw/
 __pycache__/
 *.pyc

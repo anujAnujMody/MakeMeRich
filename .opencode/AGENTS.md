@@ -11,6 +11,26 @@ Before any action — including clarifying questions, research, or planning:
 
 **Must load when relevant:** git, react-expert, react-best-practices, shadcn, tanstack-query-expert, typescript-advanced, zustand-expert, python, algo-strategy, algo-options, agiprolabs-trading, stock-market-pro, data-science-python, machine-learning
 
+## Skill Discipline
+
+Loaded skill ≠ followed skill. Reference during implementation, not from memory.
+
+### DO
+- Re-read skill's relevant section before writing code it governs
+- Run `grep` for skill-banned patterns on files before editing
+
+### DON'T
+- Implement from memory after loading a skill
+- Skip re-reading because "I already know this"
+
+### Rationalizations (Stop. These are traps.)
+
+| Thought | Truth |
+|---------|-------|
+| "I just loaded it, I remember" | Memory drifts. Re-read the section. |
+| "This is a small edit, no need" | Small edits create the pattern. Re-read. |
+| "I know what forwardRef looks like" | You literally proved otherwise. Re-read. |
+
 ## Stack
 
 | Layer | Tech | Notes |
