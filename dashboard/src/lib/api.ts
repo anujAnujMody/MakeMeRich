@@ -1,6 +1,9 @@
 import type { MarketData, Order, PlaceOrderPayload, PnLAnalysis, Position, Trade, TradeLogFilters } from '@/types'
 
-const API_BASE = import.meta.env.VITE_OPENALGO_URL ?? 'http://localhost:5000'
+// In dev (Vite HMR): default to localhost:5000
+// In prod (nginx proxy): default to relative (same-origin through nginx /api/ route)
+const DEV = import.meta.env.DEV
+const API_BASE = import.meta.env.VITE_OPENALGO_URL ?? (DEV ? 'http://localhost:5000' : '')
 const API_KEY = import.meta.env.VITE_OPENALGO_API_KEY ?? ''
 
 function headers(): Record<string, string> {

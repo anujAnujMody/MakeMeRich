@@ -1,11 +1,94 @@
 services:
   openalgo:
-    image: ghcr.io/marketcalls/openalgo:latest
+    image: marketcalls/openalgo:latest
+    container_name: openalgo
     ports:
       - "5000:5000"
+      - "8765:8765"
     env_file: .env
     volumes:
       - openalgo_data:/app/data
+      - openalgo_logs:/app/log
+      - openalgo_keys:/app/keys
+      - openalgo_strategies:/app/strategies
+      - openalgo_tmp:/app/tmp
+    environment:
+      - OPENBLAS_NUM_THREADS=2
+      - OMP_NUM_THREADS=2
+      - MKL_NUM_THREADS=2
+    shm_size: '256m'
+    restart: unless-stopped
+    networks:
+      - trading-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:5000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: dashboard/Dockerfile
+    container_name: trading-dashboard
+    ports:
+      - "80:80"
+    environment:
+      - VITE_OPENALGO_URL=http://localhost:5000
+    depends_on:
+      openalgo:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - trading-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  engine:
+    build:
+      context: ./engine
+    container_name: trading-engine
+    env_file: .env
+    environment:
+      - OPENBLAS_NUM_THREADS=2
+      - OMP_NUM_THREADS=2
+      - MKL_NUM_THREADS=2
+    volumes:
+      - ./strategies:/app/strategies
+      - ./data:/app/data
+    depends_on:
+      openalgo:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - trading-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   openalgo_data:
+  openalgo_logs:
+  openalgo_keys:
+  openalgo_strategies:
+  openalgo_tmp:
+
+networks:
+  trading-net:
+    driver: bridge
