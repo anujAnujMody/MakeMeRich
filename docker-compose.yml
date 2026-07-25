@@ -1,0 +1,11 @@
+services:
+  openalgo:
+    image: ghcr.io/marketcalls/openalgo:latest
+    ports:
+      - "5000:5000"
+    env_file: .env
+    volumes:
+      - openalgo_data:/app/data
+
+volumes:
+  openalgo_data:
