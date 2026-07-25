@@ -7,3 +7,5 @@ data/raw/
 __pycache__/
 *.pyc
 .venv/
+data/*.db
+.mypy_cache/
