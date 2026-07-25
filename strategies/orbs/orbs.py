@@ -164,7 +164,7 @@ class ORBStrategy(StrategyBase):
 
 def load_ohlcv_from_yf(symbol: str, days: int = 5) -> list[dict[str, Any]]:
     try:
-        import yfinance as yf  # type: ignore[import-untyped]
+        import yfinance as yf
     except ImportError:
         print("yfinance not installed. Run: pip install yfinance")
         sys.exit(1)
