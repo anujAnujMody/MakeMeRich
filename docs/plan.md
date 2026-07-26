@@ -59,9 +59,23 @@ Code written before tests? Delete it. Start over. No "adapting" existing code.
 - Every test must fail first before implementation sees it pass.
 - **Python backend + frontend + engine — all code follows TDD. No exceptions.**
 
-### ML TDD
+### UI TDD (Phase 7)
 
-ML models (Phase 7) test **data contracts + interfaces**, not accuracy:
+Phase 7 tests each page/component with MSW mock data:
+
+| What TDD tests | How |
+|----------------|-----|
+| Page renders all sections | `screen.getByText('Dashboard')` etc |
+| Placeholder replaced | Assert real component mounted, not `<h1>` |
+| Data shows from mock handler | `findByText` waits for rendered mock data |
+| Empty states handled | No data → message, not crash or loading loop |
+| Error states handled | Mock returns error → error message shown |
+| Navigation works | Tab click → correct section visible |
+| Filters work | Filter change → list re-renders with filtered mock data |
+
+### ML TDD (Phase 8)
+
+ML models test **data contracts + interfaces**, not accuracy:
 
 | What TDD tests | How |
 |----------------|-----|
@@ -96,6 +110,7 @@ feat/strategy-orbs          → ORB Python engine + multi-instrument config
 feat/strategy-insights      → React page (signals, PnL, trade log)
 feat/executor               → Engine loop + scheduler on VPS
 feat/self-learning          → Stats page + param optimizer
+feat/full-ui                → Dashboard + Strategies + Orders + Positions pages with MSW mock data
 feat/ml-engine              → Random Forest + instrument suggestion
 ```
 
@@ -167,7 +182,7 @@ STRATEGIES = {
 }
 ```
 
-Future AI: predicts win probability per instrument pre-market, auto-selects top 1-2.
+Phase 8 ML: predicts win probability per instrument pre-market, auto-selects top 1-2.
 
 ## Full File Tree
 
@@ -196,15 +211,27 @@ W:\Trading\
 ├── dashboard/
 │   ├── src/
 │   │   ├── pages/
+│   │   │   ├── DashboardHome.tsx       # [P7] Market overview + daily P&L + summary
+│   │   │   ├── StrategiesPage.tsx      # [P7] Strategy list + config editor
+│   │   │   ├── OrdersPage.tsx          # [P7] Order history + placement form
+│   │   │   ├── PositionsPage.tsx       # [P7] Open positions + square-off
 │   │   │   ├── StrategyInsights.tsx
 │   │   │   └── SelfLearning.tsx
 │   │   ├── components/
+│   │   │   ├── MarketOverview.tsx      # [P7] Live prices widget (mock)
+│   │   │   ├── DailyPnL.tsx            # [P7] Today's P&L card (mock)
+│   │   │   ├── ActivePositions.tsx     # [P7] Compact positions list
+│   │   │   ├── StrategyConfigCard.tsx  # [P7] Config editor with param fields
+│   │   │   ├── OrderForm.tsx           # [P7] Place order form
+│   │   │   ├── OrderTable.tsx          # [P7] Order history with status badges
+│   │   │   ├── PositionCard.tsx        # [P7] Single position with P&L
 │   │   │   ├── InstrumentSelector.tsx
 │   │   │   ├── StrategyCard.tsx
 │   │   │   ├── PnLCard.tsx
 │   │   │   ├── TradeLogTable.tsx
 │   │   │   ├── WinRateChart.tsx
 │   │   │   ├── ParamOptimizer.tsx
+│   │   │   ├── StatCard.tsx
 │   │   │   └── FeatureImportance.tsx
 │   │   ├── hooks/
 │   │   │   ├── useMarketData.ts
@@ -212,14 +239,25 @@ W:\Trading\
 │   │   │   ├── usePositions.ts
 │   │   │   ├── useTradeLog.ts
 │   │   │   ├── usePnLAnalysis.ts
+│   │   │   ├── useLearningStats.ts
+│   │   │   ├── useParamOptimization.ts
+│   │   │   ├── useDashboard.ts         # [P7] Aggregate dashboard data hook
 │   │   │   └── useWebSocket.ts
 │   │   ├── stores/
 │   │   │   ├── instrumentStore.ts
 │   │   │   ├── strategyStore.ts
 │   │   │   ├── uiStore.ts
-│   │   │   └── tradeStore.ts
+│   │   │   ├── tradeStore.ts
+│   │   │   ├── learningStore.ts
+│   │   │   └── dashboardStore.ts       # [P7] Dashboard filter/layout state
 │   │   ├── api/
-│   │   │   └── client.ts
+│   │   │   └── client.ts → lib/api.ts
+│   │   ├── mocks/                      # [P7] Extended mock data for all new pages
+│   │   │   ├── handlers.ts
+│   │   │   ├── server.ts
+│   │   │   ├── browser.ts
+│   │   │   ├── test-utils.tsx
+│   │   │   └── seed.ts                 # [P7] Seed data for mock market/quotes
 │   │   ├── types/
 │   │   │   └── index.ts
 │   │   ├── lib/
@@ -268,7 +306,8 @@ W:\Trading\
 | **4** | `feat/strategy-insights` | **Yes** | React page (signals, PnL, trade log) + tests | 3-4 |
 | **5** | `feat/executor` | **Yes** | Engine loop + scheduler + deploy to VPS + tests | 3 |
 | **6** | `feat/self-learning` | **Yes** | Stats page + param optimizer + tests | 3 |
-| **7** | `feat/ml-engine` | **Yes** | RF model + instrument suggestion + tests | 3-4 |
+| **7** | `feat/full-ui` | **Yes** | Replace all placeholder routes with real pages using MSW mock data. Dashboard home (market overview, daily P&L, active positions), Strategies page (config editor, enable/disable), Orders page (history + placement form), Positions page (open positions + square-off) | 4-6 |
+| **8** | `feat/ml-engine` | **Yes** | RF model + instrument suggestion + tests | 3-4 |
 
 ## Cost Breakdown
 
