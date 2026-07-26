@@ -1,9 +1,10 @@
-import type { MarketData, Order, PlaceOrderPayload, PnLAnalysis, Position, Trade, TradeLogFilters } from '@/types'
+import type { LearningStatsResponse, MarketData, Order, OptimizeRequest, OptimizeResponse, PnLAnalysis, Position, Trade, TradeLogFilters } from '@/types'
 
 // In dev (Vite HMR): default to localhost:5000
 // In prod (nginx proxy): default to relative (same-origin through nginx /api/ route)
 const DEV = import.meta.env.DEV
 const API_BASE = import.meta.env.VITE_OPENALGO_URL ?? (DEV ? 'http://localhost:5000' : '')
+const ENGINE_BASE = import.meta.env.VITE_ENGINE_URL ?? ''  // relative → Vite proxy (dev) or nginx (prod)
 const API_KEY = import.meta.env.VITE_OPENALGO_API_KEY ?? ''
 
 function headers(): Record<string, string> {
@@ -12,14 +13,14 @@ function headers(): Record<string, string> {
   return h
 }
 
-async function get<T>(path: string): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, { headers: headers() })
+async function get<T>(path: string, baseUrl = API_BASE): Promise<T> {
+  const res = await fetch(`${baseUrl}${path}`, { headers: headers() })
   if (!res.ok) throw new Error(`GET ${path}: ${res.status} ${res.statusText}`)
   return res.json()
 }
 
-async function post<T>(path: string, body: unknown): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
+async function post<T>(path: string, body: unknown, baseUrl = API_BASE): Promise<T> {
+  const res = await fetch(`${baseUrl}${path}`, {
     method: 'POST',
     headers: headers(),
     body: JSON.stringify(body),
@@ -73,5 +74,18 @@ export const api = {
       const qs = params.toString()
       return get<PnLAnalysis>(`/api/pnl${qs ? `?${qs}` : ''}`)
     },
+  },
+
+  // Self-learning
+  learning: {
+    stats: (strategy?: string, symbol?: string) => {
+      const params = new URLSearchParams()
+      if (strategy) params.set('strategy', strategy)
+      if (symbol) params.set('symbol', symbol)
+      const qs = params.toString()
+      return get<LearningStatsResponse>(`/api/learning/stats${qs ? `?${qs}` : ''}`, ENGINE_BASE)
+    },
+    optimize: (payload: OptimizeRequest) =>
+      post<OptimizeResponse>('/api/learning/optimize', payload, ENGINE_BASE),
   },
 }

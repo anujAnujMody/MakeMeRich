@@ -54,4 +54,18 @@ export const handlers = [
   }),
 
   http.get('*/api/pnl', () => HttpResponse.json(mockPnL)),
+
+  http.get('*/api/learning/stats', () => HttpResponse.json({
+    overall: { total_trades: 45, win_rate: 62.22, total_pnl: 12500, avg_win: 850, avg_loss: -420, profit_factor: 1.85, max_drawdown: -3200, sharpe: 1.45, winning_trades: 28, losing_trades: 17 },
+    by_strategy: { orbs: { total_trades: 30, win_rate: 66.67, total_pnl: 9800, avg_win: 750, avg_loss: -380, profit_factor: 1.92, max_drawdown: -2100, sharpe: 1.52, winning_trades: 20, losing_trades: 10 } },
+    by_hour: { 9: { total_trades: 25, win_rate: 68.0, total_pnl: 7200, avg_win: 800, avg_loss: -350, profit_factor: 2.1, max_drawdown: -1500, sharpe: 1.6, winning_trades: 17, losing_trades: 8 }, 10: { total_trades: 15, win_rate: 53.33, total_pnl: 3800, avg_win: 700, avg_loss: -450, profit_factor: 1.5, max_drawdown: -1200, sharpe: 1.1, winning_trades: 8, losing_trades: 7 } },
+    by_day: { Monday: { total_trades: 10, win_rate: 60.0, total_pnl: 2800, avg_win: 800, avg_loss: -400, profit_factor: 1.6, max_drawdown: -800, sharpe: 1.3, winning_trades: 6, losing_trades: 4 }, Tuesday: { total_trades: 12, win_rate: 66.67, total_pnl: 4200, avg_win: 900, avg_loss: -380, profit_factor: 2.0, max_drawdown: -900, sharpe: 1.6, winning_trades: 8, losing_trades: 4 } },
+  })),
+
+  http.post('*/api/learning/optimize', () => HttpResponse.json({
+    results: [
+      { params: { target_rr: 1.5, sl_rr: 1.0 }, score: 85.4, win_rate: 66.67, total_pnl: 9800, sharpe: 1.52, total_trades: 30 },
+      { params: { target_rr: 1.0, sl_rr: 1.0 }, score: 72.1, win_rate: 60.0, total_pnl: 7200, sharpe: 1.3, total_trades: 30 },
+    ],
+  })),
 ]

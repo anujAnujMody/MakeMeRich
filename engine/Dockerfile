@@ -16,4 +16,4 @@ COPY . .
 RUN chown -R app:app /app
 
 USER app
-CMD ["python", "executor.py"]
+CMD ["python", "main.py"]

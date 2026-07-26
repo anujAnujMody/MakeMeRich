@@ -130,3 +130,41 @@ export interface TradeLogFilters {
   strategy?: string
   symbol?: string
 }
+
+export interface LearningStats {
+  total_trades: number
+  win_rate: number
+  total_pnl: number
+  avg_win: number
+  avg_loss: number
+  profit_factor: number
+  max_drawdown: number
+  sharpe: number
+  winning_trades: number
+  losing_trades: number
+}
+
+export interface LearningStatsResponse {
+  overall: LearningStats
+  by_strategy: Record<string, LearningStats>
+  by_hour: Record<string, LearningStats>
+  by_day: Record<string, LearningStats>
+}
+
+export interface ParamSuggestion {
+  params: Record<string, number>
+  score: number
+  win_rate: number
+  total_pnl: number
+  sharpe: number
+  total_trades: number
+}
+
+export interface OptimizeResponse {
+  results: ParamSuggestion[]
+}
+
+export interface OptimizeRequest {
+  strategy: string
+  param_grid: Record<string, number[]>
+}
