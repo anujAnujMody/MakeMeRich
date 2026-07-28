@@ -1,21 +1,18 @@
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { queryOptions, useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { api } from '@/lib/api'
-import type { Order, PlaceOrderPayload } from '@/types'
+import type { Order } from '@/types'
 
-export function useOrders() {
-  return useQuery<Order[]>({
+export function ordersQueryOptions() {
+  return queryOptions<Order[]>({
     queryKey: ['orders'],
     queryFn: () => api.orders.list(),
+    staleTime: 5_000,
     refetchInterval: 10_000,
   })
 }
 
-export function usePlaceOrder() {
-  const qc = useQueryClient()
-  return useMutation({
-    mutationFn: (payload: PlaceOrderPayload) => api.orders.place(payload),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['orders'] }),
-  })
+export function useOrders() {
+  return useQuery(ordersQueryOptions())
 }
 
 export function useCancelOrder() {

@@ -26,21 +26,21 @@ describe('TradeLogTable', () => {
     const qtys = await screen.findAllByText('15')
     expect(qtys.length).toBeGreaterThanOrEqual(2)
     expect(await screen.findByText('25')).toBeInTheDocument()
-    expect(await screen.findByText('48,200')).toBeInTheDocument()
+    expect(await screen.findByText('₹48,200.00')).toBeInTheDocument()
   })
 
-  it('shows PnL with green for positive', async () => {
+  it('shows PnL with the shared signed-INR format and gain color for positive', async () => {
     renderWithProviders(<TradeLogTable />)
-    const pnl = await screen.findByText('+750')
+    const pnl = await screen.findByText(/\+₹750\.00/)
     expect(pnl).toBeInTheDocument()
-    expect(pnl).toHaveClass('text-green-600')
+    expect(pnl).toHaveClass('text-gain')
   })
 
-  it('shows PnL with red for negative', async () => {
+  it('shows PnL with the shared signed-INR format (U+2212, not a hyphen) and loss color for negative', async () => {
     renderWithProviders(<TradeLogTable />)
-    const pnl = await screen.findByText('-300')
+    const pnl = await screen.findByText(/−₹300\.00/)
     expect(pnl).toBeInTheDocument()
-    expect(pnl).toHaveClass('text-red-600')
+    expect(pnl).toHaveClass('text-loss')
   })
 
   it('shows loading state', () => {

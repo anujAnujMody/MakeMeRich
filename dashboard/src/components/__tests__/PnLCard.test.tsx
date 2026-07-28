@@ -7,7 +7,9 @@ import { http, HttpResponse } from 'msw'
 describe('PnLCard', () => {
   it('renders total PnL with green color for positive', async () => {
     renderWithProviders(<PnLCard />)
-    expect(await screen.findByText(/₹\s*450/)).toBeInTheDocument()
+    const total = await screen.findByText(/₹\s*450/)
+    expect(total).toBeInTheDocument()
+    expect(total).toHaveClass('text-gain')
   })
 
   it('renders win rate percentage', async () => {

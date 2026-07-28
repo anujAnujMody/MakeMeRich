@@ -1,12 +1,3 @@
-export interface Instrument {
-  symbol: string
-  exchange: string
-  token?: string
-  expiry?: string
-  strike?: number
-  optionType?: string
-}
-
 export interface Position {
   symbol: string
   exchange: string
@@ -112,18 +103,6 @@ export interface PnLAnalysis {
   }
 }
 
-export interface Tick {
-  symbol: string
-  exchange: string
-  ltp: number
-  volume: number
-  timestamp: string
-  open: number
-  high: number
-  low: number
-  close: number
-}
-
 export interface TradeLogFilters {
   dateFrom?: string
   dateTo?: string
@@ -131,24 +110,13 @@ export interface TradeLogFilters {
   symbol?: string
 }
 
-export interface LearningStats {
+export interface EngineStats {
   total_trades: number
   win_rate: number
-  total_pnl: number
-  avg_win: number
-  avg_loss: number
+  avg_profit: number
+  sharpe: number
   profit_factor: number
   max_drawdown: number
-  sharpe: number
-  winning_trades: number
-  losing_trades: number
-}
-
-export interface LearningStatsResponse {
-  overall: LearningStats
-  by_strategy: Record<string, LearningStats>
-  by_hour: Record<string, LearningStats>
-  by_day: Record<string, LearningStats>
 }
 
 export interface ParamSuggestion {
@@ -167,4 +135,354 @@ export interface OptimizeResponse {
 export interface OptimizeRequest {
   strategy: string
   param_grid: Record<string, number[]>
+}
+
+export interface DashboardData {
+  dayPnl: number
+  dayPnlPercent: number
+  winRate: number
+  totalTrades: number
+  activePositions: number
+  positions: Position[]
+  quotes: MarketData[]
+}
+
+export interface EquityPoint {
+  date: string
+  value: number
+}
+
+export interface DailyPnL {
+  date: string
+  pnl: number
+  trades: number
+}
+
+export interface MarketSession {
+  status: 'open' | 'closed' | 'pre-open' | 'post-closed'
+  label: string
+  nextEvent: string
+  currentTime: string
+}
+
+export interface WatchlistItem {
+  symbol: string
+  exchange: string
+  ltp: number
+  change: number
+  changePercent: number
+}
+
+export interface JournalEntry {
+  date: string
+  notes: string
+  emotion: string
+  tags: string[]
+  /** Server-derived from that day's actual closed trades — the client never
+   * invents this value. Absent on a freshly-saved entry until the backend
+   * computes it. */
+  pnl?: number
+}
+
+export interface RejectedOrder extends Order {
+  reason: string
+}
+
+export interface BrokerStatus {
+  connected: boolean
+  name: string
+  latency: number
+  lastPing: string
+  lastSync: string
+  ordersToday: number
+  apiCalls: number
+}
+
+// TradingMode lives in @/types/dashboard-snapshot ('dry-run' | 'live') — this
+// file used to export a second, conflicting 'paper' | 'live' union. Deleted;
+// ModeState was dead code (modeStore.ts defines its own local interface).
+
+/* ─── AI Agent System Types ─── */
+
+export type AutonomyMode = 'full-auto' | 'semi-auto'
+
+export interface AgentConfig {
+  reasoningModel: string
+  cheapModel: string
+  fallbackModel: string
+  openrouterKey: string
+  researchEnabled: boolean
+  researchTime: string
+  maxDailyLoss: number
+  maxPositionSizePct: number
+  maxDrawdownPct: number
+  maxTradesPerDay: number
+  autonomyMode: AutonomyMode
+}
+
+export interface ResearchBrief {
+  date?: string
+  timestamp?: string
+  sentiment?: string
+  summary: string
+  confidence: string | number
+  details: string
+  source?: string
+}
+
+export interface StrategyCard {
+  id: string
+  name: string
+  description: string
+  active: boolean
+  winRate: number
+  weeklyPnl: number
+  confidence: number
+  confidenceTrend: 'up' | 'down' | 'stable'
+  totalTrades: number
+  paused: boolean
+  pauseReason?: string
+  lastActive: string
+  rule: string
+}
+
+export interface TradeExplanation {
+  tradeId: string
+  strategy: string
+  symbol: string
+  transactionType: TransactionType
+  quantity: number
+  entryPrice: number
+  exitPrice: number
+  pnl: number
+  entryTime: string
+  exitTime: string
+  aiConfidenceAtEntry: number
+  aiReason: string
+  mlLearned?: string
+}
+
+export interface DailyRecap {
+  date: string
+  totalPnl: number
+  strategies: { name: string; pnl: number; wins: number; losses: number }[]
+  mlLesson: string
+}
+
+export interface PatternLibraryEntry {
+  pattern: string
+  condition: string
+  winRate: number
+  tradesTested: number
+  lastObserved: string
+  status: 'working' | 'mixed' | 'no-edge'
+}
+
+export interface LearningProgress {
+  winRateTrend: number[]
+  totalStrategiesDiscovered: number
+  totalStrategiesRetired: number
+  avgProfitPerTrade: number
+  dates: string[]
+}
+
+export type TrainingResults =
+  | { status: 'no_training_results' }
+  | {
+      status?: 'ok'
+      accuracy: number
+      feature_importance: Record<string, number>
+      walk_forward: {
+        oos_sharpe: number
+        profit_factor: number
+        total_trades: number
+      }
+      total_samples: number
+      win_rate_pct: number
+    }
+
+export interface DiscoveryQueueItem {
+  name: string
+  progress: number
+  status: 'testing' | 'validating' | 'ready'
+}
+
+export type AgentName = 'research' | 'scanner' | 'discovery' | 'validator' | 'risk' | 'execution' | 'learning'
+
+export interface AgentStatus {
+  name: AgentName
+  label: string
+  status: 'idle' | 'running' | 'success' | 'error'
+  lastRun: string | null
+  message?: string
+}
+
+/* ─── Execution / Paper Trading Types ─── */
+
+export interface ExecutionStatus {
+  running: boolean
+  check_interval_secs: number
+  ml_threshold: number
+  started_at: string | null
+}
+
+export interface PaperTrade {
+  id: string
+  strategy: string
+  symbol: string
+  direction: string
+  entry_price: number
+  exit_price: number | null
+  quantity: number
+  pnl: number | null
+  outcome: string | null
+  entry_time: string
+  exit_time: string | null
+  ml_confidence: number | null
+  type: string | null
+}
+
+export interface PaperPositionCount {
+  count: number
+}
+
+export interface SkippedSignalInfo {
+  id: number
+  strategy: string
+  symbol: string
+  direction: string
+  entry_price: number
+  ml_confidence: number
+  ml_threshold: number
+  reason: string
+  timestamp: string
+}
+
+/* ─── Pipeline / Cycle Status Types ─── */
+
+export type PipelineStage = 'idle' | 'fetching' | 'analyzing' | 'scoring' | 'deciding' | 'exiting'
+
+export interface CycleStatus {
+  stage: PipelineStage
+  running: boolean
+  cycle_start: string | null
+  next_cycle_in_secs: number
+  instruments_processed: number
+  instruments_total: number
+  signals_generated: number
+  trades_placed: number
+  trades_skipped: number
+  last_error: string | null
+  history?: CycleHistoryEntry[]
+}
+
+export interface CycleHistoryEntry {
+  timestamp: string
+  duration_secs: number
+  instruments_processed: number
+  instruments_total: number
+  signals_generated: number
+  trades_placed: number
+  trades_skipped: number
+  error: string | null
+}
+
+/* ─── Strategy Analysis Types ─── */
+
+export interface StrategyCondition {
+  label: string
+  met: boolean
+}
+
+export interface StrategyComboAnalysis {
+  strategy: string
+  symbol: string
+  current_price?: number
+  error?: string
+  reason?: string
+  signal?: string | null
+  // ORBS fields
+  range_high?: number
+  range_low?: number
+  range_mid?: number
+  buffer?: number
+  breakout_level?: number
+  breakdown_level?: number
+  is_breakout?: boolean
+  is_breakdown?: boolean
+  range_pct?: number
+  // VWAP fields
+  vwap?: number
+  deviation_pct?: number
+  rsi?: number
+  deviation_threshold?: number
+  rsi_oversold?: number
+  rsi_overbought?: number
+  is_long?: boolean
+  is_short?: boolean
+  // Shared
+  conditions?: StrategyCondition[]
+}
+
+export interface StrategyAnalysis {
+  snapshot: Record<string, number>
+  vix: number
+  quotes: { symbol: string; ltp: number; change: number; changePercent: number }[]
+  combos: StrategyComboAnalysis[]
+  timestamp: string
+}
+
+export interface MLInfo {
+  status: string
+  accuracy: number
+  threshold: number
+  samples: number
+  trained_on: string
+  walk_forward_sharpe: number
+  profit_factor: number
+  indices: { symbol: string; status: string; bars: number; features: number; pos_pct: number }[]
+}
+
+/* ─── Strategies Config Types ─── */
+
+export interface StrategyInstrumentConfig {
+  symbol: string
+  exchange: string
+  ticker: string
+  active: boolean
+  lot_size: number
+}
+
+export interface StrategyEntry {
+  name: string
+  active: boolean
+  instruments: string[]
+  params: Record<string, unknown>
+}
+
+export interface StrategiesFile {
+  check_interval_secs: number
+  ml_threshold: number
+  max_trades_per_day: number
+  risk_per_trade_pct: number
+  max_daily_loss_pct: number
+  max_drawdown_pct: number
+  max_concurrent_positions: number
+  instruments: StrategyInstrumentConfig[]
+  strategies: StrategyEntry[]
+}
+
+/* ─── Signal Feed Types ─── */
+
+export interface SignalFeedItem {
+  id: string
+  type: 'placed' | 'skipped'
+  strategy: string
+  symbol: string
+  direction: string
+  entry_price: number
+  quantity?: number
+  ml_confidence: number
+  reason?: string
+  timestamp: string
 }

@@ -1,5 +1,7 @@
 import { usePnLAnalysis } from '@/hooks/usePnLAnalysis'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { formatSignedINR, formatINR } from '@/lib/currency'
+import { pnlToneClass } from '@/lib/pnlIntensity'
 
 export function PnLCard() {
   const { data, isLoading, isError } = usePnLAnalysis()
@@ -8,16 +10,14 @@ export function PnLCard() {
   if (isError) return <div>Error loading PnL</div>
   if (!data || data.totalTrades === 0) return <div>No PnL data</div>
 
-  const isPositive = data.totalPnl >= 0
-
   return (
     <Card>
       <CardHeader>
         <CardTitle>PnL Summary</CardTitle>
       </CardHeader>
       <CardContent className="space-y-2">
-        <div className={`text-2xl font-bold ${isPositive ? 'text-green-600' : 'text-red-600'}`}>
-          ₹{data.totalPnl}
+        <div className={`font-numeric text-2xl font-bold ${pnlToneClass(data.totalPnl)}`}>
+          {formatSignedINR(data.totalPnl)}
         </div>
         <div className="text-sm text-muted-foreground">
           Win Rate: {data.winRate.toFixed(2)}%
@@ -29,10 +29,10 @@ export function PnLCard() {
           Winning: {data.winningTrades} / Losing: {data.losingTrades}
         </div>
         <div className="text-sm text-muted-foreground">
-          Avg Win: ₹{data.avgWin} / Avg Loss: ₹{data.avgLoss}
+          Avg Win: {formatINR(data.avgWin)} / Avg Loss: {formatINR(data.avgLoss)}
         </div>
         <div className="text-sm text-muted-foreground">
-          Max Drawdown: ₹{data.maxDrawdown}
+          Max Drawdown: {formatINR(data.maxDrawdown)}
         </div>
       </CardContent>
     </Card>
