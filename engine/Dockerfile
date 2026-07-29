@@ -2,18 +2,21 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-ENV OPENBLAS_NUM_THREADS=2 \
-    OMP_NUM_THREADS=2 \
-    MKL_NUM_THREADS=2
+# System deps for building wheels (pyarrow etc pull prebuilt wheels on
+# linux/amd64 for py3.12, but keep build-essential for anything that doesn't).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+COPY pyproject.toml ./
+# Editable-install target needs the package present before `pip install`.
+COPY te ./te
+COPY alembic ./alembic
+COPY alembic.ini ./
+COPY config ./config
 
-RUN addgroup --system --gid 1001 app && \
-    adduser --system --uid 1001 --ingroup app app
+RUN pip install --no-cache-dir .
 
-COPY . .
-RUN chown -R app:app /app
+EXPOSE 8000
 
-USER app
-CMD ["python", "main.py"]
+CMD ["uvicorn", "te.api.main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -1,94 +1,58 @@
 services:
-  openalgo:
-    image: marketcalls/openalgo:latest
-    container_name: openalgo
-    ports:
-      - "5000:5000"
-      - "8765:8765"
-    env_file: .env
-    volumes:
-      - openalgo_data:/app/data
-      - openalgo_logs:/app/log
-      - openalgo_keys:/app/keys
-      - openalgo_strategies:/app/strategies
-      - openalgo_tmp:/app/tmp
-    environment:
-      - OPENBLAS_NUM_THREADS=2
-      - OMP_NUM_THREADS=2
-      - MKL_NUM_THREADS=2
-    shm_size: '256m'
-    restart: unless-stopped
-    networks:
-      - trading-net
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:5000/"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 15s
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-    deploy:
-      resources:
-        limits:
-          memory: 512M
-          cpus: '0.5'
-
   dashboard:
     build:
       context: .
-      dockerfile: dashboard/Dockerfile
-    container_name: trading-dashboard
+      dockerfile: Dockerfile
     ports:
-      - "80:80"
+      - "8080:80"
     depends_on:
       openalgo:
-        condition: service_healthy
+        condition: service_started
+      engine:
+        condition: service_started
     restart: unless-stopped
-    networks:
-      - trading-net
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+
+  openalgo:
+    image: marketcalls/openalgo:latest
+    ports:
+      - "5000:5000"
+    env_file:
+      - .env
+    shm_size: 512m
+    volumes:
+      - ./db:/app/db
+      - ./log:/app/log
+      - ./strategies:/app/strategies
+      - ./.env:/app/.env:ro
+    environment:
+      - FLASK_HOST_IP=0.0.0.0
+      - WEBSOCKET_HOST=0.0.0.0
+      - ZMQ_HOST=0.0.0.0
+      - MASTER_CONTRACT_CUTOFF_TIME=23:59
+    restart: unless-stopped
 
   engine:
     build:
       context: ./engine
-    container_name: trading-engine
+      dockerfile: Dockerfile
     ports:
       - "8000:8000"
-    env_file: .env
     environment:
-      - OPENBLAS_NUM_THREADS=2
-      - OMP_NUM_THREADS=2
-      - MKL_NUM_THREADS=2
+      - TE_ENV=${TE_ENV:-dev}
+      - TE_DATABASE_URL=${TE_DATABASE_URL:-sqlite:////app/data/dev.db}
+      - TE_BAR_STORE_PATH=${TE_BAR_STORE_PATH:-/app/data/bars}
+      - TE_OPENALGO_HOST=${TE_OPENALGO_HOST:-http://openalgo:5000}
+      # OpenAlgo's WebSocket endpoint. Configured separately from
+      # TE_OPENALGO_HOST on purpose — the REST host already carries its own
+      # port, and the two can be different hosts entirely in production.
+      # The `openalgo` service publishes WS on 8765 (see ZMQ/WS config above).
+      - TE_OPENALGO_WS_HOST=${TE_OPENALGO_WS_HOST:-ws://openalgo:8765}
+      - TE_OPENALGO_API_KEY=${OPENALGO_API_KEY}
+      - TE_CORS_ORIGINS=${TE_CORS_ORIGINS:-["http://localhost:8080"]}
     volumes:
-      - ./strategies:/app/strategies
-      - ./data:/app/data
-    depends_on:
-      openalgo:
-        condition: service_healthy
+      - engine-data:/app/data
     restart: unless-stopped
-    networks:
-      - trading-net
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
 
 volumes:
-  openalgo_data:
-  openalgo_logs:
-  openalgo_keys:
-  openalgo_strategies:
-  openalgo_tmp:
+  engine-data:
 
-networks:
-  trading-net:
-    driver: bridge

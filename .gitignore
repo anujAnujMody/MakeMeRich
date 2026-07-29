@@ -10,3 +10,21 @@ __pycache__/
 .venv/
 data/*.db
 .mypy_cache/
+# Contains the OpenAlgo API key (see Phase 0 report) — never commit.
+opencode.json
+
+# Personal/local overrides — see .claude skills' update-config guidance.
+.claude/settings.local.json
+
+# OpenAlgo runtime state (mounted volumes; regenerated on container start).
+db/
+log/
+
+# Python build/test artifacts.
+.pytest_cache/
+.coverage
+*.egg-info/
+
+# Leftover data/model artifacts from the pre-rewrite engine.
+data/
+engine/data/

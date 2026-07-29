@@ -1,0 +1,398 @@
+"""`te.engine.cycle` — the decision loop: fetch -> analyze -> risk -> decide
+-> act, wired against `te.broker.simulated.SimulatedBroker` for paper mode.
+Proves the plan's two structural guarantees end to end: every skip
+(including a zero-lots sizing rejection) persists a `SkippedSignal` with a
+real reason, and a closed trade's P&L is always net of the real
+`CostModel`."""
+
+from __future__ import annotations
+
+import datetime as dt
+from decimal import Decimal
+from pathlib import Path
+
+import pandas as pd
+import pytest
+
+from te.broker.simulated import SimulatedBroker
+from te.data.barstore import BAR_COLUMNS, BarStore
+from te.data.charges_loader import load_charge_rate_table
+from te.domain.clock import IST
+from te.domain.costs import CostModel, select_rates
+from te.domain.money import Paise
+from te.engine.cycle import CycleConfig, run_entry_cycle, run_exit_cycle
+from te.execution.manager import ExecutionManager
+from te.execution.store import OrderEventStore
+from te.persistence.db import make_engine, make_session_factory
+from te.persistence.models import Base, OpenPositionRow, SkippedSignalRow, TradeRow
+from te.risk.killswitch import throttle as throttle_killswitch
+from te.risk.limits import RiskLimitsConfig
+
+_CHARGES_PATH = Path(__file__).resolve().parents[2] / "config" / "charges.yaml"
+INSTRUMENT = "NIFTY30JUN2626500CE"
+EXCHANGE = "NFO"
+ON = dt.date(2026, 7, 29)
+
+
+class _NoLimiter:
+    def acquire(self, n: int = 1) -> None:
+        pass
+
+
+def _bar(event_ts: dt.datetime, *, o: float, h: float, low: float, c: float, v: int) -> dict[str, object]:
+    return {
+        "symbol": INSTRUMENT,
+        "exchange": EXCHANGE,
+        "event_ts": event_ts,
+        "interval": "1m",
+        "o": o,
+        "h": h,
+        "l": low,
+        "c": c,
+        "v": v,
+        "oi": 0,
+        "ingested_at": event_ts,
+        "source": "test",
+    }
+
+
+def _open(minute: int) -> dt.datetime:
+    base = dt.datetime(2026, 7, 29, 9, 15, tzinfo=IST)
+    return base + dt.timedelta(minutes=minute)
+
+
+@pytest.fixture
+def cost_model() -> CostModel:
+    table = load_charge_rate_table(_CHARGES_PATH)
+    return CostModel(select_rates(table, ON))
+
+
+@pytest.fixture
+def session_factory(tmp_path: Path):  # noqa: ANN201
+    engine = make_engine(f"sqlite:///{tmp_path / 'cycle_test.db'}")
+    Base.metadata.create_all(engine)
+    return make_session_factory(engine)
+
+
+@pytest.fixture
+def execution(session_factory, cost_model: CostModel):  # noqa: ANN001, ANN201
+    broker = SimulatedBroker(cost_model=cost_model, on=ON)
+    store = OrderEventStore(session_factory)
+    manager = ExecutionManager(session_factory, store, broker, _NoLimiter())
+    return manager
+
+
+def _config(**overrides: object) -> CycleConfig:
+    defaults: dict[str, object] = {
+        "mode": "paper",
+        "strategy_name": "orb",
+        "instruments": (INSTRUMENT,),
+        "exchange": EXCHANGE,
+        "lot_size": 65,
+        "capital": Paise(2_500_000),
+        "risk_budget_pct": Decimal(2),
+        "min_edge_multiple": Decimal("1.2"),
+        "stop_distance": Paise(700),
+        "target_distance": Paise(1_500),
+        "trailing_distance": Paise(300),
+        "max_hold": dt.timedelta(hours=3),
+        "hard_exit_by": dt.time(15, 20),
+        "risk_limits": RiskLimitsConfig(
+            max_daily_loss_paise=Paise(10_000_00), max_concurrent_positions=5, max_trades_per_day=20
+        ),
+    }
+    defaults.update(overrides)
+    return CycleConfig(**defaults)  # type: ignore[arg-type]
+
+
+def _breakout_store(tmp_path: Path) -> BarStore:
+    store = BarStore(tmp_path / "bars")
+    rows = [
+        _bar(_open(0), o=30, h=32, low=28, c=30, v=1_000),
+        _bar(_open(1), o=30, h=31, low=29, c=30.2, v=1_000),
+        _bar(_open(2), o=30, h=31, low=29, c=30.1, v=1_000),
+        _bar(_open(15), o=30, h=38, low=30, c=36, v=2_000),  # confirmed upside breakout, close=36 -> premium 3600p
+    ]
+    store.append(pd.DataFrame(rows, columns=list(BAR_COLUMNS)))
+    return store
+
+
+def _no_signal_store(tmp_path: Path) -> BarStore:
+    store = BarStore(tmp_path / "bars_empty")
+    return store
+
+
+def test_entry_cycle_opens_a_position_with_an_exit_plan_on_confirmed_breakout(
+    session_factory,
+    execution,
+    cost_model: CostModel,
+    tmp_path: Path,  # noqa: ANN001
+) -> None:
+    store = _breakout_store(tmp_path)
+    config = _config()
+    as_of = _open(16)
+
+    run_entry_cycle(
+        session_factory=session_factory,
+        store=store,
+        execution=execution,
+        cost_model=cost_model,
+        config=config,
+        as_of=as_of,
+    )
+
+    with session_factory() as session:
+        rows = session.query(OpenPositionRow).all()
+        assert len(rows) == 1
+        row = rows[0]
+        assert row.closed_at is None
+        assert row.stop_paise > 0
+        assert row.target_paise > row.entry_premium_paise
+        assert row.trailing_distance_paise == 300
+
+
+def test_skipped_signal_persisted_with_real_reason(
+    session_factory,
+    execution,
+    cost_model: CostModel,
+    tmp_path: Path,  # noqa: ANN001
+) -> None:
+    store = _no_signal_store(tmp_path)
+    config = _config()
+    as_of = _open(1)
+
+    run_entry_cycle(
+        session_factory=session_factory,
+        store=store,
+        execution=execution,
+        cost_model=cost_model,
+        config=config,
+        as_of=as_of,
+    )
+
+    with session_factory() as session:
+        skips = session.query(SkippedSignalRow).all()
+        assert len(skips) == 1
+        assert skips[0].reason  # non-empty, real
+        assert "opening range" in skips[0].reason
+
+
+def test_skipped_signal_persisted_when_sizing_rejects_zero_lots(
+    session_factory,
+    execution,
+    cost_model: CostModel,
+    tmp_path: Path,  # noqa: ANN001
+) -> None:
+    """A traded ORB verdict whose sizing rejects (lots=0) must STILL
+    persist a SkippedSignal with the real rejection reason — the exact bug
+    class the plan calls out."""
+    store = _breakout_store(tmp_path)
+    # min_edge_multiple absurdly high -> guaranteed cost-vs-edge rejection.
+    config = _config(min_edge_multiple=Decimal(1000))
+    as_of = _open(16)
+
+    run_entry_cycle(
+        session_factory=session_factory,
+        store=store,
+        execution=execution,
+        cost_model=cost_model,
+        config=config,
+        as_of=as_of,
+    )
+
+    with session_factory() as session:
+        assert session.query(OpenPositionRow).count() == 0
+        skips = session.query(SkippedSignalRow).all()
+        assert len(skips) == 1
+        assert "round-trip cost" in skips[0].reason
+
+
+def test_paper_trade_pnl_is_net(
+    session_factory,
+    execution,
+    cost_model: CostModel,
+    tmp_path: Path,  # noqa: ANN001
+) -> None:
+    """A full open -> exit cycle through SimulatedBroker: the trade's
+    `net_pnl_paise` must equal `gross - costs` computed via the real
+    CostModel, and no exposed field anywhere is a bare gross `pnl`."""
+    store = _breakout_store(tmp_path)
+    config = _config()
+    entry_at = _open(16)
+
+    run_entry_cycle(
+        session_factory=session_factory,
+        store=store,
+        execution=execution,
+        cost_model=cost_model,
+        config=config,
+        as_of=entry_at,
+    )
+
+    with session_factory() as session:
+        open_row = session.query(OpenPositionRow).one()
+        entry_premium = open_row.entry_premium_paise
+        target = open_row.target_paise
+
+    exit_at = entry_at + dt.timedelta(minutes=5)
+    closed = run_exit_cycle(
+        session_factory=session_factory,
+        execution=execution,
+        cost_model=cost_model,
+        current_premium=lambda row: Paise(target),  # hits target immediately
+        as_of=exit_at,
+    )
+    assert len(closed) == 1
+
+    with session_factory() as session:
+        assert session.query(OpenPositionRow).filter(OpenPositionRow.closed_at.is_(None)).count() == 0
+        trade = session.query(TradeRow).one()
+
+    qty = trade.lots * trade.lot_size
+    costs = cost_model.round_trip(
+        entry_premium=Paise(entry_premium), exit_premium=Paise(target), qty=qty, exchange=EXCHANGE, on=exit_at.date()
+    )
+    expected_gross = (target - entry_premium) * qty
+    expected_net = expected_gross - costs.total
+
+    assert trade.gross_pnl_paise == expected_gross
+    assert trade.costs_paise == costs.total
+    assert trade.net_pnl_paise == expected_net
+    assert trade.net_pnl_paise == trade.gross_pnl_paise - trade.costs_paise
+    assert trade.exit_reason == "target"
+
+    # No bare `pnl` column anywhere on the TradeRow model.
+    assert not hasattr(trade, "pnl")
+
+    # The stop/target the position was OPENED with survive onto the closed
+    # trade. They live on `OpenPositionRow`, which is gone once the position
+    # closes, so without these columns a post-hoc review of "what were we
+    # actually risking?" is unanswerable from the trade record alone.
+    with session_factory() as session:
+        closed_row = session.query(OpenPositionRow).one()
+    assert trade.stop_paise == closed_row.stop_paise
+    assert trade.target_paise == closed_row.target_paise
+    # `stop_paise` is the ORIGINAL stop, not the trailed `current_stop_paise`.
+    assert trade.stop_paise is not None
+
+
+def test_throttle_multiplier_reaches_sizing(
+    session_factory,
+    execution,
+    cost_model: CostModel,
+    tmp_path: Path,  # noqa: ANN001
+) -> None:
+    """A Phase 7 throttle (`te.risk.killswitch.throttle()`) must reduce the
+    effective lot count `run_entry_cycle` actually opens a position with,
+    vs an identical run with no throttle set — without changing
+    `size_position()`'s own signature/behaviour (see
+    `tests/risk/test_sizing.py` for proof that is unaffected)."""
+    store = _breakout_store(tmp_path)
+    # Large enough capital/risk budget that the baseline (untouched) sizing
+    # comes out to more than 1 lot, so a 0.5x throttle multiplier is a real,
+    # observable reduction rather than a reject-to-zero.
+    config = _config(capital=Paise(10_000_000))
+    as_of = _open(16)
+
+    run_entry_cycle(
+        session_factory=session_factory,
+        store=store,
+        execution=execution,
+        cost_model=cost_model,
+        config=config,
+        as_of=as_of,
+    )
+    with session_factory() as session:
+        baseline_row = session.query(OpenPositionRow).one()
+    baseline_lots = baseline_row.lots
+    assert baseline_lots > 1  # otherwise this test can't observe a reduction
+
+    throttled_engine = make_engine(f"sqlite:///{tmp_path / 'throttled.db'}")
+    Base.metadata.create_all(throttled_engine)
+    throttled_session_factory = make_session_factory(throttled_engine)
+    throttled_broker = SimulatedBroker(cost_model=cost_model, on=ON)
+    throttled_execution = ExecutionManager(
+        throttled_session_factory, OrderEventStore(throttled_session_factory), throttled_broker, _NoLimiter()
+    )
+    with throttled_session_factory() as session:
+        throttle_killswitch(session, "Tier 0 slippage monitor")
+        session.commit()
+
+    run_entry_cycle(
+        session_factory=throttled_session_factory,
+        store=store,
+        execution=throttled_execution,
+        cost_model=cost_model,
+        config=config,
+        as_of=as_of,
+    )
+    with throttled_session_factory() as session:
+        throttled_row = session.query(OpenPositionRow).one()
+    assert throttled_row.lots < baseline_lots
+    assert throttled_row.lots > 0
+
+
+def test_exit_cycle_skips_the_db_write_when_the_trailing_stop_did_not_ratchet(
+    session_factory,  # noqa: ANN001
+    execution,  # noqa: ANN001
+    cost_model: CostModel,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The no-exit branch runs once per open position per cycle; the stop
+    only ratchets when price makes a new favourable extreme, so the common
+    case must not issue an UPDATE at all. Proven by counting calls to
+    `update_trailing_stop` — a flat mark cannot move the stop."""
+    import te.engine.cycle as cycle_module
+
+    store = _breakout_store(tmp_path)
+    entry_at = _open(16)
+    run_entry_cycle(
+        session_factory=session_factory,
+        store=store,
+        execution=execution,
+        cost_model=cost_model,
+        config=_config(),
+        as_of=entry_at,
+    )
+
+    with session_factory() as session:
+        open_row = session.query(OpenPositionRow).one()
+        entry_premium = open_row.entry_premium_paise
+        stop_before = open_row.current_stop_paise
+
+    calls: list[int] = []
+    real_update = cycle_module.update_trailing_stop
+
+    def _counting_update(session, row, new_stop):  # noqa: ANN001, ANN202
+        calls.append(int(new_stop))
+        return real_update(session, row, new_stop)
+
+    monkeypatch.setattr(cycle_module, "update_trailing_stop", _counting_update)
+
+    def _cycle(mark: int, minute: int) -> list[str]:
+        return run_exit_cycle(
+            session_factory=session_factory,
+            execution=execution,
+            cost_model=cost_model,
+            current_premium=lambda row: Paise(mark),
+            as_of=entry_at + dt.timedelta(minutes=minute),
+        )
+
+    # First cycle at the entry mark DOES ratchet (initial stop is
+    # `stop_distance` below entry, the trailing distance is tighter), so the
+    # guard is not simply disabling trailing stops.
+    assert _cycle(entry_premium, 1) == []
+    assert len(calls) == 1
+    with session_factory() as session:
+        ratcheted = session.query(OpenPositionRow).one().current_stop_paise
+    assert ratcheted > stop_before
+
+    # Every subsequent cycle at the SAME mark makes no new favourable
+    # extreme -> nothing to write.
+    assert _cycle(entry_premium, 2) == []
+    assert _cycle(entry_premium, 3) == []
+    assert len(calls) == 1, "unchanged trailing stop must not be written back"
+
+    with session_factory() as session:
+        assert session.query(OpenPositionRow).one().current_stop_paise == ratcheted

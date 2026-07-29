@@ -4,3 +4,7 @@ dist
 .env
 __pycache__
 *.pyc
+.pytest_cache
+engine
+db
+log

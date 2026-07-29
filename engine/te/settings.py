@@ -1,0 +1,79 @@
+"""Application settings — pydantic-settings, env_prefix="TE_".
+
+`env` and `database_url` have NO defaults: a missing environment variable
+must raise a `ValidationError` at instantiation, never silently fall back to
+a default (a silent default is how tests end up writing into prod — see the
+plan's "Database" section).
+"""
+
+import datetime as dt
+from decimal import Decimal
+from pathlib import Path
+from typing import Literal, Self
+
+from pydantic import SecretStr, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="TE_", extra="ignore")
+
+    env: Literal["dev", "prod"]
+    database_url: str
+
+    bar_store_path: Path
+    openalgo_host: str
+
+    #: OpenAlgo's WebSocket endpoint, e.g. `ws://openalgo:8765`. Configured
+    #: EXPLICITLY and separately from `openalgo_host` — deliberately never
+    #: derived from it. `openalgo_host` already carries its own port
+    #: (`http://openalgo:5000`), so scheme-swapping string surgery plus a
+    #: `:8765` suffix yields the invalid two-port `ws://openalgo:5000:8765`;
+    #: and in a real deployment the REST and WS endpoints may sit on
+    #: entirely different hostnames, ports and paths behind a proxy.
+    #:
+    #: Required, with NO default, for the same reason `env`/`database_url`
+    #: are: a silently-wrong endpoint here means the recorder simply never
+    #: connects, no bars are ever written, and every strategy quietly
+    #: no-ops — a failure that is invisible until someone notices the
+    #: missing data. A missing env var must fail loudly at startup instead.
+    openalgo_ws_host: str
+
+    openalgo_api_key: SecretStr
+    cors_origins: list[str]
+
+    charges_path: Path = Path("config/charges.yaml")
+    max_orders_per_second: int = 5
+
+    # Paper-trading cycle job (te.engine.scheduler) — an intraday ORB
+    # strategy, so the default interval is short. `paper_cycle_instruments`
+    # empty means the job is registered but is a documented per-instrument
+    # no-op (never a hardcoded literal instrument list) until configured.
+    paper_cycle_enabled: bool = True
+    paper_cycle_interval_minutes: int = 1
+    paper_cycle_instruments: tuple[str, ...] = ()
+    paper_cycle_exchange: str = "NFO"
+    paper_cycle_strategy: str = "orb"
+    paper_cycle_lot_size: int = 65
+    paper_cycle_capital_paise: int = 2_500_000
+    paper_cycle_risk_budget_pct: Decimal = Decimal(2)
+    paper_cycle_min_edge_multiple: Decimal = Decimal("1.2")
+    paper_cycle_stop_distance_paise: int = 700
+    paper_cycle_target_distance_paise: int = 1_500
+    paper_cycle_trailing_distance_paise: int | None = 300
+    paper_cycle_max_hold_minutes: int = 180
+    paper_cycle_hard_exit_by: dt.time = dt.time(15, 20)
+    paper_cycle_max_daily_loss_paise: int = 1_000_000
+    paper_cycle_max_concurrent_positions: int = 5
+    paper_cycle_max_trades_per_day: int = 20
+
+    @model_validator(mode="after")
+    def _cross_env_guard(self) -> Self:
+        """Rejects `env="dev"` with "prod" in `database_url` and vice versa —
+        catches transposed dev/prod DB files before they can be used."""
+        url_lower = self.database_url.lower()
+        if self.env == "dev" and "prod" in url_lower:
+            raise ValueError(f"TE_ENV=dev but TE_DATABASE_URL looks like a prod database: {self.database_url!r}")
+        if self.env == "prod" and "dev" in url_lower:
+            raise ValueError(f"TE_ENV=prod but TE_DATABASE_URL looks like a dev database: {self.database_url!r}")
+        return self

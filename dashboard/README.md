@@ -22,13 +22,11 @@ Open http://localhost:5173 — login with any API key (mocks active in dev).
 
 ## Backend Setup
 
-Copy `.env.example` to `.env` and configure:
-
-```env
-VITE_OPENALGO_URL=http://localhost:5000
-VITE_OPENALGO_API_KEY=your-key
-VITE_ENGINE_URL=http://localhost:8000
-```
+The dashboard has no build-time env vars of its own — it talks to the engine
+purely through relative `/api/*` calls, proxied by nginx in Docker (or MSW
+mocks in `yarn dev`). Backend configuration lives at the repo root: copy
+`W:\Trading\.env.example` to `W:\Trading\.env` and fill it in — see that
+file's comments for what's required.
 
 ## Docker
 

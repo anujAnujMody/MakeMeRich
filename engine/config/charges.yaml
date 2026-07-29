@@ -1,0 +1,21 @@
+# Cost rates for te/domain/costs.py, versioned by `effective_from` — never
+# constants in code, so a backtest spanning a rate change correctly uses the
+# rate that was in force on each trade date. `te/data/charges_loader.py`
+# reads this file, sorts by `effective_from`, and picks the latest row with
+# `effective_from <= trade_date`.
+#
+# verify_charges.py (later phase) prints this table's age; past 90 days the
+# engine should log loudly and set a `staleRates` flag on `/api/engine/health`.
+
+- effective_from: 2026-04-01
+  verified_at: 2026-07-29
+  source: "https://zerodha.com/charges"
+  brokerage_per_executed_order_paise: 2000
+  stt_sell_bps: 15.0
+  stt_exercise_intrinsic_bps: 15.0
+  exchange_txn_bps:
+    NFO: 3.553
+    BFO: 3.25
+  sebi_bps: 0.01
+  gst_pct: 18.0
+  stamp_buy_bps: 0.3

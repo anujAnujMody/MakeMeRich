@@ -1,0 +1,148 @@
+"""`size_position()` — turns a signal's premium/stop/target into a lot count,
+or a real, always-present reason why it can't be sized. This is the exact
+bug class the plan calls out from the old engine: a sizing bug meant it had
+never placed a single trade, silently. `lots=0` without a `rejected_reason`
+is a bug by definition here — every return path that yields `lots=0` sets
+`rejected_reason`, and `lots > 0` always leaves it `None`.
+
+Two independent gates, both real:
+1. **Cost-vs-edge floor** — the gross edge per lot ((target - premium) x
+   lot_size) must be at least `min_edge_multiple` times the real round-trip
+   cost (computed via the actual `CostModel`, never estimated) or the trade
+   is rejected outright, regardless of capital/risk budget. This is the
+   plan's "₹20-premium trap" gate — fixed ₹20/order brokerage makes cheap
+   premiums structurally unprofitable no matter how many lots you buy.
+2. **Risk-budget sizing** — `lots` is however many lots fit inside
+   `capital x risk_budget_pct` given the real per-lot loss-at-stop
+   ((premium - stop) x lot_size), further capped by how many lots the
+   capital can actually afford to buy outright (no leverage assumed —
+   directional option BUYING only, per the plan).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import date
+from decimal import Decimal
+
+from te.domain.costs import CostModel
+from te.domain.money import Paise
+
+
+@dataclass(frozen=True)
+class SizingResult:
+    lots: int
+    risk_paise: Paise
+    round_trip_cost_paise: Paise
+    cost_as_pct_of_risk: Decimal
+    rejected_reason: str | None
+
+    def __post_init__(self) -> None:
+        if self.lots == 0 and self.rejected_reason is None:
+            raise ValueError(
+                "SizingResult(lots=0) must always carry a rejected_reason — a silent zero-lot "
+                "result is the exact bug class that meant the old engine never placed a trade"
+            )
+        if self.lots > 0 and self.rejected_reason is not None:
+            raise ValueError(
+                f"SizingResult(lots={self.lots}) must not carry a rejected_reason, got {self.rejected_reason!r}"
+            )
+
+
+def _rejected(*, round_trip_cost_paise: Paise, reason: str) -> SizingResult:
+    return SizingResult(
+        lots=0,
+        risk_paise=Paise(0),
+        round_trip_cost_paise=round_trip_cost_paise,
+        cost_as_pct_of_risk=Decimal(0),
+        rejected_reason=reason,
+    )
+
+
+def size_position(
+    *,
+    capital: Paise,
+    risk_budget_pct: Decimal,
+    premium: Paise,
+    stop_premium: Paise,
+    target_premium: Paise,
+    lot_size: int,
+    costs: CostModel,
+    exchange: str,
+    on: date,
+    min_edge_multiple: Decimal,
+) -> SizingResult:
+    """Rejects (lots=0, rejected_reason set) when the gross edge per lot is
+    below `round_trip_cost x min_edge_multiple`, when the risk budget can't
+    afford even one lot, or when capital can't afford even one lot outright.
+    Never returns `lots=0` without a `rejected_reason` — see
+    `SizingResult.__post_init__`."""
+    per_lot_round_trip = costs.round_trip(
+        entry_premium=premium, exit_premium=target_premium, qty=lot_size, exchange=exchange, on=on
+    ).total
+    gross_edge_per_lot = (target_premium - premium) * lot_size
+
+    if gross_edge_per_lot <= 0:
+        return _rejected(
+            round_trip_cost_paise=per_lot_round_trip,
+            reason=f"target_premium ({target_premium}p) is not above premium ({premium}p) — no positive edge",
+        )
+
+    required_edge = Decimal(per_lot_round_trip) * min_edge_multiple
+    if Decimal(gross_edge_per_lot) < required_edge:
+        return _rejected(
+            round_trip_cost_paise=per_lot_round_trip,
+            reason=(
+                f"gross edge per lot ({gross_edge_per_lot}p) < round-trip cost ({per_lot_round_trip}p) "
+                f"x min_edge_multiple ({min_edge_multiple}) = {required_edge}p"
+            ),
+        )
+
+    risk_per_lot = (premium - stop_premium) * lot_size
+    if risk_per_lot <= 0:
+        return _rejected(
+            round_trip_cost_paise=per_lot_round_trip,
+            reason=f"stop_premium ({stop_premium}p) is not below premium ({premium}p) — no real stop-loss risk defined",
+        )
+
+    risk_budget_paise = int(Decimal(capital) * risk_budget_pct / Decimal(100))
+    lots_by_risk = risk_budget_paise // risk_per_lot
+    if lots_by_risk < 1:
+        return _rejected(
+            round_trip_cost_paise=per_lot_round_trip,
+            reason=(
+                f"risk budget ({risk_budget_paise}p = {risk_budget_pct}% of capital {capital}p) is insufficient "
+                f"for even 1 lot at risk_per_lot={risk_per_lot}p"
+            ),
+        )
+
+    lot_cost = premium * lot_size
+    lots_by_capital = capital // lot_cost if lot_cost > 0 else 0
+    if lots_by_capital < 1:
+        return _rejected(
+            round_trip_cost_paise=per_lot_round_trip,
+            reason=f"capital ({capital}p) cannot afford even 1 lot at premium={premium}p x lot_size={lot_size}",
+        )
+
+    lots = min(lots_by_risk, lots_by_capital)
+    if lots < 1:
+        return _rejected(
+            round_trip_cost_paise=per_lot_round_trip,
+            reason="sized to fewer than 1 lot after applying both the risk-budget and capital-affordability caps",
+        )
+
+    risk_paise = Paise(risk_per_lot * lots)
+    total_round_trip = costs.round_trip(
+        entry_premium=premium, exit_premium=target_premium, qty=lot_size * lots, exchange=exchange, on=on
+    ).total
+    cost_as_pct_of_risk = (
+        (Decimal(total_round_trip) / Decimal(risk_paise) * Decimal(100)) if risk_paise > 0 else Decimal(0)
+    )
+
+    return SizingResult(
+        lots=lots,
+        risk_paise=risk_paise,
+        round_trip_cost_paise=total_round_trip,
+        cost_as_pct_of_risk=cost_as_pct_of_risk,
+        rejected_reason=None,
+    )

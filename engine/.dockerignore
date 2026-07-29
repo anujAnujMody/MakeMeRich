@@ -1,4 +1,10 @@
-__pycache__
+.venv/
+__pycache__/
 *.pyc
-.env
-.git
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+tests/
+data/
+trading_engine.egg-info/
+*.db

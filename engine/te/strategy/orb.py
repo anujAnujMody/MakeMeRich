@@ -1,0 +1,171 @@
+"""`OrbStrategy` — THE primary rule (opening-range breakout). Re-derived from
+`engine/strategies/orbs/orbs.py` (read as a SPECIFICATION only, per the
+plan's R9) under the `te.domain.evaluation.Evaluation`/`ConditionResult`
+interface, so every condition emits a real measured `actual` value.
+
+Vocabulary (mirrors the plan's "Meta-labeling pipeline" section, so a later
+meta-labeling secondary stays disjoint from it): opening range high/low over
+a configurable window, breakout close beyond the range, breakout-bar volume
+vs range-average volume (a volume-confirmation filter), direction.
+
+No ML import anywhere in this file — enforced by the `lint-imports`
+contract "strategy may never import ml".
+
+`Strategy.evaluate()` returns only an `Evaluation` (the Protocol's fixed
+signature), but the plan also calls for the rule to "emit a Signal ... when
+all conditions pass". `OrbStrategy` satisfies both: `evaluate()` always
+returns the `Evaluation`, and — only when `verdict == "traded"` — also sets
+`self.last_signal` to the real `Signal` that fired, for the caller
+(`te.engine.cycle`) to read immediately afterwards and hand to
+`te.risk.sizing`. `last_signal` is reset to `None` at the start of every
+`evaluate()` call, so a stale signal from a previous cycle can never leak
+forward.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+from dataclasses import dataclass
+from decimal import Decimal
+
+from te.domain.clock import DEFAULT_SESSION, IST
+from te.domain.evaluation import ConditionResult, Evaluation
+from te.domain.money import Paise
+from te.domain.signal import Direction, Signal
+from te.strategy.context import StrategyContext
+
+_NOT_REACHED = "not reached"
+
+
+def _not_reached(label: str) -> ConditionResult:
+    return ConditionResult(
+        label=label, required="n/a — short-circuited by an earlier failed/unreached condition", actual=_NOT_REACHED,
+        passed=False, evaluated=False,
+    )
+
+
+@dataclass(frozen=True)
+class OrbParams:
+    opening_range_minutes: int = 15
+    min_opening_bars: int = 3
+    volume_confirmation_multiple: Decimal = Decimal("1.0")
+    lot_size: int = 65
+
+
+class OrbStrategy:
+    name = "orb"
+
+    def __init__(self, params: OrbParams | None = None) -> None:
+        self.params = params or OrbParams()
+        self.last_signal: Signal | None = None
+
+    def evaluate(self, ctx: StrategyContext) -> Evaluation:
+        self.last_signal = None
+        params = self.params
+
+        as_of_local = ctx.as_of.astimezone(IST)
+        session_date = as_of_local.date()
+        market_open = dt.datetime.combine(session_date, DEFAULT_SESSION.start, tzinfo=IST)
+        range_end = market_open + dt.timedelta(minutes=params.opening_range_minutes)
+
+        conditions: list[ConditionResult] = []
+        bars = ctx.bars(lookback=dt.timedelta(hours=7))
+
+        if bars.empty:
+            opening_bars = bars
+        else:
+            local_ts = bars["event_ts"].dt.tz_convert(IST)
+            opening_bars = bars[(local_ts >= market_open) & (local_ts < range_end)]
+
+        data_cond = ConditionResult(
+            label="opening range data available",
+            required=f">= {params.min_opening_bars} bars in the first {params.opening_range_minutes}m after open",
+            actual=f"{len(opening_bars)} bars",
+            passed=len(opening_bars) >= params.min_opening_bars,
+            evaluated=True,
+        )
+        conditions.append(data_cond)
+        if not data_cond.passed:
+            conditions.append(_not_reached("breakout close beyond opening range"))
+            conditions.append(_not_reached("breakout volume confirmation"))
+            return self._skip(ctx, conditions, "opening range not yet formed (insufficient bars)")
+
+        range_high = float(opening_bars["h"].max())
+        range_low = float(opening_bars["l"].min())
+        avg_range_volume = float(opening_bars["v"].mean())
+
+        local_ts = bars["event_ts"].dt.tz_convert(IST)
+        breakout_bars = bars[local_ts >= range_end]
+        if breakout_bars.empty:
+            conditions.append(_not_reached("breakout close beyond opening range"))
+            conditions.append(_not_reached("breakout volume confirmation"))
+            return self._skip(ctx, conditions, "no bar has closed after the opening range window yet")
+
+        breakout_bar = breakout_bars.iloc[-1]
+        close = float(breakout_bar["c"])
+        volume = float(breakout_bar["v"])
+
+        direction: Direction | None
+        if close > range_high:
+            direction = "long_call"
+        elif close < range_low:
+            direction = "long_put"
+        else:
+            direction = None
+
+        breakout_cond = ConditionResult(
+            label="breakout close beyond opening range",
+            required=f"close > {range_high:.2f} (long_call) or close < {range_low:.2f} (long_put)",
+            actual=f"close={close:.2f}, range=[{range_low:.2f}, {range_high:.2f}]",
+            passed=direction is not None,
+            evaluated=True,
+        )
+        conditions.append(breakout_cond)
+        if direction is None:
+            conditions.append(_not_reached("breakout volume confirmation"))
+            return self._skip(ctx, conditions, "close finished inside the opening range — no breakout")
+
+        threshold = avg_range_volume * float(params.volume_confirmation_multiple)
+        volume_cond = ConditionResult(
+            label="breakout volume confirmation",
+            required=f">= {params.volume_confirmation_multiple}x opening-range average volume "
+            f"({avg_range_volume:.0f})",
+            actual=f"breakout bar volume={volume:.0f}",
+            passed=volume >= threshold,
+            evaluated=True,
+        )
+        conditions.append(volume_cond)
+        if not volume_cond.passed:
+            return self._skip(ctx, conditions, "breakout volume below confirmation threshold")
+
+        self.last_signal = Signal(
+            strategy=self.name,
+            instrument=ctx.instrument,
+            direction=direction,
+            entry_premium=Paise(int(round(close * 100))),
+            lot_size=params.lot_size,
+            ts=ctx.as_of,
+        )
+        return Evaluation(
+            id=self._eval_id(ctx),
+            timestamp=ctx.as_of,
+            strategy=self.name,
+            instrument=ctx.instrument,
+            verdict="traded",
+            reason="opening range breakout confirmed with volume",
+            conditions=tuple(conditions),
+        )
+
+    def _skip(self, ctx: StrategyContext, conditions: list[ConditionResult], reason: str) -> Evaluation:
+        return Evaluation(
+            id=self._eval_id(ctx),
+            timestamp=ctx.as_of,
+            strategy=self.name,
+            instrument=ctx.instrument,
+            verdict="skipped",
+            reason=reason,
+            conditions=tuple(conditions),
+        )
+
+    def _eval_id(self, ctx: StrategyContext) -> str:
+        return f"{self.name}-{ctx.instrument}-{ctx.as_of.isoformat()}"
