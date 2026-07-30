@@ -22,6 +22,21 @@ from typing import Literal
 
 OptionType = Literal["CE", "PE"]
 
+#: The real F&O exchange per tradeable underlying — the single source of
+#: truth for "which exchange does this underlying's derivatives trade on",
+#: shared by `te.engine.scheduler` (instrument-sync contract resolution)
+#: and `te.engine.state` (multi-instrument selection defaults), so the two
+#: can never quietly disagree. NIFTY/BANKNIFTY are NSE (NFO); SENSEX/BANKEX
+#: are BSE (BFO) — a user enabling SENSEX/BANKEX from the dashboard must
+#: never be able to end up with the wrong exchange, since that 404s against
+#: the real broker (confirmed live 2026-07-30).
+FNO_UNDERLYING_EXCHANGES: tuple[tuple[str, str], ...] = (
+    ("NIFTY", "NFO"),
+    ("BANKNIFTY", "NFO"),
+    ("SENSEX", "BFO"),
+    ("BANKEX", "BFO"),
+)
+
 _MONTH_ABBR = {
     1: "JAN",
     2: "FEB",
@@ -70,6 +85,16 @@ def _fmt_strike(strike: Decimal | int | float) -> str:
 
 def build_option_symbol(base: str, expiry: dt.date, strike: Decimal | int | float, option_type: OptionType) -> str:
     return f"{base}{fmt_expiry(expiry)}{_fmt_strike(strike)}{option_type}"
+
+
+def build_future_symbol(base: str, expiry: dt.date) -> str:
+    """`<BASE><DD><MMM><YY>FUT`, e.g. `build_future_symbol("NIFTY",
+    date(2026, 6, 30)) -> "NIFTY30JUN26FUT"`. Lot size is a property of the
+    underlying+expiry series, identical across its FUT/CE/PE contracts —
+    querying the futures contract is the reliable way to resolve a real,
+    always-listed lot size without first knowing a valid strike (see
+    `te/broker/instrument_sync.py`, which uses this for exactly that)."""
+    return f"{base}{fmt_expiry(expiry)}FUT"
 
 
 @dataclass(frozen=True)

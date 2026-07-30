@@ -24,6 +24,9 @@ from typing import Protocol
 from sqlalchemy.orm import Session, sessionmaker
 
 from te.broker.protocol import BrokerPort, FillReport
+from te.broker.ratelimit import TokenBucket
+from te.broker.simulated import SimulatedBroker
+from te.domain.costs import ChargeRateTable, CostModel, select_rates
 from te.domain.events import (
     OrderAccepted,
     OrderCancelled,
@@ -69,9 +72,19 @@ class ExecutionManager:
         self._clock: Callable[[], dt.datetime] = clock or (lambda: dt.datetime.now(dt.UTC))
 
     def submit(self, request: OrderRequest) -> str:
-        with self._session_factory() as session:
-            if is_halted(session):
-                raise HaltedError("execution is halted — refusing to submit new orders")
+        # A halt blocks new exposure but never blocks reducing it —
+        # `request.reduce_only` is the caller's explicit declaration of
+        # which this order is (see `OrderRequest.reduce_only`'s docstring).
+        # Found live: the halt used to block every SELL unconditionally,
+        # which meant tripping the daily-loss kill switch — the exact event
+        # meant to protect capital — would strand every open position with
+        # no stop-loss, trailing stop, or time exit for the rest of the
+        # halt, contradicting this project's non-negotiable "every position
+        # always has a working exit plan" rule.
+        if not request.reduce_only:
+            with self._session_factory() as session:
+                if is_halted(session):
+                    raise HaltedError("execution is halted — refusing to submit new orders")
 
         client_order_id = mint_client_order_id()
         ts = self._clock()
@@ -183,3 +196,22 @@ class ExecutionManager:
             self._store.append(
                 OrderAccepted(client_order_id=client_order_id, venue_order_id=report.venue_order_id, ts=report.ts)
             )
+
+
+def build_paper_execution_stack(
+    session_factory: sessionmaker[Session],
+    *,
+    charge_rate_table: ChargeRateTable,
+    max_orders_per_second: float,
+    on: dt.date,
+) -> tuple[CostModel, ExecutionManager]:
+    """The `CostModel` -> `SimulatedBroker` -> `TokenBucket` ->
+    `ExecutionManager` stack every paper-trading entry point needs — the
+    scheduled cycle (`te.engine.scheduler.PaperCycleRunner.run_once`) and
+    the manual square-off API route (`te.api.routers.positions`) used to
+    each hand-assemble this identically."""
+    cost_model = CostModel(select_rates(charge_rate_table, on))
+    broker = SimulatedBroker(cost_model=cost_model, on=on)
+    rate_limiter = TokenBucket(rate=max_orders_per_second, capacity=int(max_orders_per_second))
+    execution = ExecutionManager(session_factory, OrderEventStore(session_factory), broker, rate_limiter)
+    return cost_model, execution

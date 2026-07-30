@@ -98,3 +98,59 @@ def test_settings_fails_without_openalgo_ws_host(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setenv("TE_CORS_ORIGINS", '["http://localhost:5173"]')
     with pytest.raises(ValidationError):
         Settings()
+
+
+def _full_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    _base_env(monkeypatch)
+    monkeypatch.setenv("TE_ENV", "dev")
+    monkeypatch.setenv("TE_DATABASE_URL", "sqlite:///dev.db")
+    monkeypatch.setenv("TE_BAR_STORE_PATH", "data/bars")
+    monkeypatch.setenv("TE_OPENALGO_HOST", "http://openalgo:5000")
+    monkeypatch.setenv("TE_OPENALGO_WS_HOST", "ws://openalgo:8765")
+    monkeypatch.setenv("TE_OPENALGO_API_KEY", "secret")
+    monkeypatch.setenv("TE_CORS_ORIGINS", '["http://localhost:5173"]')
+
+
+def test_relogin_fields_default_to_none_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    _full_env(monkeypatch)
+    settings = Settings()
+    assert settings.openalgo_app_username is None
+    assert settings.openalgo_app_password is None
+    assert settings.angel_client_id is None
+    assert settings.angel_pin is None
+    assert settings.angel_totp_secret is None
+
+
+def test_relogin_fields_treat_docker_composes_blank_substitution_as_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: `docker-compose.yml`'s `${OPENALGO_APP_USERNAME:-}` passes
+    an EMPTY STRING (not an unset var) when the root `.env` doesn't define
+    it — which would otherwise satisfy `str | None` as `""` rather than
+    `None`, silently defeating `run_openalgo_relogin`'s all-or-nothing
+    "not configured" skip (it would see 5 present-but-blank values and
+    attempt a real broker login with empty credentials)."""
+    _full_env(monkeypatch)
+    monkeypatch.setenv("TE_OPENALGO_APP_USERNAME", "")
+    monkeypatch.setenv("TE_ANGEL_PIN", "")
+    settings = Settings()
+    assert settings.openalgo_app_username is None
+    assert settings.angel_pin is None
+
+
+def test_relogin_fields_populate_when_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    _full_env(monkeypatch)
+    monkeypatch.setenv("TE_OPENALGO_APP_USERNAME", "app-user")
+    monkeypatch.setenv("TE_OPENALGO_APP_PASSWORD", "app-pass")
+    monkeypatch.setenv("TE_ANGEL_CLIENT_ID", "C123")
+    monkeypatch.setenv("TE_ANGEL_PIN", "1234")
+    monkeypatch.setenv("TE_ANGEL_TOTP_SECRET", "JBSWY3DPEHPK3PXP")
+    settings = Settings()
+    assert settings.openalgo_app_username == "app-user"
+    assert settings.openalgo_app_password is not None
+    assert settings.openalgo_app_password.get_secret_value() == "app-pass"
+    assert settings.angel_client_id == "C123"
+    assert settings.angel_pin is not None
+    assert settings.angel_pin.get_secret_value() == "1234"
+    assert settings.angel_totp_secret is not None
+    assert settings.angel_totp_secret.get_secret_value() == "JBSWY3DPEHPK3PXP"

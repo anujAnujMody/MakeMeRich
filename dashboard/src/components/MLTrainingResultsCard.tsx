@@ -11,9 +11,15 @@ interface MLTrainingResultsCardProps {
   training: TrainingResults
   onRetrain: () => void
   isRetraining: boolean
+  /** Set when the last retrain attempt failed — e.g. the backend honestly
+   * reports `status: "not_ready"` (no training pipeline built yet) rather
+   * than silently doing nothing. `lib/api.ts` turns that into a real
+   * mutation error; this surfaces it instead of leaving the button's
+   * "Training..." state simply revert with nothing shown. */
+  retrainError?: string
 }
 
-export function MLTrainingResultsCard({ training, onRetrain, isRetraining }: MLTrainingResultsCardProps) {
+export function MLTrainingResultsCard({ training, onRetrain, isRetraining, retrainError }: MLTrainingResultsCardProps) {
   if (training.status === 'no_training_results') {
     return (
       <Card>
@@ -39,6 +45,7 @@ export function MLTrainingResultsCard({ training, onRetrain, isRetraining }: MLT
         </Button>
       </CardHeader>
       <CardContent className="space-y-4">
+        {retrainError && <p className="text-xs text-critical">{retrainError}</p>}
         <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
           <Card>
             <CardContent className="p-4 text-center">

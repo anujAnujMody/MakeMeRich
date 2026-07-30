@@ -23,6 +23,11 @@ export function ApprovePage() {
           </div>
         )}
 
+        <div className="rounded-lg border border-warning/40 bg-warning/10 px-4 py-2.5 text-xs text-warning">
+          Approve/Reject only records your decision right now — placing or cancelling a real order on
+          approval isn't built yet. Nothing here executes against a broker.
+        </div>
+
         {isLoading ? (
           <p className="text-sm text-muted-foreground">Loading approvals…</p>
         ) : !approvals || approvals.length === 0 ? (

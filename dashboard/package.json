@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:real": "vite --mode real",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
     "arch:check": "depcruise src --config .dependency-cruiser.cjs",

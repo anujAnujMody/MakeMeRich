@@ -1,8 +1,8 @@
-import type { CycleStatus, DashboardData, DailyPnL, DiscoveryQueueItem, EngineStats, EquityPoint, ExecutionStatus, JournalEntry, LearningProgress, MarketData, MarketSession, Order, OptimizeRequest, OptimizeResponse, PaperTrade, PaperPositionCount, PnLAnalysis, PlaceOrderPayload, Position, RejectedOrder, SignalFeedItem, SkippedSignalInfo, StrategiesFile, StrategyCard, StrategyConfig, StrategyAnalysis, MLInfo, Trade, TradeLogFilters, TrainingResults, WatchlistItem, BrokerStatus, ResearchBrief, DailyRecap, PatternLibraryEntry } from '@/types'
+import type { CycleStatus, DashboardData, DailyPnL, DiscoveryQueueItem, EngineStats, EquityPoint, ExecutionStatus, JournalEntry, LearningProgress, MarketData, MarketSession, Order, OptimizeRequest, OptimizeResponse, PaperTrade, PaperPositionCount, PnLAnalysis, PlaceOrderPayload, Position, RejectedOrder, SignalFeedItem, SkippedSignalInfo, StrategyCard, StrategyConfig, StrategyAnalysis, MLInfo, Trade, TradeLogFilters, TrainingResults, WatchlistItem, BrokerStatus, ResearchBrief, DailyRecap, PatternLibraryEntry } from '@/types'
 import type { CycleEvaluation, DashboardSnapshot, TradingMode } from '@/types/dashboard-snapshot'
 import type { PendingApproval } from '@/types/approval'
 import type { MaturityGateStatus, ShadowComparison } from '@/types/learning'
-import type { EngineHealthStatus } from '@/types/ops'
+import type { AccountGuardrails, EngineHealthStatus, InstrumentSelections } from '@/types/ops'
 
 function headers(): Record<string, string> {
   return { 'Content-Type': 'application/json' }
@@ -32,6 +32,35 @@ async function post<T>(path: string, body: unknown): Promise<T> {
     body: JSON.stringify(body),
   })
   if (!res.ok) throw new Error(`POST ${path}: ${res.status} ${res.statusText}`)
+  const data = await res.json()
+  // The backend sends an HONEST `success: false` / `status: "not_ready"`
+  // body on a 200 for actions it can't actually perform yet (e.g.
+  // `/api/positions/squareoff` when there's no recent price to close at,
+  // `/api/learning/retrain` when there's no training pipeline yet) — this
+  // used to be silently ignored by every caller, so a real failure looked
+  // like success in the UI. Surface it the same way a non-2xx does: throw,
+  // so TanStack Query's `onError` actually fires instead of `onSuccess`.
+  // The real reason (when there is one) travels in `X-TE-Not-Ready-Reason`,
+  // never the JSON body — the body's shape is a frozen contract type.
+  const notReadyReason = res.headers.get('X-TE-Not-Ready-Reason')
+  if (data && typeof data === 'object') {
+    if ('success' in data && data.success === false) {
+      throw new Error(notReadyReason || `${path}: action did not succeed`)
+    }
+    if ('status' in data && data.status === 'not_ready') {
+      throw new Error(notReadyReason || `${path}: not ready yet`)
+    }
+  }
+  return data
+}
+
+async function put<T>(path: string, body: unknown): Promise<T> {
+  const res = await fetch(path, {
+    method: 'PUT',
+    headers: headers(),
+    body: JSON.stringify(body),
+  })
+  if (!res.ok) throw new Error(`PUT ${path}: ${res.status} ${res.statusText}`)
   return res.json()
 }
 
@@ -145,6 +174,10 @@ export const api = {
     pause: () => post<EngineHealthStatus>('/api/engine/pause', {}),
     resume: () => post<EngineHealthStatus>('/api/engine/resume', {}),
     resetDrawdownBreaker: () => post<EngineHealthStatus>('/api/engine/reset-drawdown-breaker', {}),
+    guardrails: () => get<AccountGuardrails>('/api/engine/guardrails'),
+    saveGuardrails: (payload: AccountGuardrails) => put<AccountGuardrails>('/api/engine/guardrails', payload),
+    instruments: () => get<InstrumentSelections>('/api/engine/instruments'),
+    saveInstruments: (payload: InstrumentSelections) => put<InstrumentSelections>('/api/engine/instruments', payload),
   },
 
   rejectedOrders: {
@@ -189,10 +222,5 @@ export const api = {
     signalFeed: (limit = 50) => get<SignalFeedItem[]>(`/api/execution/signal-feed?limit=${limit}`),
     analysis: () => get<StrategyAnalysis>('/api/execution/analysis'),
     mlInfo: () => get<MLInfo>('/api/execution/ml-info'),
-  },
-
-  strategiesConfig: {
-    get: () => get<StrategiesFile>('/api/strategies/config'),
-    put: (config: StrategiesFile) => post<StrategiesFile>('/api/strategies/config', config),
   },
 }

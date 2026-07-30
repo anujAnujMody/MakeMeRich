@@ -20,7 +20,7 @@ from te.data.charges_loader import load_charge_rate_table
 from te.domain.clock import IST
 from te.domain.costs import CostModel, select_rates
 from te.domain.money import Paise
-from te.engine.cycle import CycleConfig, run_entry_cycle, run_exit_cycle
+from te.engine.cycle import CycleConfig, InstrumentConfig, run_entry_cycle, run_exit_cycle
 from te.execution.manager import ExecutionManager
 from te.execution.store import OrderEventStore
 from te.persistence.db import make_engine, make_session_factory
@@ -151,6 +151,64 @@ def test_entry_cycle_opens_a_position_with_an_exit_plan_on_confirmed_breakout(
         assert row.trailing_distance_paise == 300
 
 
+def test_entry_cycle_sizes_two_instruments_independently_across_exchanges(
+    session_factory,
+    execution,
+    cost_model: CostModel,
+    tmp_path: Path,  # noqa: ANN001
+) -> None:
+    """Proves the plan's Tier 1 multi-instrument fix: `CycleConfig.
+    instrument_configs` lets one cycle trade instruments on DIFFERENT
+    exchanges with DIFFERENT lot sizes, each sized/recorded with its OWN
+    values — never the other instrument's, and never a shared single
+    `config.exchange`/`config.lot_size` (today's single-instrument
+    behaviour, which this test's sibling above still covers unchanged)."""
+    second_instrument = "BANKNIFTY30JUL2652000CE"
+    second_exchange = "BFO"
+    store = _breakout_store(tmp_path)
+    # Same breakout shape as `_breakout_store`, for the second symbol/exchange.
+    rows = [
+        _bar(_open(0), o=30, h=32, low=28, c=30, v=1_000),
+        _bar(_open(1), o=30, h=31, low=29, c=30.2, v=1_000),
+        _bar(_open(2), o=30, h=31, low=29, c=30.1, v=1_000),
+        _bar(_open(15), o=30, h=38, low=30, c=36, v=2_000),
+    ]
+    for row in rows:
+        row = dict(row)
+        row["symbol"] = second_instrument
+        row["exchange"] = second_exchange
+        store.append(pd.DataFrame([row], columns=list(BAR_COLUMNS)))
+
+    config = _config(
+        instruments=(),
+        instrument_configs=(
+            InstrumentConfig(symbol=INSTRUMENT, exchange=EXCHANGE, lot_size=65),
+            InstrumentConfig(symbol=second_instrument, exchange=second_exchange, lot_size=30),
+        ),
+    )
+    as_of = _open(16)
+
+    run_entry_cycle(
+        session_factory=session_factory,
+        store=store,
+        execution=execution,
+        cost_model=cost_model,
+        config=config,
+        as_of=as_of,
+    )
+
+    with session_factory() as session:
+        rows_by_symbol = {r.symbol: r for r in session.query(OpenPositionRow).all()}
+
+    assert set(rows_by_symbol) == {INSTRUMENT, second_instrument}
+
+    first, second = rows_by_symbol[INSTRUMENT], rows_by_symbol[second_instrument]
+    assert first.exchange == EXCHANGE
+    assert first.lot_size == 65
+    assert second.exchange == second_exchange
+    assert second.lot_size == 30
+
+
 def test_skipped_signal_persisted_with_real_reason(
     session_factory,
     execution,
@@ -175,6 +233,68 @@ def test_skipped_signal_persisted_with_real_reason(
         assert len(skips) == 1
         assert skips[0].reason  # non-empty, real
         assert "opening range" in skips[0].reason
+
+
+def test_a_daily_loss_breach_is_caught_even_when_no_instrument_has_a_signal(
+    session_factory,
+    execution,
+    cost_model: CostModel,
+    tmp_path: Path,  # noqa: ANN001
+) -> None:
+    """Regression: the portfolio-level daily-loss/drawdown check used to
+    live inside the per-instrument "signal fired" branch, so on a day with
+    zero signals (the common case — most cycles skip on "opening range not
+    yet formed" or similar) an ongoing breach could go undetected
+    indefinitely. It must now run every cycle regardless of whether any
+    instrument's rule actually fires."""
+    from te.persistence.repos.paper_trading import insert_trade
+
+    store = _no_signal_store(tmp_path)  # no bars at all -> no instrument can ever fire a signal
+    config = _config(
+        instruments=("NIFTY", "BANKNIFTY"),
+        risk_limits=RiskLimitsConfig(
+            max_daily_loss_paise=Paise(4_000_00), max_concurrent_positions=5, max_trades_per_day=20
+        ),
+    )
+    as_of = _open(1)
+
+    with session_factory() as session:
+        insert_trade(
+            session,
+            client_order_id="c-already-closed",
+            symbol="NIFTY30JUN2626500CE",
+            exchange=EXCHANGE,
+            strategy="orb",
+            direction="long_call",
+            lots=1,
+            lot_size=65,
+            entry_premium=Paise(3_000),
+            exit_premium=Paise(1_000),
+            gross_pnl=Paise(-5_000_00),
+            costs=Paise(0),
+            net_pnl=Paise(-5_000_00),  # already breaches the 4,000-rupee daily loss limit
+            exit_reason="stop",
+            opened_at=as_of - dt.timedelta(hours=1),
+            closed_at=as_of,
+        )
+        session.commit()
+
+    run_entry_cycle(
+        session_factory=session_factory,
+        store=store,
+        execution=execution,
+        cost_model=cost_model,
+        config=config,
+        as_of=as_of,
+    )
+
+    with session_factory() as session:
+        skips = session.query(SkippedSignalRow).all()
+        assert {s.instrument for s in skips} == {"NIFTY", "BANKNIFTY"}
+        assert all("daily loss limit" in s.reason for s in skips)
+        from te.execution.halt import is_halted
+
+        assert is_halted(session) is True
 
 
 def test_skipped_signal_persisted_when_sizing_rejects_zero_lots(
@@ -233,6 +353,8 @@ def test_paper_trade_pnl_is_net(
         open_row = session.query(OpenPositionRow).one()
         entry_premium = open_row.entry_premium_paise
         target = open_row.target_paise
+        opened_stop_paise = open_row.stop_paise
+        opened_target_paise = open_row.target_paise
 
     exit_at = entry_at + dt.timedelta(minutes=5)
     closed = run_exit_cycle(
@@ -268,12 +390,79 @@ def test_paper_trade_pnl_is_net(
     # trade. They live on `OpenPositionRow`, which is gone once the position
     # closes, so without these columns a post-hoc review of "what were we
     # actually risking?" is unanswerable from the trade record alone.
+    assert trade.stop_paise == opened_stop_paise
+    assert trade.target_paise == opened_target_paise
+
+
+def test_square_off_closes_position_immediately_regardless_of_exit_conditions(
+    session_factory,
+    execution,
+    cost_model: CostModel,
+    tmp_path: Path,  # noqa: ANN001
+) -> None:
+    """Manual square-off (the plan's Tier 2 fix — `/api/positions/squareoff`
+    used to always return `success=False`, honestly, since nothing was
+    wired to actually close a position) must close even when NO stop/
+    target/trailing/time condition has fired — that's the whole point of a
+    manual override."""
+    from te.engine.cycle import square_off_position
+
+    store = _breakout_store(tmp_path)
+    config = _config()
+    entry_at = _open(16)
+
+    run_entry_cycle(
+        session_factory=session_factory,
+        store=store,
+        execution=execution,
+        cost_model=cost_model,
+        config=config,
+        as_of=entry_at,
+    )
+
     with session_factory() as session:
-        closed_row = session.query(OpenPositionRow).one()
-    assert trade.stop_paise == closed_row.stop_paise
-    assert trade.target_paise == closed_row.target_paise
-    # `stop_paise` is the ORIGINAL stop, not the trailed `current_stop_paise`.
-    assert trade.stop_paise is not None
+        open_row = session.query(OpenPositionRow).one()
+        entry_premium = open_row.entry_premium_paise
+        # A premium that hits NEITHER the stop NOR the target — proves this
+        # closes independent of `evaluate_position`'s own condition check.
+        mid_premium = entry_premium + 10
+
+    square_off_at = entry_at + dt.timedelta(minutes=2)
+    closed_id = square_off_position(
+        session_factory=session_factory,
+        execution=execution,
+        cost_model=cost_model,
+        symbol=INSTRUMENT,
+        exchange=EXCHANGE,
+        current_premium=Paise(mid_premium),
+        as_of=square_off_at,
+    )
+
+    assert closed_id is not None
+    with session_factory() as session:
+        assert session.query(OpenPositionRow).filter(OpenPositionRow.closed_at.is_(None)).count() == 0
+        trade = session.query(TradeRow).one()
+    assert trade.exit_reason == "manual"
+    assert trade.exit_premium_paise == mid_premium
+
+
+def test_square_off_returns_none_when_no_open_position_matches(
+    session_factory,
+    execution,
+    cost_model: CostModel,
+) -> None:
+    from te.engine.cycle import square_off_position
+
+    result = square_off_position(
+        session_factory=session_factory,
+        execution=execution,
+        cost_model=cost_model,
+        symbol="NONEXISTENT",
+        exchange=EXCHANGE,
+        current_premium=Paise(1000),
+        as_of=_open(0),
+    )
+    assert result is None
 
 
 def test_throttle_multiplier_reaches_sizing(

@@ -71,12 +71,22 @@ def size_position(
     exchange: str,
     on: date,
     min_edge_multiple: Decimal,
+    max_position_size_pct: Decimal = Decimal(100),
 ) -> SizingResult:
     """Rejects (lots=0, rejected_reason set) when the gross edge per lot is
     below `round_trip_cost x min_edge_multiple`, when the risk budget can't
     afford even one lot, or when capital can't afford even one lot outright.
     Never returns `lots=0` without a `rejected_reason` — see
-    `SizingResult.__post_init__`."""
+    `SizingResult.__post_init__`.
+
+    `max_position_size_pct` caps a SINGLE position's notional
+    (premium x lot_size x lots) at that percentage of `capital` — a
+    separate cap from `risk_budget_pct` (which bounds LOSS-AT-STOP, not
+    notional exposure): a position can be sized well within its risk
+    budget yet still tie up an outsized share of capital in one bet if the
+    stop is close to premium. Defaults to `100` (capital-affordability is
+    already the effective ceiling, unchanged from before this parameter
+    existed) so every pre-existing call site behaves identically."""
     per_lot_round_trip = costs.round_trip(
         entry_premium=premium, exit_premium=target_premium, qty=lot_size, exchange=exchange, on=on
     ).total
@@ -124,11 +134,28 @@ def size_position(
             reason=f"capital ({capital}p) cannot afford even 1 lot at premium={premium}p x lot_size={lot_size}",
         )
 
-    lots = min(lots_by_risk, lots_by_capital)
+    # `lot_cost > 0` is already proven here — `lots_by_capital >= 1` above
+    # required it (the `lot_cost > 0 else 0` guard on that line is what
+    # would have rejected a zero `lot_cost` first).
+    max_position_paise = int(Decimal(capital) * max_position_size_pct / Decimal(100))
+    lots_by_position_size = max_position_paise // lot_cost
+    if lots_by_position_size < 1:
+        return _rejected(
+            round_trip_cost_paise=per_lot_round_trip,
+            reason=(
+                f"max_position_size_pct ({max_position_size_pct}% of capital {capital}p = {max_position_paise}p) "
+                f"is insufficient for even 1 lot at premium={premium}p x lot_size={lot_size}"
+            ),
+        )
+
+    lots = min(lots_by_risk, lots_by_capital, lots_by_position_size)
     if lots < 1:
         return _rejected(
             round_trip_cost_paise=per_lot_round_trip,
-            reason="sized to fewer than 1 lot after applying both the risk-budget and capital-affordability caps",
+            reason=(
+                "sized to fewer than 1 lot after applying the risk-budget, capital-affordability, "
+                "and max-position-size caps"
+            ),
         )
 
     risk_paise = Paise(risk_per_lot * lots)

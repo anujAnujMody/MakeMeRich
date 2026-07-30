@@ -213,10 +213,6 @@ export interface AgentConfig {
   openrouterKey: string
   researchEnabled: boolean
   researchTime: string
-  maxDailyLoss: number
-  maxPositionSizePct: number
-  maxDrawdownPct: number
-  maxTradesPerDay: number
   autonomyMode: AutonomyMode
 }
 
@@ -441,35 +437,6 @@ export interface MLInfo {
   walk_forward_sharpe: number
   profit_factor: number
   indices: { symbol: string; status: string; bars: number; features: number; pos_pct: number }[]
-}
-
-/* ─── Strategies Config Types ─── */
-
-export interface StrategyInstrumentConfig {
-  symbol: string
-  exchange: string
-  ticker: string
-  active: boolean
-  lot_size: number
-}
-
-export interface StrategyEntry {
-  name: string
-  active: boolean
-  instruments: string[]
-  params: Record<string, unknown>
-}
-
-export interface StrategiesFile {
-  check_interval_secs: number
-  ml_threshold: number
-  max_trades_per_day: number
-  risk_per_trade_pct: number
-  max_daily_loss_pct: number
-  max_drawdown_pct: number
-  max_concurrent_positions: number
-  instruments: StrategyInstrumentConfig[]
-  strategies: StrategyEntry[]
 }
 
 /* ─── Signal Feed Types ─── */

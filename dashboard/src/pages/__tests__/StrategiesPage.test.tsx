@@ -37,9 +37,9 @@ describe('StrategiesPage', () => {
     expect(screen.getAllByText(/n=/i).length).toBeGreaterThan(0)
   })
 
-  it('renders auto-discover badge', async () => {
+  it('does not claim autonomous strategy discovery is running (not built yet)', async () => {
     renderWithProviders(<StrategiesPage />)
-    expect(await screen.findByText('Auto-discover ON')).toBeInTheDocument()
+    expect(await screen.findByText('No autonomous strategy discovery yet')).toBeInTheDocument()
   })
 
   it('shows discovery queue', async () => {

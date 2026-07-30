@@ -18,7 +18,14 @@ def test_scheduler_status_reports_all_jobs_including_paper_cycle() -> None:
     assert response.status_code == 200
     body = response.json()
     job_ids = {job["id"] for job in body["jobs"]}
-    assert job_ids == {"ws_recorder_start", "ws_recorder_stop", "bhavcopy_ingest", "instrument_sync", "paper_cycle"}
+    assert job_ids == {
+        "openalgo_relogin",
+        "ws_recorder_start",
+        "ws_recorder_stop",
+        "bhavcopy_ingest",
+        "instrument_sync",
+        "paper_cycle",
+    }
 
     paper_cycle_job = next(job for job in body["jobs"] if job["id"] == "paper_cycle")
     assert paper_cycle_job["maxInstances"] == 1

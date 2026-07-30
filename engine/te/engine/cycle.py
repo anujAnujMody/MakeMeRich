@@ -24,12 +24,13 @@ from decimal import Decimal
 
 from sqlalchemy.orm import Session, sessionmaker
 
+from te.data.asof import latest_close_paise
 from te.data.barstore import BarStore
 from te.domain.clock import assume_utc as _as_utc
 from te.domain.costs import CostModel
 from te.domain.money import Paise
 from te.domain.orders import OrderRequest
-from te.domain.pnl import GrossPnl, net_pnl
+from te.domain.pnl import GrossPnl, mark_to_market_pnl, net_pnl
 from te.domain.signal import ExitPlan, Signal
 from te.engine.exits import OpenPosition, evaluate_position
 from te.execution.manager import ExecutionManager
@@ -37,6 +38,7 @@ from te.ml.gates import MLHook, MLInfluence
 from te.persistence.db import session_scope
 from te.persistence.models import OpenPositionRow
 from te.persistence.repos.paper_trading import (
+    find_open_position,
     insert_open_position,
     insert_trade,
     mark_position_closed,
@@ -44,12 +46,19 @@ from te.persistence.repos.paper_trading import (
     record_cycle,
     record_evaluation,
     record_skipped_signal,
+    total_net_pnl_paise,
     update_trailing_stop,
 )
 from te.risk.killswitch import KillSwitchTrippedError, is_currently_throttled
 from te.risk.killswitch import check as check_killswitch
-from te.risk.limits import LimitBreachError, RiskLimitsConfig
-from te.risk.limits import check_all as check_risk_limits
+from te.risk.limits import (
+    LimitBreachError,
+    RiskLimitsConfig,
+    check_daily_loss_limit,
+    check_max_concurrent_positions,
+    check_max_drawdown,
+    check_max_trades_per_day,
+)
 from te.risk.regime import DEFAULT_REGIME_THROTTLE_CONFIG, compose_size_multipliers
 from te.risk.sizing import size_position
 from te.strategy.context import StrategyContext
@@ -57,9 +66,28 @@ from te.strategy.registry import get as get_strategy
 
 
 @dataclass(frozen=True)
+class InstrumentConfig:
+    """One instrument's exchange + lot size, for a `CycleConfig` trading
+    more than one instrument at once. `lot_size` here is whatever the
+    caller resolved it to be — `te.engine.scheduler`'s builder resolves it
+    from the real synced `instruments` table (never a hand-typed literal),
+    per this project's standing rule that sizing data comes only from that
+    table (see `te.engine.scheduler`'s `NSE_UNDERLYINGS`/`BSE_UNDERLYINGS`
+    docstring)."""
+
+    symbol: str
+    exchange: str
+    lot_size: int
+
+
+@dataclass(frozen=True)
 class CycleConfig:
     mode: str
     strategy_name: str
+    #: Single-instrument/single-exchange config, kept for backward
+    #: compatibility (every test/call site before multi-instrument support
+    #: existed constructs `CycleConfig` this way). `instrument_configs`
+    #: below, when set, takes priority — see `_resolve_instruments`.
     instruments: tuple[str, ...]
     exchange: str
     lot_size: int
@@ -72,6 +100,51 @@ class CycleConfig:
     max_hold: dt.timedelta
     hard_exit_by: dt.time
     risk_limits: RiskLimitsConfig
+    #: `None` (the default) means "use `instruments` x `exchange`/`lot_size`
+    #: for all of them" — today's single-exchange behaviour, unchanged. Set
+    #: this to trade instruments across different exchanges/lot sizes in one
+    #: cycle (e.g. NIFTY/BANKNIFTY on NFO with different lot sizes, SENSEX on
+    #: BFO) — see the plan's "Dashboard<->engine wiring remediation", Tier 1.
+    instrument_configs: tuple[InstrumentConfig, ...] | None = None
+    #: Caps a single position's notional at this % of capital — see
+    #: `te.risk.sizing.size_position`'s docstring. `Decimal(100)` (a no-op)
+    #: by default so every pre-existing `CycleConfig` construction is
+    #: unaffected.
+    max_position_size_pct: Decimal = Decimal(100)
+
+
+def _resolve_instruments(config: CycleConfig) -> list[InstrumentConfig]:
+    if config.instrument_configs is not None:
+        return list(config.instrument_configs)
+    return [InstrumentConfig(symbol=s, exchange=config.exchange, lot_size=config.lot_size) for s in config.instruments]
+
+
+def unrealized_pnl_paise(
+    session: Session, *, store: BarStore, cost_model: CostModel, as_of: dt.datetime
+) -> Paise:
+    """Sum of every open position's mark-to-market P&L (negative when
+    underwater), via the same `mark_to_market_pnl` formula a real close
+    uses. Feeds `te.risk.limits.check_daily_loss_limit` so the daily-loss
+    halt sees unrealized losses too, not only realized ones — see that
+    function's docstring for why the check itself can't compute this
+    (pricing a mark needs a `BarStore`/`CostModel`, both above `te.risk` in
+    the layer rule)."""
+    total = 0
+    for row in open_positions(session):
+        current = Paise(
+            latest_close_paise(store, row.symbol, as_of, fallback=row.entry_premium_paise)
+        )
+        total += int(
+            mark_to_market_pnl(
+                entry_premium=Paise(row.entry_premium_paise),
+                current_premium=current,
+                qty=row.lots * row.lot_size,
+                exchange=row.exchange,
+                cost_model=cost_model,
+                on=as_of.date(),
+            )
+        )
+    return Paise(total)
 
 
 def _row_to_position(row: OpenPositionRow) -> OpenPosition:
@@ -134,9 +207,48 @@ def run_entry_cycle(
                 session, ts=as_of, strategy=config.strategy_name, instrument=instrument, reason=reason
             )
 
-    for instrument in config.instruments:
+    # Portfolio-level risk (daily loss incl. unrealized, and drawdown vs
+    # peak equity) is checked ONCE per cycle here, unconditionally — not
+    # nested inside the per-instrument loop below. It used to run only when
+    # some instrument's rule fired a signal, so a real breach could go
+    # undetected indefinitely on a day with zero signals; computing it once
+    # also avoids re-deriving the same portfolio equity once per instrument
+    # for an identical answer. `check_killswitch` is deliberately still
+    # re-checked per instrument below too, since a same-cycle overfill halt
+    # (triggered synchronously by an earlier instrument's fill) must still
+    # block a later instrument in the same cycle.
+    portfolio_blocked_reason: str | None = None
+    throttled = False
+    with session_scope(session_factory) as session:
+        try:
+            check_killswitch(session)
+            unrealized = unrealized_pnl_paise(session, store=store, cost_model=cost_model, as_of=as_of)
+            equity = Paise(int(config.capital) + int(total_net_pnl_paise(session)) + int(unrealized))
+            check_daily_loss_limit(
+                session, config.risk_limits, on=as_of.date(), now=as_of, unrealized_pnl_paise=unrealized
+            )
+            check_max_drawdown(session, config.risk_limits, now=as_of, current_equity_paise=equity)
+        except (KillSwitchTrippedError, LimitBreachError) as exc:
+            # Recorded AFTER this session closes (via `_skip`, below) rather
+            # than on this session, same convention as the per-instrument
+            # gate further down — never nest one SQLite write transaction
+            # inside another.
+            portfolio_blocked_reason = str(exc)
+        else:
+            throttled = is_currently_throttled(session)
+
+    if portfolio_blocked_reason is not None:
+        for instrument_config in _resolve_instruments(config):
+            _skip(instrument_config.symbol, portfolio_blocked_reason)
+        return cycle_id
+
+    for instrument_config in _resolve_instruments(config):
+        instrument = instrument_config.symbol
+        exchange = instrument_config.exchange
+        lot_size = instrument_config.lot_size
+
         strategy = get_strategy(config.strategy_name)
-        ctx = StrategyContext(store=store, instrument=instrument, exchange=config.exchange, as_of=as_of)
+        ctx = StrategyContext(store=store, instrument=instrument, exchange=exchange, as_of=as_of)
         evaluation = strategy.evaluate(ctx)
 
         with session_scope(session_factory) as session:
@@ -160,25 +272,24 @@ def run_entry_cycle(
             _skip(instrument, "strategy reported verdict=traded but produced no Signal")
             continue
 
-        throttled = False
+        # Per-instrument gates only — portfolio-level checks already ran
+        # once above. These two depend on state that can change WITHIN this
+        # loop (an earlier instrument in this same cycle opening a position
+        # moves both counters), so they stay re-checked per instrument.
+        # `check_killswitch` is repeated too: a same-cycle overfill halt
+        # from an earlier instrument's synchronous fill must still block a
+        # later one.
         blocked_reason: str | None = None
         with session_scope(session_factory) as session:
             try:
                 check_killswitch(session)
-                check_risk_limits(session, config.risk_limits, on=as_of.date(), now=as_of)
+                check_max_concurrent_positions(session, config.risk_limits)
+                check_max_trades_per_day(session, config.risk_limits, on=as_of.date())
             except (KillSwitchTrippedError, LimitBreachError) as exc:
                 # Recorded AFTER this session closes (via `_skip`) rather
                 # than on this session, so the skip write never nests one
                 # SQLite write transaction inside another.
                 blocked_reason = str(exc)
-            else:
-                # Phase 7's throttle (`te.risk.killswitch.throttle()`) is a
-                # "reduce size" signal, distinct from a halt — read fresh
-                # from the DB each cycle (see killswitch.py's module
-                # docstring for why there is no in-process throttle cache)
-                # and compose it below with any ML size multiplier via
-                # `te.risk.regime.compose_size_multipliers`, never a halt.
-                throttled = is_currently_throttled(session)
         if blocked_reason is not None:
             _skip(instrument, blocked_reason)
             continue
@@ -192,11 +303,12 @@ def run_entry_cycle(
             premium=signal.entry_premium,
             stop_premium=stop_premium,
             target_premium=target_premium,
-            lot_size=config.lot_size,
+            lot_size=lot_size,
             costs=cost_model,
-            exchange=config.exchange,
+            exchange=exchange,
             on=as_of.date(),
             min_edge_multiple=config.min_edge_multiple,
+            max_position_size_pct=config.max_position_size_pct,
         )
         if sizing.lots == 0:
             _skip(instrument, sizing.rejected_reason or "sizing rejected with no reason (bug)")
@@ -237,9 +349,9 @@ def run_entry_cycle(
 
         request = OrderRequest(
             symbol=instrument,
-            exchange=config.exchange,
+            exchange=exchange,
             side="BUY",
-            quantity=config.lot_size * lots,
+            quantity=lot_size * lots,
             order_type="LIMIT",
             limit_price=signal.entry_premium,
         )
@@ -257,11 +369,11 @@ def run_entry_cycle(
                 session,
                 client_order_id=client_order_id,
                 symbol=instrument,
-                exchange=config.exchange,
+                exchange=exchange,
                 strategy=config.strategy_name,
                 direction=signal.direction,
                 lots=lots,
-                lot_size=config.lot_size,
+                lot_size=lot_size,
                 entry_premium=signal.entry_premium,
                 exit_plan=exit_plan,
                 opened_at=as_of,
@@ -303,60 +415,123 @@ def run_exit_cycle(
                     update_trailing_stop(session, row, updated.current_stop)
                 continue
 
-            qty = row.lots * row.lot_size
-            request = OrderRequest(
-                symbol=row.symbol,
-                exchange=row.exchange,
-                side="SELL",
-                quantity=qty,
-                order_type="LIMIT",
-                limit_price=decision.exit_premium,
-            )
-            # Flush+commit anything pending before the broker round-trip:
-            # `execution.submit` opens its own session, and holding this
-            # one's write transaction open across that call would have one
-            # SQLite writer waiting on another.
-            session.commit()
-            execution.submit(request)
-
-            entry_premium = Paise(row.entry_premium_paise)
-            costs = cost_model.round_trip(
-                entry_premium=entry_premium,
-                exit_premium=decision.exit_premium,
-                qty=qty,
-                exchange=row.exchange,
-                on=as_of.date(),
-            )
-            gross = GrossPnl(Paise((decision.exit_premium - entry_premium) * qty))
-            net = net_pnl(entry_premium, decision.exit_premium, qty, costs)
-
-            mark_position_closed(session, row, closed_at=as_of)
-            insert_trade(
+            _close_position(
                 session,
-                client_order_id=row.client_order_id,
-                symbol=row.symbol,
-                exchange=row.exchange,
-                strategy=row.strategy,
-                direction=row.direction,  # type: ignore[arg-type]
-                lots=row.lots,
-                lot_size=row.lot_size,
-                entry_premium=entry_premium,
+                execution=execution,
+                cost_model=cost_model,
+                row=row,
                 exit_premium=decision.exit_premium,
-                gross_pnl=Paise(gross),
-                costs=costs.total,
-                net_pnl=Paise(net),
                 exit_reason=decision.reason,
-                opened_at=_as_utc(row.opened_at),
-                closed_at=as_of,
-                mode="paper",
-                # The levels the position was OPENED with — `row.stop_paise`,
-                # never the trailed `row.current_stop_paise`. `row` is about
-                # to become a closed `open_positions` row, so this is the last
-                # point at which they can be carried onto the trade record.
-                stop_paise=Paise(row.stop_paise),
-                target_paise=Paise(row.target_paise),
+                as_of=as_of,
             )
-            session.commit()
             closed.append(row.client_order_id)
 
     return closed
+
+
+def _close_position(
+    session: Session,
+    *,
+    execution: ExecutionManager,
+    cost_model: CostModel,
+    row: OpenPositionRow,
+    exit_premium: Paise,
+    exit_reason: str,
+    as_of: dt.datetime,
+) -> None:
+    """The shared close path for both a fired exit condition
+    (`run_exit_cycle`) and a manual square-off (`square_off_position`) —
+    same broker submission, same net-of-cost trade record, same
+    `mark_position_closed`, so the two can never quietly diverge on how a
+    position actually gets closed. Commits internally (matches
+    `run_exit_cycle`'s pre-existing commit-around-the-broker-call
+    ordering) — callers should not wrap this in their own transaction."""
+    qty = row.lots * row.lot_size
+    request = OrderRequest(
+        symbol=row.symbol,
+        exchange=row.exchange,
+        side="SELL",
+        quantity=qty,
+        order_type="LIMIT",
+        limit_price=exit_premium,
+        reduce_only=True,
+    )
+    # Flush+commit anything pending before the broker round-trip:
+    # `execution.submit` opens its own session, and holding this one's write
+    # transaction open across that call would have one SQLite writer waiting
+    # on another.
+    session.commit()
+    execution.submit(request)
+
+    entry_premium = Paise(row.entry_premium_paise)
+    costs = cost_model.round_trip(
+        entry_premium=entry_premium,
+        exit_premium=exit_premium,
+        qty=qty,
+        exchange=row.exchange,
+        on=as_of.date(),
+    )
+    gross = GrossPnl(Paise((exit_premium - entry_premium) * qty))
+    net = net_pnl(entry_premium, exit_premium, qty, costs)
+
+    mark_position_closed(session, row, closed_at=as_of)
+    insert_trade(
+        session,
+        client_order_id=row.client_order_id,
+        symbol=row.symbol,
+        exchange=row.exchange,
+        strategy=row.strategy,
+        direction=row.direction,  # type: ignore[arg-type]
+        lots=row.lots,
+        lot_size=row.lot_size,
+        entry_premium=entry_premium,
+        exit_premium=exit_premium,
+        gross_pnl=Paise(gross),
+        costs=costs.total,
+        net_pnl=Paise(net),
+        exit_reason=exit_reason,
+        opened_at=_as_utc(row.opened_at),
+        closed_at=as_of,
+        mode="paper",
+        # The levels the position was OPENED with — `row.stop_paise`, never
+        # the trailed `row.current_stop_paise`. `row` is about to become a
+        # closed `open_positions` row, so this is the last point at which
+        # they can be carried onto the trade record.
+        stop_paise=Paise(row.stop_paise),
+        target_paise=Paise(row.target_paise),
+    )
+    session.commit()
+
+
+def square_off_position(
+    *,
+    session_factory: sessionmaker[Session],
+    execution: ExecutionManager,
+    cost_model: CostModel,
+    symbol: str,
+    exchange: str,
+    current_premium: Paise,
+    as_of: dt.datetime,
+) -> str | None:
+    """Manual square-off — closes ONE open position immediately at
+    `current_premium`, regardless of whether any stop/target/trailing/time
+    condition has fired (unlike `run_exit_cycle`, which only closes on a
+    real `evaluate_position` decision). Returns the closed position's
+    `client_order_id`, or `None` if no open position matches
+    `(symbol, exchange)`. Reuses `_close_position` — the same broker
+    submission and net-of-cost trade record as an automatic exit, tagged
+    `exit_reason="manual"`."""
+    with session_scope(session_factory) as session:
+        row = find_open_position(session, symbol=symbol, exchange=exchange)
+        if row is None:
+            return None
+        _close_position(
+            session,
+            execution=execution,
+            cost_model=cost_model,
+            row=row,
+            exit_premium=current_premium,
+            exit_reason="manual",
+            as_of=as_of,
+        )
+        return row.client_order_id

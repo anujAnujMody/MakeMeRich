@@ -1,6 +1,7 @@
 """FastAPI app entrypoint. CORS origins come from `Settings.cors_origins` —
 never hardcoded, per the plan."""
 
+import datetime as dt
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -25,13 +26,18 @@ from te.api.routers import (
     strategies,
     trades,
 )
-from te.engine.scheduler import build_scheduler
+from te.domain.clock import IST
+from te.engine.scheduler import build_scheduler, should_start_recorder_now
+from te.ops.logging import configure_logging
 from te.persistence.db import engine_from_settings
 from te.settings import Settings
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings()
+    # Before anything else touches a logger — `configure_logging` only
+    # affects loggers created/used after it runs (see te/ops/logging.py).
+    configure_logging(settings.env)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -50,7 +56,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # that a router needs but that aren't a DB/settings dependency.
         app.state.scheduler = scheduler
         app.state.paper_cycle_runner = paper_cycle_runner
+        # Exposed for GET /api/broker-status (te/api/routers/broker.py) —
+        # `WSRecorderSupervisor.is_running()` is the real broker-connection
+        # signal; before this the endpoint was a literal Phase-0 stub always
+        # returning `connected=False`, found live on 2026-07-30 showing
+        # "Disconnected"/"Down" on the Ops page all day despite the broker
+        # actually streaming ticks continuously.
+        app.state.ws_supervisor = supervisor
         scheduler.start()
+        # Catch-up: the 09:10 IST cron trigger fires once and
+        # `BackgroundScheduler` has no memory of a missed fire — a same-day
+        # restart after 09:10 would otherwise silently lose the rest of the
+        # session's bars until tomorrow. See `should_start_recorder_now`.
+        if should_start_recorder_now(dt.datetime.now(IST)):
+            supervisor.start()
         try:
             yield
         finally:

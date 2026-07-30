@@ -11,11 +11,19 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Literal, Self
 
-from pydantic import SecretStr, model_validator
+from pydantic import SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    #: Deliberately NO `env_file` here — see the module docstring's "NO
+    #: defaults" rule. A silent fallback file would defeat the exact
+    #: `test_settings_fails_without_*` tests that rule exists for. The
+    #: bare-host dev engine (`yarn dev:engine`/`dev:all`) instead loads
+    #: `engine/.env` at the SHELL level (`dotenv run --`) before this class
+    #: ever runs, so those values arrive as real process env vars — the same
+    #: mechanism Docker Compose uses, not a second, quieter source Settings
+    #: itself falls back to.
     model_config = SettingsConfigDict(env_prefix="TE_", extra="ignore")
 
     env: Literal["dev", "prod"]
@@ -55,7 +63,7 @@ class Settings(BaseSettings):
     paper_cycle_exchange: str = "NFO"
     paper_cycle_strategy: str = "orb"
     paper_cycle_lot_size: int = 65
-    paper_cycle_capital_paise: int = 2_500_000
+    paper_cycle_capital_paise: int = 2_000_000
     paper_cycle_risk_budget_pct: Decimal = Decimal(2)
     paper_cycle_min_edge_multiple: Decimal = Decimal("1.2")
     paper_cycle_stop_distance_paise: int = 700
@@ -66,6 +74,37 @@ class Settings(BaseSettings):
     paper_cycle_max_daily_loss_paise: int = 1_000_000
     paper_cycle_max_concurrent_positions: int = 5
     paper_cycle_max_trades_per_day: int = 20
+
+    # Automated daily OpenAlgo-app + Angel-broker relogin (te.broker.openalgo_login)
+    # — Angel expires its broker session nightly regardless of restarts; ALL
+    # FIVE optional so every existing `Settings()` call site (tests included)
+    # keeps working unchanged. `_run_openalgo_relogin` simply skips with a
+    # logged reason when any is unset, same convention as
+    # `paper_cycle_instruments`'s empty-tuple no-op above.
+    openalgo_app_username: str | None = None
+    openalgo_app_password: SecretStr | None = None
+    angel_client_id: str | None = None
+    angel_pin: SecretStr | None = None
+    angel_totp_secret: SecretStr | None = None
+
+    @field_validator(
+        "openalgo_app_username",
+        "openalgo_app_password",
+        "angel_client_id",
+        "angel_pin",
+        "angel_totp_secret",
+        mode="before",
+    )
+    @classmethod
+    def _blank_relogin_field_is_unset(cls, value: object) -> object:
+        """Docker Compose's `${VAR:-}` substitution passes an EMPTY STRING,
+        not an unset variable, when `VAR` is missing from `.env` — which
+        would otherwise satisfy the `str | None` type as `""` rather than
+        falling through to the `None` default, silently defeating
+        `run_openalgo_relogin`'s all-or-nothing "not configured" check (it
+        would see 5 present-but-blank values and attempt a real login with
+        empty credentials instead of skipping)."""
+        return None if value == "" else value
 
     @model_validator(mode="after")
     def _cross_env_guard(self) -> Self:

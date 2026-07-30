@@ -78,7 +78,12 @@ export function LearningPage() {
         {trainLoading ? (
           <div className="h-48 animate-pulse rounded-lg bg-muted" />
         ) : training ? (
-          <MLTrainingResultsCard training={training} onRetrain={() => retrain.mutate()} isRetraining={retrain.isPending} />
+          <MLTrainingResultsCard
+            training={training}
+            onRetrain={() => retrain.mutate()}
+            isRetraining={retrain.isPending}
+            retrainError={retrain.isError ? retrain.error.message : undefined}
+          />
         ) : null}
 
         {statsErr && (

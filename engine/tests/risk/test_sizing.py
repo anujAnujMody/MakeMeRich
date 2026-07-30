@@ -130,6 +130,75 @@ def test_sizing_never_returns_zero_lots_silently(cost_model: CostModel, kwargs: 
         assert result.rejected_reason is None
 
 
+def test_max_position_size_pct_caps_lots_below_the_risk_and_capital_caps(cost_model: CostModel) -> None:
+    """A position can be well within its risk budget yet still tie up an
+    outsized share of capital in one bet when the stop is close to premium
+    — `max_position_size_pct` is a separate notional cap from
+    `risk_budget_pct`. A generous risk budget (10%) would otherwise size
+    many more lots than a tight 5%-of-capital position cap should allow."""
+    shared: dict[str, object] = {
+        "capital": Paise(2_500_000),  # ₹25,000
+        "risk_budget_pct": Decimal(10),
+        "premium": Paise(3_500),  # ₹35
+        "stop_premium": Paise(3_400),  # tight stop -> risk budget alone would size many lots
+        "target_premium": Paise(4_500),
+        "lot_size": 65,
+        "costs": cost_model,
+        "exchange": "NFO",
+        "on": ON,
+        "min_edge_multiple": Decimal("1.5"),
+    }
+
+    uncapped = size_position(**shared, max_position_size_pct=Decimal(100))  # type: ignore[arg-type]
+    capped = size_position(**shared, max_position_size_pct=Decimal(30))  # type: ignore[arg-type]
+
+    assert uncapped.lots > capped.lots
+    assert capped.lots >= 1
+    # premium=₹35 x lot_size=65 = ₹2,275/lot notional; ₹25,000 x 30% = ₹7,500 caps it at 3 lots,
+    # well below the risk-budget/capital-affordability answer (10 lots).
+    notional_per_lot = 3_500 * 65
+    max_notional = int(2_500_000 * Decimal(30) / 100)
+    assert capped.lots == max_notional // notional_per_lot
+
+
+def test_max_position_size_pct_rejects_with_a_real_reason_when_too_tight(cost_model: CostModel) -> None:
+    result = size_position(
+        capital=Paise(2_500_000),
+        risk_budget_pct=Decimal(10),
+        premium=Paise(3_500),
+        stop_premium=Paise(3_400),
+        target_premium=Paise(4_500),
+        lot_size=65,
+        costs=cost_model,
+        exchange="NFO",
+        on=ON,
+        min_edge_multiple=Decimal("1.5"),
+        max_position_size_pct=Decimal("0.1"),  # far too tight for even 1 lot at ~₹2,275
+    )
+
+    assert result.lots == 0
+    assert result.rejected_reason is not None
+    assert "max_position_size_pct" in result.rejected_reason
+
+
+def test_max_position_size_pct_defaults_to_100_matching_pre_existing_behaviour(cost_model: CostModel) -> None:
+    shared: dict[str, object] = {
+        "capital": Paise(2_500_000),
+        "risk_budget_pct": Decimal(2),
+        "premium": Paise(3_500),
+        "stop_premium": Paise(2_800),
+        "target_premium": Paise(4_500),
+        "lot_size": 65,
+        "costs": cost_model,
+        "exchange": "NFO",
+        "on": ON,
+        "min_edge_multiple": Decimal("1.5"),
+    }
+    without_param = size_position(**shared)  # type: ignore[arg-type]
+    with_explicit_100 = size_position(**shared, max_position_size_pct=Decimal(100))  # type: ignore[arg-type]
+    assert without_param == with_explicit_100
+
+
 def test_sizing_result_constructor_rejects_zero_lots_without_reason() -> None:
     """The invariant is enforced at the type's own constructor, not just by
     convention in `size_position()` — a caller can't accidentally construct

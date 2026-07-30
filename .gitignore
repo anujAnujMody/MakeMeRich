@@ -28,3 +28,7 @@ log/
 # Leftover data/model artifacts from the pre-rewrite engine.
 data/
 engine/data/
+
+# Bare-host dev engine's isolated dev DB/bar store (yarn dev:engine / dev:all)
+# — see engine/.env.
+engine/data-local/

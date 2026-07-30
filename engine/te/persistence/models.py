@@ -78,6 +78,39 @@ class Instrument(Base):
     updated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class OptionBhav(Base):
+    """Read-side ORM mirror of `te.data.bhav_store.option_bhav` (see that
+    module's docstring — this is the actual historical bhavcopy DATA table,
+    distinct from `BarIngestLog`'s audit-only row counts). Keep the two
+    column lists in sync by hand, same convention as `Instrument`/
+    `BarIngestLog` above."""
+
+    __tablename__ = "option_bhav"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    trade_date: Mapped[dt.date] = mapped_column(nullable=False)
+    symbol: Mapped[str] = mapped_column(String(16), nullable=False)
+    expiry: Mapped[dt.date] = mapped_column(nullable=False)
+    strike: Mapped[float] = mapped_column(nullable=False)
+    option_type: Mapped[str] = mapped_column(String(2), nullable=False)
+    exchange: Mapped[str] = mapped_column(String(8), nullable=False)
+    open: Mapped[float] = mapped_column(nullable=False)
+    high: Mapped[float] = mapped_column(nullable=False)
+    low: Mapped[float] = mapped_column(nullable=False)
+    close: Mapped[float] = mapped_column(nullable=False)
+    settle_price: Mapped[float] = mapped_column(nullable=False)
+    open_interest: Mapped[int] = mapped_column(nullable=False)
+    change_in_oi: Mapped[int] = mapped_column(nullable=False)
+    volume: Mapped[int] = mapped_column(nullable=False)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "trade_date", "exchange", "symbol", "expiry", "strike", "option_type", name="uq_option_bhav_contract_day"
+        ),
+    )
+
+
 class OrderEventRow(Base):
     """Append-only source of truth for Phase 3's execution core — see
     `te/execution/store.py`. Never UPDATEd or DELETEd; `Order`/fill/position

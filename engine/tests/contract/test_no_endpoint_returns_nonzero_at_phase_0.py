@@ -25,6 +25,19 @@ client = TestClient(app)
 # not ban them.
 ALLOWED_NONZERO_PATHS = {
     "/api/market-status",  # status/label are a valid enum default, not a metric
+    # maxDrawdownLimitPct defaults to 100 (= no cap enforced) via
+    # `te.engine.state.guardrails_defaults_from_settings` when no guardrails
+    # have been saved yet — a real, honest config default (this guardrail
+    # was never enforced before the Tier-1 wiring pass added it), not a
+    # measured/fabricated metric. currentDrawdownPct/lastSuccessfulPollSecondsAgo
+    # on this same endpoint are still genuinely 0.
+    "/api/engine/health",
+    # dailyLossLimit/maxPositions/maxTradesPerDay are the same guardrail
+    # config defaults as above, surfaced on the dashboard snapshot too (see
+    # `te.api.routers.dashboard.get_dashboard_snapshot`) — real configured
+    # limits, not measured metrics. todayPnl/tradesToday/openPositionsCount
+    # etc. on this same endpoint are still genuinely 0.
+    "/api/dashboard/snapshot",
 }
 
 

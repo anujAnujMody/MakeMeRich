@@ -58,7 +58,16 @@ class OrderRequest:
     """What a caller (e.g. `te.risk.sizing`, later phases) asks
     `ExecutionManager.submit()` for. Deliberately has no `client_order_id`/
     `ts` — those are minted by the execution core, never by the caller, so
-    idempotency can't be bypassed by a caller supplying its own id."""
+    idempotency can't be bypassed by a caller supplying its own id.
+
+    `reduce_only` is the caller's explicit declaration that this order can
+    only shrink/close existing exposure, never open new exposure — what
+    `ExecutionManager.submit()` checks to decide whether a halt should
+    block it (see that method's docstring). Declared explicitly by the
+    caller that actually knows the intent (`te.engine.cycle._close_position`
+    sets it) rather than inferred from `side`, so a future order path this
+    project doesn't have yet (a hedge, a spread leg) can't silently bypass
+    the halt just because it happens to submit a SELL."""
 
     symbol: str
     exchange: str
@@ -66,6 +75,7 @@ class OrderRequest:
     quantity: int
     order_type: OrderType = "MARKET"
     limit_price: Paise | None = None
+    reduce_only: bool = False
 
 
 @dataclass(frozen=True)

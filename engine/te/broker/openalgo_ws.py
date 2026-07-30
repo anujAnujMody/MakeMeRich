@@ -91,7 +91,18 @@ class OpenAlgoWSClient:
         `type == "market_data"` frame to `on_tick`, and transparently
         reconnects (re-auth + re-subscribe, always both) on any connection
         drop. Runs until `max_retries` consecutive connection failures (if
-        set) or cancellation."""
+        set) or cancellation.
+
+        `on_tick` exceptions are caught per-message and logged, never
+        allowed to escape this loop. Found live: `on_tick` ultimately calls
+        `BarStore.append()`, and a single write failure (a real incident,
+        see `te.data.barstore`'s non-atomic-write fix) used to propagate
+        all the way out of this coroutine — killing the task while
+        `WSRecorderSupervisor`'s dedicated thread kept running
+        (`loop.run_forever()` has nothing left to run), so recording
+        silently stopped for the rest of the session with no crash, no
+        restart, and no signal anywhere. One bad tick must never take down
+        every tick after it."""
         attempt = 0
         while True:
             try:
@@ -102,7 +113,10 @@ class OpenAlgoWSClient:
                     async for raw in ws:
                         message = json.loads(raw)
                         if message.get("type") == "market_data":
-                            on_tick(message)
+                            try:
+                                on_tick(message)
+                            except Exception:
+                                logger.exception("on_tick handler raised — dropping this tick, connection stays up")
             except (ConnectionClosed, OSError):
                 attempt += 1
                 if max_retries is not None and attempt > max_retries:

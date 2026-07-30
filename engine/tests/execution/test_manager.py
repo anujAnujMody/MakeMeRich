@@ -25,7 +25,7 @@ _ZERO_COSTS = CostBreakdown(
 )
 
 
-def _request(*, side: str = "BUY", qty: int = 65) -> OrderRequest:
+def _request(*, side: str = "BUY", qty: int = 65, reduce_only: bool = False) -> OrderRequest:
     return OrderRequest(
         symbol="NIFTY30JUN2626500CE",
         exchange="NFO",
@@ -33,6 +33,7 @@ def _request(*, side: str = "BUY", qty: int = 65) -> OrderRequest:
         quantity=qty,
         order_type="LIMIT",
         limit_price=Paise(10_000),  # type: ignore[arg-type]
+        reduce_only=reduce_only,
     )
 
 
@@ -151,6 +152,48 @@ def test_submit_refuses_when_halted(session_factory, store: OrderEventStore) -> 
 
     with pytest.raises(Exception, match="halt"):
         manager.submit(_request())
+    assert broker.calls == 0
+
+
+def test_submit_still_places_reduce_only_orders_when_halted(session_factory, store: OrderEventStore) -> None:  # noqa: ANN001
+    """A halt must block new exposure but never block reducing it —
+    `reduce_only=True` is the caller's explicit declaration of that (set by
+    `te.engine.cycle._close_position` on every exit/square-off SELL).
+    Regression test for a live bug: the halt used to block every SELL
+    unconditionally, stranding open positions with no working
+    stop-loss/trailing-stop/time-exit for the rest of the halt."""
+    from te.execution.halt import set_halt
+
+    with session_factory() as session:
+        set_halt(session, "test halt")
+        session.commit()
+
+    broker = _SucceedingBroker()
+    manager = ExecutionManager(session_factory, store, broker, _NoLimiter(), clock=lambda: TS)
+
+    client_order_id = manager.submit(_request(side="SELL", reduce_only=True))
+
+    assert broker.calls == 1
+    order = store.fold_order(client_order_id)
+    assert order.status == "ACCEPTED"
+
+
+def test_submit_still_blocks_a_sell_that_is_not_marked_reduce_only(session_factory, store: OrderEventStore) -> None:  # noqa: ANN001
+    """The halt bypass is driven by the explicit `reduce_only` flag, not by
+    `side` alone — a SELL that doesn't declare itself reduce-only is still
+    blocked. Guards against silently reintroducing the side-based inference
+    this flag replaced."""
+    from te.execution.halt import set_halt
+
+    with session_factory() as session:
+        set_halt(session, "test halt")
+        session.commit()
+
+    broker = _SucceedingBroker()
+    manager = ExecutionManager(session_factory, store, broker, _NoLimiter(), clock=lambda: TS)
+
+    with pytest.raises(Exception, match="halt"):
+        manager.submit(_request(side="SELL", reduce_only=False))
     assert broker.calls == 0
 
 

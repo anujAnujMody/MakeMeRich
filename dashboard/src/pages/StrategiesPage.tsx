@@ -82,7 +82,7 @@ export function StrategiesPage() {
               <span className="text-xs text-muted-foreground">
                 {active.length - activePausedCount} active, {activePausedCount} paused, {inactive.length} inactive
               </span>
-              <Badge variant="secondary" className="text-[10px]">Auto-discover ON</Badge>
+              <Badge variant="secondary" className="text-[10px]">No autonomous strategy discovery yet</Badge>
             </div>
 
             <div className="space-y-2">

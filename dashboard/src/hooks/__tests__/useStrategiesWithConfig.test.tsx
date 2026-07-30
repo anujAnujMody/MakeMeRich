@@ -11,15 +11,7 @@ function createWrapper() {
 }
 
 describe('useStrategiesWithConfig', () => {
-  it('joins each strategy card to its matching config entry, where one exists', async () => {
-    const { result } = renderHook(() => useStrategiesWithConfig(), { wrapper: createWrapper() })
-    await waitFor(() => expect(result.current.isLoading).toBe(false))
-
-    const orbs = result.current.active.find((s) => s.name === 'Nifty ORBS Breakout')
-    expect(orbs?.config?.name).toBe('orbs')
-  })
-
-  it('leaves config undefined when no matching entry exists, rather than guessing', async () => {
+  it('leaves config undefined — the per-strategy config source this used to join against never reached the real engine, so it is not pretended to exist', async () => {
     const { result } = renderHook(() => useStrategiesWithConfig(), { wrapper: createWrapper() })
     await waitFor(() => expect(result.current.isLoading).toBe(false))
 

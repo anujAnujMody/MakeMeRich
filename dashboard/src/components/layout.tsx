@@ -8,6 +8,7 @@ import { useThemeSync } from '@/hooks/useThemeSync'
 import { MarketClock } from '@/components/MarketClock'
 import { BottomNav } from '@/components/BottomNav'
 import { GoLiveConfirmDialog } from '@/components/GoLiveConfirmDialog'
+import { MockDataBanner } from '@/components/MockDataBanner'
 import {
   Sun,
   Moon,
@@ -106,6 +107,7 @@ export function Layout() {
       </aside>
 
       <div className="flex-1 flex flex-col min-w-0">
+        <MockDataBanner />
         <header className="flex items-center justify-between gap-2 h-14 px-3 sm:px-6 border-b bg-background shrink-0">
           <div className="flex items-center gap-2 text-sm text-muted-foreground min-w-0">
             <span className="text-foreground font-medium truncate">{currentLabel}</span>

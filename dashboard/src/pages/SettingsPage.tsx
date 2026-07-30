@@ -1,6 +1,6 @@
 import { useShallow } from 'zustand/react/shallow'
 import { useSettingsStore } from '@/stores/settingsStore'
-import { useStrategiesConfig, useSaveStrategiesConfig } from '@/hooks/useAgentData'
+import { useInstrumentSelections, useSaveInstrumentSelections } from '@/hooks/useAgentData'
 import { PageHeader } from '@/components/PageHeader'
 import { TradingModeCard } from '@/components/TradingModeCard'
 import { AccountGuardrailsCard } from '@/components/AccountGuardrailsCard'
@@ -73,8 +73,8 @@ export function SettingsPage() {
       setOpenrouterKey: s.setOpenrouterKey,
     })),
   )
-  const { data: strategiesConfig, isLoading: configLoading } = useStrategiesConfig()
-  const saveConfig = useSaveStrategiesConfig()
+  const { data: instrumentSelections, isLoading: instrumentsLoading } = useInstrumentSelections()
+  const saveInstruments = useSaveInstrumentSelections()
 
   return (
     <div>
@@ -85,13 +85,13 @@ export function SettingsPage() {
 
         <AccountGuardrailsCard />
 
-        {configLoading ? (
+        {instrumentsLoading ? (
           <div className="h-40 animate-pulse rounded-lg bg-muted" />
-        ) : strategiesConfig ? (
+        ) : instrumentSelections ? (
           <StrategyConfigEditor
-            config={strategiesConfig}
-            onSave={(config) => saveConfig.mutate(config)}
-            isSaving={saveConfig.isPending}
+            config={instrumentSelections}
+            onSave={(config) => saveInstruments.mutate(config)}
+            isSaving={saveInstruments.isPending}
           />
         ) : null}
 

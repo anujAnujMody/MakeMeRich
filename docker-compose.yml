@@ -49,6 +49,25 @@ services:
       - TE_OPENALGO_WS_HOST=${TE_OPENALGO_WS_HOST:-ws://openalgo:8765}
       - TE_OPENALGO_API_KEY=${OPENALGO_API_KEY}
       - TE_CORS_ORIGINS=${TE_CORS_ORIGINS:-["http://localhost:8080"]}
+      # Daily automated OpenAlgo-app + Angel-broker relogin (te.broker.openalgo_login,
+      # te.engine.scheduler's "openalgo_relogin" job, 08:40 IST) — all five
+      # optional in Settings, so an unset value here just means the job
+      # skips with a logged reason rather than crashing the engine.
+      - TE_OPENALGO_APP_USERNAME=${OPENALGO_APP_USERNAME:-}
+      - TE_OPENALGO_APP_PASSWORD=${OPENALGO_APP_PASSWORD:-}
+      - TE_ANGEL_CLIENT_ID=${CLIENT_ID:-}
+      - TE_ANGEL_PIN=${PIN:-}
+      - TE_ANGEL_TOTP_SECRET=${TOTP_SECRET:-}
+      # Without this, `paper_cycle_instruments` defaults to an empty tuple
+      # and the paper-trading cycle job runs on schedule but is a documented
+      # no-op every time — bars still record, but ORB never evaluates a
+      # signal. NIFTY only for now: CycleConfig has a single `exchange`/
+      # `lot_size` for its whole instrument list, so NIFTY+SENSEX (NFO vs
+      # BFO, different lot sizes) can't both go in this one config yet.
+      - TE_PAPER_CYCLE_INSTRUMENTS=${TE_PAPER_CYCLE_INSTRUMENTS:-["NIFTY"]}
+      # ₹20,000 starting paper capital, in paise (Paise is always integer
+      # paise — see te/domain/money.py — never a float rupee amount).
+      - TE_PAPER_CYCLE_CAPITAL_PAISE=${TE_PAPER_CYCLE_CAPITAL_PAISE:-2000000}
     volumes:
       - engine-data:/app/data
     restart: unless-stopped

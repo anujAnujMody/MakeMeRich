@@ -1,9 +1,9 @@
 import { http, HttpResponse } from 'msw'
-import type { ExecutionStatus, PaperTrade, PaperPositionCount, SkippedSignalInfo, StrategyConfig, Trade, PnLAnalysis, Order, JournalEntry, ResearchBrief, StrategyCard, DiscoveryQueueItem, DailyRecap, PatternLibraryEntry, LearningProgress, StrategiesFile } from '@/types'
+import type { ExecutionStatus, PaperTrade, PaperPositionCount, SkippedSignalInfo, StrategyConfig, Trade, PnLAnalysis, Order, JournalEntry, ResearchBrief, StrategyCard, DiscoveryQueueItem, DailyRecap, PatternLibraryEntry, LearningProgress } from '@/types'
 import type { CycleEvaluation, DashboardSnapshot } from '@/types/dashboard-snapshot'
 import type { PendingApproval } from '@/types/approval'
 import type { MaturityGateStatus, ShadowComparison } from '@/types/learning'
-import type { EngineHealthStatus } from '@/types/ops'
+import type { AccountGuardrails, EngineHealthStatus, InstrumentSelections } from '@/types/ops'
 import { mockQuotes, mockPositions, mockOrders, mockDashboard, mockEquityCurve, mockDailyPnL, mockWatchlist, mockJournalEntries, mockBrokerStatus, mockRejectedOrders } from './seed'
 
 export const mockDashboardSnapshot: DashboardSnapshot = {
@@ -125,23 +125,24 @@ function initialOrders(): Order[] {
   return [...mockOrders]
 }
 
-function initialStrategiesConfig(): StrategiesFile {
+function initialGuardrails(): AccountGuardrails {
   return {
-    check_interval_secs: 60,
-    ml_threshold: 0.55,
-    max_trades_per_day: 10,
-    risk_per_trade_pct: 1.0,
-    max_daily_loss_pct: 3.0,
-    max_drawdown_pct: 15.0,
-    max_concurrent_positions: 5,
+    capitalRupees: 20000,
+    maxDailyLossRupees: 500,
+    maxPositionSizePct: 40,
+    maxDrawdownPct: 15,
+    maxTradesPerDay: 10,
+    maxConcurrentPositions: 5,
+    riskPerTradePct: 2,
+  }
+}
+
+function initialInstrumentSelections(): InstrumentSelections {
+  return {
     instruments: [
-      { symbol: 'NIFTY', exchange: 'NSE', ticker: '^NSEI', active: true, lot_size: 65 },
-      { symbol: 'BANKNIFTY', exchange: 'NSE', ticker: '^NSEBANK', active: true, lot_size: 30 },
-      { symbol: 'SENSEX', exchange: 'BFO', ticker: 'BSE:SENSEX', active: true, lot_size: 20 },
-    ],
-    strategies: [
-      { name: 'orbs', active: true, instruments: ['NIFTY', 'BANKNIFTY', 'SENSEX'], params: { opening_minutes: 15 } },
-      { name: 'vwap_reversion', active: true, instruments: ['NIFTY'], params: {} },
+      { symbol: 'NIFTY', exchange: 'NFO', lotSize: 65, active: true },
+      { symbol: 'BANKNIFTY', exchange: 'NFO', lotSize: 30, active: true },
+      { symbol: 'SENSEX', exchange: 'BFO', lotSize: 20, active: true },
     ],
   }
 }
@@ -197,7 +198,8 @@ function initialApprovals(): PendingApproval[] {
 let orders = initialOrders()
 let executionRunning = false
 let currentMode: 'dry-run' | 'live' = 'dry-run'
-let strategiesConfig: StrategiesFile = initialStrategiesConfig()
+let guardrails: AccountGuardrails = initialGuardrails()
+let instrumentSelections: InstrumentSelections = initialInstrumentSelections()
 let engineHealth: EngineHealthStatus = initialEngineHealth()
 let approvals: PendingApproval[] = initialApprovals()
 let agentStrategies = initialAgentStrategies()
@@ -209,7 +211,8 @@ export function resetMockState(): void {
   orders = initialOrders()
   executionRunning = false
   currentMode = 'dry-run'
-  strategiesConfig = initialStrategiesConfig()
+  guardrails = initialGuardrails()
+  instrumentSelections = initialInstrumentSelections()
   engineHealth = initialEngineHealth()
   approvals = initialApprovals()
   agentStrategies = initialAgentStrategies()
@@ -524,13 +527,19 @@ export const handlers = [
 
   http.get('*/api/execution/signal-feed', () => HttpResponse.json([])),
 
-  /* ─── Strategies Config Mocks ─── */
+  /* ─── Engine guardrails / instrument selections mocks ─── */
 
-  http.get('*/api/strategies/config', () => HttpResponse.json(strategiesConfig)),
+  http.get('*/api/engine/guardrails', () => HttpResponse.json(guardrails)),
 
-  http.post('*/api/strategies/config', async ({ request }) => {
-    const body = (await request.json()) as StrategiesFile
-    strategiesConfig = body
-    return HttpResponse.json(strategiesConfig)
+  http.put('*/api/engine/guardrails', async ({ request }) => {
+    guardrails = (await request.json()) as AccountGuardrails
+    return HttpResponse.json(guardrails)
+  }),
+
+  http.get('*/api/engine/instruments', () => HttpResponse.json(instrumentSelections)),
+
+  http.put('*/api/engine/instruments', async ({ request }) => {
+    instrumentSelections = (await request.json()) as InstrumentSelections
+    return HttpResponse.json(instrumentSelections)
   }),
 ]

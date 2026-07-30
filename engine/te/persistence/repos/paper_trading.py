@@ -27,6 +27,7 @@ from te.persistence.models import (
     CycleRow,
     EvaluationConditionRow,
     OpenPositionRow,
+    OrderEventRow,
     RiskEventRow,
     SkippedSignalRow,
     TradeRow,
@@ -67,6 +68,30 @@ def record_condition(session: Session, evaluation_id: str, seq: int, condition: 
             passed=condition.passed,
             evaluated=condition.evaluated,
         )
+    )
+
+
+def evaluations_today(session: Session, on: dt.date) -> list[CycleEvaluationRow]:
+    """Every `CycleEvaluationRow` recorded today, newest first — feeds
+    `GET /api/decisions/today`. One row per (strategy, instrument, cycle),
+    regardless of verdict — `record_evaluation` writes one every cycle."""
+    start, end = _day_bounds(on)
+    return list(
+        session.execute(
+            select(CycleEvaluationRow)
+            .where(CycleEvaluationRow.ts >= start, CycleEvaluationRow.ts <= end)
+            .order_by(CycleEvaluationRow.ts.desc())
+        ).scalars().all()
+    )
+
+
+def conditions_for(session: Session, evaluation_id: str) -> list[EvaluationConditionRow]:
+    return list(
+        session.execute(
+            select(EvaluationConditionRow)
+            .where(EvaluationConditionRow.evaluation_id == evaluation_id)
+            .order_by(EvaluationConditionRow.seq)
+        ).scalars().all()
     )
 
 
@@ -124,6 +149,22 @@ def insert_open_position(
 
 def open_positions(session: Session) -> list[OpenPositionRow]:
     return list(session.execute(select(OpenPositionRow).where(OpenPositionRow.closed_at.is_(None))).scalars().all())
+
+
+def find_open_position(session: Session, *, symbol: str, exchange: str) -> OpenPositionRow | None:
+    """The lookup behind manual square-off (`POST /api/positions/squareoff`)
+    — `(symbol, exchange)` is not a DB-enforced unique key on
+    `open_positions` (nothing stops two ORB firings on the same symbol in
+    theory), so this returns the FIRST match; a real multi-position-per-
+    symbol scenario would need the caller to disambiguate by
+    `client_order_id` instead, not attempted here."""
+    return session.execute(
+        select(OpenPositionRow).where(
+            OpenPositionRow.closed_at.is_(None),
+            OpenPositionRow.symbol == symbol,
+            OpenPositionRow.exchange == exchange,
+        )
+    ).scalars().first()
 
 
 def open_positions_count(session: Session) -> int:
@@ -234,6 +275,16 @@ def daily_net_pnl_paise(session: Session, on: dt.date) -> Paise:
     return Paise(int(total))
 
 
+def total_net_pnl_paise(session: Session) -> Paise:
+    """Lifetime realized net P&L across every closed trade ever, no date
+    filter — unlike `daily_net_pnl_paise`. Feeds account equity
+    (`capital + total_net_pnl_paise + unrealized`) for the max-drawdown
+    guardrail (`te.risk.limits.check_max_drawdown`), which tracks
+    peak-to-current equity across the whole account, not just today."""
+    total = session.execute(select(func.coalesce(func.sum(TradeRow.net_pnl_paise), 0))).scalar_one()
+    return Paise(int(total))
+
+
 def recent_trades(session: Session, *, limit: int = 500) -> list[TradeRow]:
     """The most recent `limit` CLOSED trades, newest first — feeds
     `te.risk.monitors.RollingPerformance` (Tier 3, informational only)."""
@@ -254,6 +305,22 @@ def recent_session_dates(session: Session, *, limit: int) -> list[dt.date]:
         .limit(limit)
     ).scalars().all()
     return [dt.date.fromisoformat(str(row)) for row in rows]
+
+
+def order_ids_today(session: Session, on: dt.date) -> list[str]:
+    """Distinct `client_order_id`s with at least one `order_events` row on
+    `on` — the enumeration half of listing "today's orders"; the caller (the
+    `/api/orders` router) folds each id via `OrderEventStore.fold_order` to
+    get its current status, since folding is the only sanctioned way to
+    derive order state from the append-only event log (see
+    `te/execution/store.py`)."""
+    start, end = _day_bounds(on)
+    rows = session.execute(
+        select(OrderEventRow.client_order_id)
+        .distinct()
+        .where(OrderEventRow.ts >= start, OrderEventRow.ts <= end)
+    ).scalars().all()
+    return list(rows)
 
 
 def trades_closed_since(session: Session, cutoff: dt.date) -> list[TradeRow]:

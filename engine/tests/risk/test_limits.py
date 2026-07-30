@@ -6,6 +6,7 @@ confirming the halt is still in effect, simulating a process restart."""
 from __future__ import annotations
 
 import datetime as dt
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,7 @@ from te.risk.limits import (
     RiskLimitsConfig,
     check_daily_loss_limit,
     check_max_concurrent_positions,
+    check_max_drawdown,
     check_max_trades_per_day,
 )
 
@@ -150,3 +152,92 @@ def test_max_trades_per_day_blocks_at_limit(db_path: Path) -> None:
 
     with factory() as session, pytest.raises(LimitBreachError):
         check_max_trades_per_day(session, config, on=ON)
+
+
+def test_daily_loss_limit_counts_unrealized_pnl_on_open_positions(db_path: Path) -> None:
+    """Regression: an unattended session could previously run unlimited
+    unrealized drawdown across open positions without ever tripping the
+    daily-loss halt — only CLOSED trades counted."""
+    factory = _session_factory(db_path)
+    config = _config(max_daily_loss_paise=Paise(4_000_00))
+
+    with factory() as session:
+        # No closed trades at all — realized P&L is exactly 0 — but a huge
+        # unrealized loss must still trip the halt.
+        with pytest.raises(LimitBreachError):
+            check_daily_loss_limit(session, config, on=ON, now=NOW, unrealized_pnl_paise=Paise(-5_000_00))
+        session.commit()
+
+    with factory() as session:
+        assert is_halted(session) is True
+
+
+def test_daily_loss_limit_stays_clear_with_a_small_unrealized_loss(db_path: Path) -> None:
+    factory = _session_factory(db_path)
+    config = _config(max_daily_loss_paise=Paise(10_000_00))
+
+    with factory() as session:
+        check_daily_loss_limit(session, config, on=ON, now=NOW, unrealized_pnl_paise=Paise(-1_000_00))  # must not raise
+        session.commit()
+
+    with factory() as session:
+        assert is_halted(session) is False
+
+
+def test_max_drawdown_halts_when_equity_drops_from_its_peak(db_path: Path) -> None:
+    factory = _session_factory(db_path)
+    config = _config(max_drawdown_pct=Decimal(10))
+
+    with factory() as session:
+        # First observation establishes the peak (10,000).
+        check_max_drawdown(session, config, now=NOW, current_equity_paise=Paise(10_000_00))
+        session.commit()
+
+    with factory() as session:
+        # Equity has since dropped 15% from that peak — breaches the 10% cap.
+        with pytest.raises(LimitBreachError):
+            check_max_drawdown(session, config, now=NOW, current_equity_paise=Paise(8_500_00))
+        session.commit()
+
+    with factory() as session:
+        assert is_halted(session) is True
+
+
+def test_max_drawdown_peak_watermark_survives_a_restart_and_never_ratchets_down(db_path: Path) -> None:
+    factory = _session_factory(db_path)
+    config = _config(max_drawdown_pct=Decimal(50))
+
+    with factory() as session:
+        check_max_drawdown(session, config, now=NOW, current_equity_paise=Paise(10_000_00))
+        session.commit()
+    with factory() as session:
+        # Equity dips but stays within the 50% band — must not raise, and
+        # must NOT lower the stored peak.
+        check_max_drawdown(session, config, now=NOW, current_equity_paise=Paise(9_000_00))
+        session.commit()
+
+    # Simulate a restart: fresh session factory against the same db file.
+    restarted_factory = _session_factory(db_path)
+    with restarted_factory() as session:
+        # A drop to just above 50% of the ORIGINAL 10,000 peak (not the
+        # lower 9,000 the account dipped to) must still be safe.
+        check_max_drawdown(session, config, now=NOW, current_equity_paise=Paise(5_100_00))  # must not raise
+        session.commit()
+    with restarted_factory() as session:
+        # But a drop below 50% of the original peak trips it.
+        with pytest.raises(LimitBreachError):
+            check_max_drawdown(session, config, now=NOW, current_equity_paise=Paise(4_900_00))
+
+
+def test_max_drawdown_disabled_by_default_matches_pre_existing_config(db_path: Path) -> None:
+    """`max_drawdown_pct` defaults to 100 (a no-op) so a `RiskLimitsConfig`
+    built before this guardrail existed keeps behaving identically."""
+    factory = _session_factory(db_path)
+    config = _config()  # no max_drawdown_pct override -> Decimal(100)
+
+    with factory() as session:
+        check_max_drawdown(session, config, now=NOW, current_equity_paise=Paise(10_000_00))
+        session.commit()
+    with factory() as session:
+        # Equity crashes to nearly 0 — still must not raise at the default 100%.
+        check_max_drawdown(session, config, now=NOW, current_equity_paise=Paise(1))

@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '@/lib/api'
-import type { StrategiesFile, StrategyCard, DiscoveryQueueItem, LearningProgress, EngineStats, PatternLibraryEntry, TrainingResults } from '@/types'
+import type { StrategyCard, DiscoveryQueueItem, LearningProgress, EngineStats, PatternLibraryEntry, TrainingResults } from '@/types'
+import type { AccountGuardrails, InstrumentSelections } from '@/types/ops'
 
 export function useAgentStrategies() {
   return useQuery<{ active: StrategyCard[]; inactive: StrategyCard[]; queue: DiscoveryQueueItem[] }>({
@@ -75,20 +76,45 @@ export function useRetrain() {
 
 /* ─── Strategies Config Hooks ─── */
 
-export function useStrategiesConfig() {
-  return useQuery<StrategiesFile>({
-    queryKey: ['strategies-config'],
-    queryFn: () => api.strategiesConfig.get(),
+/** Live account guardrails (capital, risk limits) — `GET`/`PUT
+ * /api/engine/guardrails`, real: `PaperCycleRunner` reads the same call on
+ * every cycle, no restart needed (see the plan's "Dashboard<->engine wiring
+ * remediation", Tier 1). Replaces the old `useStrategiesConfig`, which
+ * pointed at a process-local dict the engine never read. */
+export function useGuardrails() {
+  return useQuery<AccountGuardrails>({
+    queryKey: ['guardrails'],
+    queryFn: () => api.engine.guardrails(),
     refetchInterval: 30_000,
   })
 }
 
-export function useSaveStrategiesConfig() {
+export function useSaveGuardrails() {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: (config: StrategiesFile) => api.strategiesConfig.put(config),
+    mutationFn: (payload: AccountGuardrails) => api.engine.saveGuardrails(payload),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['strategies-config'] })
+      qc.invalidateQueries({ queryKey: ['guardrails'] })
+    },
+  })
+}
+
+/** Live instrument selections (which symbols trade, each with its own
+ * exchange/lot size) — `GET`/`PUT /api/engine/instruments`. */
+export function useInstrumentSelections() {
+  return useQuery<InstrumentSelections>({
+    queryKey: ['instrument-selections'],
+    queryFn: () => api.engine.instruments(),
+    refetchInterval: 30_000,
+  })
+}
+
+export function useSaveInstrumentSelections() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (payload: InstrumentSelections) => api.engine.saveInstruments(payload),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['instrument-selections'] })
     },
   })
 }

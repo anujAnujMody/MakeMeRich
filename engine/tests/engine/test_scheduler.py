@@ -8,21 +8,30 @@ start/stop lifecycle."""
 from __future__ import annotations
 
 import datetime as dt
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 from sqlalchemy import create_engine
 
+from te.broker.openalgo_login import LoginResult
 from te.broker.openalgo_ws import Instrument, OpenAlgoWSClient
 from te.data.barstore import BarStore
 from te.data.recorder import BarRecorder
 from te.domain.clock import IST
 from te.domain.money import Paise
 from te.engine import scheduler as scheduler_module
-from te.engine.scheduler import PaperCycleRunner, WSRecorderSupervisor, build_scheduler
-from te.engine.state import set_mode
+from te.engine.scheduler import (
+    PaperCycleRunner,
+    WSRecorderSupervisor,
+    build_scheduler,
+    run_openalgo_relogin,
+    should_start_recorder_now,
+)
+from te.engine.state import AccountGuardrails, set_guardrails, set_mode, set_run_state
 from te.persistence.db import make_engine, make_session_factory
 from te.persistence.models import Base
+from te.risk import killswitch
 from te.risk.killswitch import trip as trip_killswitch
 from te.settings import Settings
 
@@ -41,15 +50,112 @@ def _settings(**overrides: object) -> Settings:
     return Settings(**defaults)  # type: ignore[arg-type]
 
 
-def test_build_scheduler_registers_all_four_jobs(tmp_path: Path) -> None:
+def test_should_start_recorder_now_true_mid_session_weekday() -> None:
+    """Regression for 2026-07-30: a mid-day engine redeploy after the 09:10
+    IST cron trigger already fired left bar recording silently stopped for
+    the rest of the session, since `BackgroundScheduler` has no memory of a
+    missed fire. This is the catch-up check `te.api.main`'s lifespan runs
+    right after `scheduler.start()`."""
+    wednesday_noon_ist = dt.datetime(2026, 7, 29, 12, 0, tzinfo=IST)
+    assert should_start_recorder_now(wednesday_noon_ist) is True
+
+
+def test_should_start_recorder_now_false_outside_window() -> None:
+    wednesday_night_ist = dt.datetime(2026, 7, 29, 20, 0, tzinfo=IST)
+    assert should_start_recorder_now(wednesday_night_ist) is False
+
+
+def test_should_start_recorder_now_false_on_weekend() -> None:
+    saturday_noon_ist = dt.datetime(2026, 8, 1, 12, 0, tzinfo=IST)
+    assert should_start_recorder_now(saturday_noon_ist) is False
+
+
+def test_should_start_recorder_now_accepts_non_ist_input() -> None:
+    """`now` can arrive in any tz (e.g. UTC, as `dt.datetime.now(IST)`'s
+    caller might pass through a differently-configured clock) — the check
+    must convert, not assume the caller already passed IST."""
+    utc_mid_session = dt.datetime(2026, 7, 29, 6, 30, tzinfo=dt.UTC)  # 12:00 IST
+    assert should_start_recorder_now(utc_mid_session) is True
+
+
+def test_fno_lot_size_contracts_are_real_derivative_symbols_not_index_quotes() -> None:
+    """Regression for 2026-07-30: instrument sync used to query
+    `NSE_INDEX`/`BSE_INDEX` quote symbols (`NIFTY`, `SENSEX`, ...) for lot
+    size — an index has no lot size of its own, so the broker honestly
+    returned `lotsize=1`/`instrumenttype="INDEX"` for all four, and the
+    `instruments` table silently never held a real, usable lot size. Fixed
+    by resolving each underlying's real FUT contract instead — futures need
+    no strike to exist, and lot size is identical across every FUT/CE/PE
+    contract in the same underlying+expiry series.
+
+    Always the MONTHLY expiry, even for NIFTY/SENSEX (whose OPTIONS trade
+    weekly) — index FUTURES are monthly-only on NSE/BSE regardless of the
+    same underlying's options cadence. An earlier version of this fix used
+    the weekly cadence for NIFTY/SENSEX and 404'd against the real broker
+    (`NIFTY04AUG26FUT` does not exist; only `NIFTY25AUG26FUT` does)."""
+    reference = dt.date(2026, 7, 30)  # a Thursday
+    contracts = dict(scheduler_module._fno_lot_size_contracts(reference))
+
+    assert contracts["NIFTY25AUG26FUT"] == "NFO"  # last Tuesday of August
+    assert contracts["BANKNIFTY25AUG26FUT"] == "NFO"  # last Tuesday of August
+    assert contracts["SENSEX30JUL26FUT"] == "BFO"  # today is the last Thursday of July
+    assert contracts["BANKEX30JUL26FUT"] == "BFO"  # today is the last Thursday of July
+
+
+def test_run_openalgo_relogin_skips_when_not_configured() -> None:
+    result = run_openalgo_relogin(_settings())
+    assert result == LoginResult(False, "not_configured", "openalgo relogin skipped: credentials not configured")
+
+
+def test_run_openalgo_relogin_calls_login_openalgo_with_settings_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_login_openalgo(host: str, **kwargs: object) -> LoginResult:
+        captured["host"] = host
+        captured.update(kwargs)
+        return LoginResult(True, "done", "logged in")
+
+    monkeypatch.setattr(scheduler_module, "login_openalgo", fake_login_openalgo)
+
+    settings = _settings(
+        openalgo_app_username="app-user",
+        openalgo_app_password="app-pass",
+        angel_client_id="C123",
+        angel_pin="1234",
+        angel_totp_secret="JBSWY3DPEHPK3PXP",
+    )
+    result = run_openalgo_relogin(settings)
+
+    assert result.ok is True
+    assert captured["host"] == settings.openalgo_host
+    assert captured["app_username"] == "app-user"
+    assert captured["app_password"] == "app-pass"
+    assert captured["angel_client_id"] == "C123"
+    assert captured["angel_pin"] == "1234"
+    assert captured["angel_totp_secret"] == "JBSWY3DPEHPK3PXP"
+
+
+def test_build_scheduler_registers_all_five_jobs(tmp_path: Path) -> None:
     engine = create_engine("sqlite:///:memory:")
     scheduler, supervisor, runner = build_scheduler(_settings(), engine=engine, bar_store=BarStore(tmp_path))
 
     job_ids = {job.id for job in scheduler.get_jobs()}
-    assert job_ids == {"ws_recorder_start", "ws_recorder_stop", "bhavcopy_ingest", "instrument_sync", "paper_cycle"}
+    assert job_ids == {
+        "openalgo_relogin",
+        "ws_recorder_start",
+        "ws_recorder_stop",
+        "bhavcopy_ingest",
+        "instrument_sync",
+        "paper_cycle",
+    }
 
     ws_start = scheduler.get_job("ws_recorder_start")
     assert "9" in str(ws_start.trigger.fields[5])  # hour field
+
+    relogin_job = scheduler.get_job("openalgo_relogin")
+    assert "8" in str(relogin_job.trigger.fields[5])  # hour field — before instrument_sync (08:45)
     ws_stop = scheduler.get_job("ws_recorder_stop")
     assert "15" in str(ws_stop.trigger.fields[5])
 
@@ -143,6 +249,42 @@ def test_ws_recorder_supervisor_start_stop_lifecycle(tmp_path: Path) -> None:
     assert not supervisor.is_running()
 
 
+def test_ws_recorder_supervisor_reports_not_running_when_its_task_has_died(tmp_path: Path) -> None:
+    """Regression: thread-liveness alone used to be the whole `is_running()`
+    check — `loop.run_forever()` keeps the background thread alive even
+    after its one WS task finishes (with or without an exception), so a
+    dead task used to still report `is_running() -> True` forever. This is
+    exactly the state `GET /api/broker-status` reads to decide
+    `connected`. Tests `is_running()`'s logic directly against lightweight
+    fakes rather than racing a real thread/event loop."""
+    store = BarStore(tmp_path)
+    recorder = BarRecorder(store)
+    ws_client = OpenAlgoWSClient(url="ws://localhost:1", api_key="test-key")
+    supervisor = WSRecorderSupervisor(ws_client, recorder)
+
+    class _FakeThread:
+        def is_alive(self) -> bool:
+            return True
+
+    class _FakeTask:
+        def __init__(self, *, done: bool) -> None:
+            self._done = done
+
+        def done(self) -> bool:
+            return self._done
+
+    supervisor._thread = _FakeThread()  # type: ignore[assignment]
+
+    supervisor._task = None
+    assert supervisor.is_running() is True  # still starting up — not a false negative
+
+    supervisor._task = _FakeTask(done=False)  # type: ignore[assignment]
+    assert supervisor.is_running() is True  # thread alive, task still running
+
+    supervisor._task = _FakeTask(done=True)  # type: ignore[assignment]
+    assert supervisor.is_running() is False  # thread alive, but its task has died
+
+
 _CHARGES_PATH = Path(__file__).resolve().parents[2] / "config" / "charges.yaml"
 
 
@@ -178,12 +320,27 @@ def _runner(tmp_path: Path, *, clock: object) -> PaperCycleRunner:
     db_engine = make_engine(f"sqlite:///{tmp_path / 'scheduler_cycle_test.db'}")
     Base.metadata.create_all(db_engine)
     session_factory = make_session_factory(db_engine)
+    # `get_run_state`'s real default is "paused" (te.engine.state) — every
+    # pre-existing test here predates the pause gate and expects the cycle
+    # to run unless it explicitly tests halt/mode/session/pause, so set
+    # "running" here; `test_paper_cycle_skips_when_paused` overrides it back.
+    with session_factory() as session:
+        set_run_state(session, "running")
+        session.commit()
+    # `te.risk.killswitch`'s in-process flag (layer 1) is a MODULE-LEVEL
+    # global, not per-DB state — a prior test in this file calling
+    # `trip_killswitch()` leaves it tripped for every test that runs after
+    # it in the same process, regardless of which DB file it uses. Reset it
+    # per the module's own documented test-isolation pattern (its docstring:
+    # "tests that simulate a restart").
+    killswitch.reset_in_process_cache()
     return PaperCycleRunner(
         session_factory=session_factory,
         store=BarStore(tmp_path / "bars"),
         charge_rate_table=load_charge_rate_table(_CHARGES_PATH),
         config=_cycle_config(),  # type: ignore[arg-type]
         max_orders_per_second=5,
+        settings=_settings(),
         clock=clock,  # type: ignore[arg-type]
     )
 
@@ -223,7 +380,12 @@ def test_paper_cycle_runs_when_dry_run_and_not_halted(tmp_path: Path, monkeypatc
     assert runner.status.last_run_at == _during_session_clock()
 
 
-def test_paper_cycle_skips_when_halted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_paper_cycle_blocks_entries_but_still_runs_exits_when_halted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A halt must never strand an open position with no working exit plan
+    — see te/execution/manager.py's submit() docstring for the live bug
+    this is a regression test for. New entries ARE blocked."""
     calls = _patch_cycle_calls(monkeypatch)
 
     runner = _runner(tmp_path, clock=_during_session_clock)
@@ -233,8 +395,8 @@ def test_paper_cycle_skips_when_halted(tmp_path: Path, monkeypatch: pytest.Monke
 
     runner.run_once()
 
-    assert calls == {"entry": 0, "exit": 0}
-    assert runner.status.last_result == "skipped_halted"
+    assert calls == {"entry": 0, "exit": 1}
+    assert runner.status.last_result == "skipped_halted_entries_only"
 
 
 def test_paper_cycle_skips_when_mode_is_live(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -259,3 +421,174 @@ def test_paper_cycle_only_runs_during_session_window(tmp_path: Path, monkeypatch
 
     assert calls == {"entry": 0, "exit": 0}
     assert runner.status.last_result == "skipped_outside_session"
+
+
+def test_paper_cycle_skips_when_paused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The dashboard-wiring remediation's Tier 2 fix: Pause/Resume used to
+    flip a display-only field this loop never read. `run_once` must now
+    actually skip when `run_state == "paused"`, same as a halt."""
+    calls = _patch_cycle_calls(monkeypatch)
+
+    runner = _runner(tmp_path, clock=_during_session_clock)
+    with runner.session_factory() as session:
+        set_run_state(session, "paused")
+        session.commit()
+
+    runner.run_once()
+
+    assert calls == {"entry": 0, "exit": 0}
+    assert runner.status.last_result == "skipped_paused"
+
+
+def _patch_cycle_calls_capturing_config(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    """Like `_patch_cycle_calls`, but records the `config=` kwarg
+    `run_entry_cycle` was actually called with each time, so a test can
+    assert on ITS content — `_patch_cycle_calls`'s `**_kw` swallows it,
+    which can't distinguish "the live config was used" from "some config
+    was used"."""
+    captured: list[object] = []
+
+    def _entry(**kw: object) -> int:
+        captured.append(kw["config"])
+        return 0
+
+    def _exit(**_kw: object) -> list[str]:
+        return []
+
+    monkeypatch.setattr(scheduler_module, "run_entry_cycle", _entry)
+    monkeypatch.setattr(scheduler_module, "run_exit_cycle", _exit)
+    return captured
+
+
+def test_paper_cycle_falls_back_to_env_defaults_with_no_saved_guardrails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fallback source is `Settings.paper_cycle_*`
+    (`guardrails_defaults_from_settings`), NOT `runner.config`'s own
+    hardcoded test literals — `_cycle_config()`'s capital is a fixture
+    value unrelated to real env-var defaults, so the correct comparison is
+    against `runner.settings`, the actual fallback source."""
+    from te.engine.state import guardrails_defaults_from_settings
+
+    captured = _patch_cycle_calls_capturing_config(monkeypatch)
+    runner = _runner(tmp_path, clock=_during_session_clock)
+    expected = guardrails_defaults_from_settings(runner.settings)
+
+    runner.run_once()
+
+    assert len(captured) == 1
+    config = captured[0]
+    assert config.capital == expected.capital  # type: ignore[attr-defined]
+    assert config.risk_limits.max_daily_loss_paise == expected.max_daily_loss  # type: ignore[attr-defined]
+    assert config.risk_limits.max_trades_per_day == expected.max_trades_per_day  # type: ignore[attr-defined]
+
+
+def test_paper_cycle_reads_live_guardrails_without_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The core proof for the plan's Tier 1: a guardrails change saved via
+    the API takes effect on the VERY NEXT scheduled cycle, on the SAME
+    running `PaperCycleRunner` instance — no process restart needed."""
+    captured = _patch_cycle_calls_capturing_config(monkeypatch)
+    runner = _runner(tmp_path, clock=_during_session_clock)
+
+    runner.run_once()
+    first_capital = captured[-1].capital  # type: ignore[attr-defined]
+
+    with runner.session_factory() as session:
+        set_guardrails(
+            session,
+            AccountGuardrails(
+                capital=Paise(9_999_900),
+                max_daily_loss=Paise(500_000),
+                max_position_size_pct=Decimal(30),
+                max_drawdown_pct=Decimal(10),
+                max_trades_per_day=3,
+                max_concurrent_positions=1,
+                risk_per_trade_pct=Decimal("1.5"),
+            ),
+        )
+        session.commit()
+
+    runner.run_once()
+    second_config = captured[-1]
+
+    assert second_config.capital != first_capital  # type: ignore[attr-defined]
+    assert second_config.capital == Paise(9_999_900)  # type: ignore[attr-defined]
+    assert second_config.risk_budget_pct == Decimal("1.5")  # type: ignore[attr-defined]
+    assert second_config.risk_limits.max_trades_per_day == 3  # type: ignore[attr-defined]
+    assert second_config.risk_limits.max_concurrent_positions == 1  # type: ignore[attr-defined]
+    assert second_config.risk_limits.max_daily_loss_paise == Paise(500_000)  # type: ignore[attr-defined]
+
+
+def test_paper_cycle_reads_live_instrument_selections_without_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The scheduler-side half of the multi-instrument fix: saved
+    `InstrumentSelection`s reach the built `CycleConfig.instrument_configs`
+    on the next cycle, each carrying its OWN exchange/lot_size — and an
+    inactive selection is excluded entirely, not sized as 0.
+
+    Seeds real `Instrument` sync rows for NIFTY/BANKNIFTY (matching real
+    daily operation, where `instrument_sync` runs at 08:45 IST before the
+    market opens) — an instrument with NO real sync ever recorded is now
+    forced inactive regardless of its saved `active` flag (see
+    `te.engine.state._with_real_lot_size`'s "never trade on an unconfirmed
+    lot size" rule), so this test would otherwise see zero active
+    instruments rather than exercising the real per-instrument config
+    path."""
+    from te.engine.state import InstrumentSelection, set_instrument_selections
+    from te.persistence.models import Instrument as InstrumentRow
+
+    captured = _patch_cycle_calls_capturing_config(monkeypatch)
+    runner = _runner(tmp_path, clock=_during_session_clock)
+
+    with runner.session_factory() as session:
+        session.add_all(
+            [
+                InstrumentRow(
+                    symbol="NIFTY25AUG26FUT",
+                    exchange="NFO",
+                    name="NIFTY",
+                    instrument_type="FUT",
+                    expiry="25-AUG-26",
+                    strike=0.0,
+                    lot_size=65,
+                    tick_size=0.05,
+                    source="openalgo",
+                    updated_at=dt.datetime.now(dt.UTC),
+                ),
+                InstrumentRow(
+                    symbol="BANKNIFTY25AUG26FUT",
+                    exchange="NFO",
+                    name="BANKNIFTY",
+                    instrument_type="FUT",
+                    expiry="25-AUG-26",
+                    strike=0.0,
+                    lot_size=30,
+                    tick_size=0.05,
+                    source="openalgo",
+                    updated_at=dt.datetime.now(dt.UTC),
+                ),
+            ]
+        )
+        set_instrument_selections(
+            session,
+            (
+                InstrumentSelection(symbol="NIFTY", exchange="NFO", lot_size=65),
+                InstrumentSelection(symbol="BANKNIFTY", exchange="NFO", lot_size=30),
+                InstrumentSelection(symbol="SENSEX", exchange="BFO", lot_size=20, active=False),
+            ),
+        )
+        session.commit()
+
+    runner.run_once()
+    config = captured[-1]
+
+    active_symbols = {ic.symbol for ic in config.instrument_configs}  # type: ignore[attr-defined]
+    assert active_symbols == {"NIFTY", "BANKNIFTY"}  # SENSEX excluded: active=False
+
+    by_symbol = {ic.symbol: ic for ic in config.instrument_configs}  # type: ignore[attr-defined]
+    assert by_symbol["NIFTY"].lot_size == 65
+    assert by_symbol["BANKNIFTY"].lot_size == 30
+    assert by_symbol["NIFTY"].exchange == "NFO"
