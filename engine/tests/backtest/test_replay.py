@@ -235,3 +235,41 @@ def test_replay_does_not_enter_after_the_hard_exit_time(tmp_path: Path, session_
     )
 
     assert result.firings == 0, "a post-15:20 crossing became a training sample"
+
+
+def test_the_opening_range_length_actually_reaches_the_rule(tmp_path: Path, session_factory) -> None:  # noqa: ANN001
+    """`replay_orb(opening_range_minutes=...)` alone only moves the first
+    evaluable minute — the rule is built by the registry with its DEFAULT
+    15-minute range. Sweeping the parameter without a matching
+    `strategy_factory` would produce identical firings at every value and
+    read as "opening range length does not matter".
+
+    Built so the two lengths MUST disagree: the first 5 minutes are flat, then
+    price steps up and holds. A 5-minute range is broken by that step; a
+    30-minute range absorbs it into the range itself.
+    """
+    from te.strategy.orb import OrbParams, OrbStrategy
+
+    store = BarStore(tmp_path / "bars")
+    day = dt.date(2026, 6, 2)
+    rows = [_bar(_open(day, m), o=100, h=101, low=99, c=100) for m in range(5)]
+    rows += [_bar(_open(day, m), o=104, h=106, low=103, c=105) for m in range(5, 40)]
+    store.append(pd.DataFrame(rows, columns=list(BAR_COLUMNS)))
+
+    def _replay(minutes: int) -> int:
+        return replay_orb(
+            store=store,
+            session_factory=session_factory,
+            instruments={SYMBOL: EXCHANGE},
+            start=day,
+            end=day,
+            strategy_factory=lambda: OrbStrategy(OrbParams(opening_range_minutes=minutes, min_opening_bars=3)),
+            opening_range_minutes=minutes,
+        ).firings
+
+    short_range = _replay(5)
+    long_range = _replay(30)
+
+    assert short_range != long_range, (
+        f"both range lengths produced {short_range} firings — the swept value never reached the rule"
+    )

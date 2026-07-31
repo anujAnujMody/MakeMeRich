@@ -38,6 +38,7 @@ firing can always be told apart from one the live engine actually took.
 from __future__ import annotations
 
 import datetime as dt
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -52,6 +53,7 @@ from te.domain.evaluation import Evaluation
 from te.persistence.db import session_scope
 from te.persistence.models import CycleEvaluationRow
 from te.persistence.repos.paper_trading import record_cycle, record_evaluation
+from te.strategy.base import Strategy
 from te.strategy.context import StrategyContext
 from te.strategy.registry import get as get_strategy
 
@@ -140,6 +142,7 @@ def replay_orb(
     start: dt.date,
     end: dt.date,
     strategy_name: str = "orb",
+    strategy_factory: Callable[[], Strategy] | None = None,
     session_window: SessionWindow = DEFAULT_SESSION,
     opening_range_minutes: int = 15,
     last_entry_by: dt.time = DEFAULT_LAST_ENTRY,
@@ -148,6 +151,13 @@ def replay_orb(
     persists every ORB firing as a `cycle_evaluations` row.
 
     `instruments` maps symbol -> exchange (e.g. `{"NIFTY": "NSE_INDEX"}`).
+
+    `strategy_factory` builds the rule; `None` uses the registry, which
+    constructs it with its DEFAULT parameters. Pass one to vary a rule
+    parameter — `opening_range_minutes` alone only shifts the first evaluable
+    minute of the replay, it does NOT reach the rule, so sweeping it without
+    a matching factory would produce identical firings at every value and
+    read as "this parameter does not matter".
     """
     result = ReplayResult()
 
@@ -168,7 +178,7 @@ def replay_orb(
                 session_factory=session_factory,
                 symbol=symbol,
                 exchange=exchange,
-                strategy_name=strategy_name,
+                strategy_factory=strategy_factory or (lambda: get_strategy(strategy_name)),
                 first=first,
                 last=last,
                 result=result,
@@ -190,7 +200,7 @@ def _replay_one_day(
     session_factory: sessionmaker[Session],
     symbol: str,
     exchange: str,
-    strategy_name: str,
+    strategy_factory: Callable[[], Strategy],
     first: dt.datetime,
     last: dt.datetime,
     result: ReplayResult,
@@ -206,7 +216,7 @@ def _replay_one_day(
     # this loop runs once per replayed minute. `OrbStrategy` resets
     # `last_signal` at the top of every `evaluate()`, so one instance across
     # the day carries no state forward.
-    strategy = get_strategy(strategy_name)
+    strategy = strategy_factory()
     while as_of <= last:
         ctx = StrategyContext(store=day_store, instrument=symbol, exchange=exchange, as_of=as_of)
         evaluation = strategy.evaluate(ctx)
