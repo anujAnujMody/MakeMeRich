@@ -38,7 +38,6 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import re
 import sys
 from collections import defaultdict
 
@@ -55,12 +54,11 @@ from scripts.label_replay_firings import (  # noqa: E402
 from te.data.barstore import BarStore
 from te.data.charges_loader import load_charge_rate_table
 from te.domain.costs import CostModel, select_rates
-from te.ml.labeling import label_firings_from_evaluations
+from te.ml.labeling import label_firings_from_evaluations, parse_breakout
 from te.persistence.db import make_engine, make_session_factory
-from te.persistence.models import CycleEvaluationRow, EvaluationConditionRow
+from te.persistence.models import EvaluationConditionRow
 from te.settings import Settings
 
-_BREAKOUT_RE = re.compile(r"close=([0-9.]+), range=\[([0-9.]+), ([0-9.]+)\]")
 _BREAKOUT_LABEL = "breakout close beyond opening range"
 
 #: Barriers are 2:1 (target 2x stop), so a firing must win more than
@@ -69,10 +67,13 @@ BREAKEVEN_WIN_RATE = 1 / 3
 
 
 def range_width_pct(actual: str) -> float | None:
-    match = _BREAKOUT_RE.match(actual)
-    if match is None:
+    """Opening-range width as a percentage of the breakout close, parsed via
+    `te.ml.labeling.parse_breakout` rather than a second copy of the regex —
+    ORB's `actual` format has exactly one parser."""
+    parsed = parse_breakout(actual)
+    if parsed is None:
         return None
-    close, low, high = (float(g) for g in match.groups())
+    close, low, high = (float(v) for v in parsed)
     if close <= 0:
         return None
     return (high - low) / close * 100
@@ -105,12 +106,6 @@ def main() -> int:
             .scalars()
             .all()
         }
-        instrument_of = {
-            row.evaluation_id: row.instrument
-            for row in session.execute(select(CycleEvaluationRow).where(CycleEvaluationRow.verdict == "traded"))
-            .scalars()
-            .all()
-        }
 
     print("IN-SAMPLE exploratory analysis — see this script's docstring.")
     print(f"breakeven win rate on these 2:1 barriers: {BREAKEVEN_WIN_RATE:.1%}\n")
@@ -130,16 +125,18 @@ def main() -> int:
             since=RATES_VERIFIED_FROM,
             cost_per_unit=round_trip_cost_in_index_points(symbol, cost_model, RATES_VERIFIED_FROM),
         )
-        rows = [
-            (widths[f.evaluation_id], f.barrier)
-            for f in firings
-            if widths.get(f.evaluation_id) is not None and instrument_of.get(f.evaluation_id) == symbol
-        ]
+        # No instrument filter needed: `label_firings_from_evaluations`
+        # already restricted the query to `symbol`.
+        rows: list[tuple[float, str]] = []
+        for firing in firings:
+            width = widths.get(firing.evaluation_id)
+            if width is not None:
+                rows.append((width, firing.barrier))
         if len(rows) < args.buckets * 10:
             print(f"{symbol}: only {len(rows)} usable firings — too few to bucket\n")
             continue
 
-        rows.sort(key=lambda r: r[0])  # type: ignore[arg-type,return-value]
+        rows.sort(key=lambda r: r[0])
         per = len(rows) // args.buckets
         print(f"=== {symbol} ===  n={len(rows):,}")
         print(f"{'range width %':>18}{'n':>7}{'target':>8}{'stop':>7}{'time':>7}{'win(decided)':>14}")

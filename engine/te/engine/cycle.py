@@ -160,25 +160,50 @@ def _exit_levels(config: CycleConfig, entry_premium: Paise) -> tuple[Paise, Pais
     Percentages are the correct form once a real option premium is being
     traded: a fixed ₹15 target is 50% of a ₹30 premium and 5% of a ₹300 one,
     so an absolute distance silently changes the strategy as premiums move."""
-    stop_distance = (
-        Paise(int(Decimal(int(entry_premium)) * config.stop_pct / Decimal(100)))
-        if config.stop_pct is not None
-        else config.stop_distance
-    )
+    stop_distance = _pct_of(entry_premium, config.stop_pct) if config.stop_pct is not None else config.stop_distance
     target_distance = (
-        Paise(int(Decimal(int(entry_premium)) * config.target_pct / Decimal(100)))
-        if config.target_pct is not None
-        else config.target_distance
+        _pct_of(entry_premium, config.target_pct) if config.target_pct is not None else config.target_distance
     )
     return Paise(entry_premium - stop_distance), Paise(entry_premium + target_distance)
 
 
+def _pct_of(premium: Paise, pct: Decimal) -> Paise:
+    """`pct` percent of `premium`, TRUNCATED toward zero.
+
+    One definition rather than three: the rounding is the load-bearing part
+    (tests pin the truncating form), so restating it per call site is how the
+    stop and the target quietly stop agreeing."""
+    return Paise(int(Decimal(int(premium)) * pct / Decimal(100)))
+
+
+def _uses_premium_percentages(config: CycleConfig) -> bool:
+    """Whether this config expresses exits as percentages of the option
+    premium rather than as absolute index-point distances."""
+    return config.stop_pct is not None or config.target_pct is not None
+
+
 def _trailing_distance(config: CycleConfig, entry_premium: Paise) -> Paise | None:
-    """Trailing distance for one entry — percentage of entry premium when
-    `trailing_pct` is set, else the historic absolute distance."""
-    if config.trailing_pct is None:
-        return config.trailing_distance
-    return Paise(int(Decimal(int(entry_premium)) * config.trailing_pct / Decimal(100)))
+    """Trailing distance for one entry.
+
+    In premium-percentage mode `trailing_pct` is the ONLY source, and `None`
+    means the trail is OFF. It must never fall back to `trailing_distance`:
+    those absolute values are index-point-scaled leftovers, and falling back
+    is not a neutral default — it silently re-enables the exact bug this
+    project has already been bitten by twice.
+
+    Found by review on 2026-07-31, after `paper_cycle_trailing_pct` was set
+    to `None` to disable the trail (so live behaviour would match the
+    barrier sweep, which modelled only stop/target/time). The fallback
+    quietly restored `paper_cycle_trailing_distance_paise = 300` — a Rs 3
+    absolute trail, 3.68% of that day's Rs 81.50 NIFTY premium — which is
+    the same Rs 3 trail that had closed 14 of 14 trades on `trailing_stop`
+    at a 3.1-minute average hold. "Disabled" had re-enabled it.
+    """
+    if _uses_premium_percentages(config):
+        if config.trailing_pct is None:
+            return None
+        return _pct_of(entry_premium, config.trailing_pct)
+    return config.trailing_distance
 
 
 def _resolve_instruments(config: CycleConfig) -> list[InstrumentConfig]:
@@ -637,13 +662,18 @@ def run_exit_cycle(
                 logger.exception("pricing an open position raised; treating as unpriceable", symbol=row.symbol)
                 premium = None
 
-            fresh = premium is not None
             if premium is not None:
                 update_last_mark(session, row, premium, as_of)
+                updated, decision = evaluate_position(position, current_premium=premium, now=as_of)
             elif row.last_mark_paise is not None:
-                premium = Paise(row.last_mark_paise)
-
-            if premium is None:
+                # Stale mark: the clock-driven exits MUST still fire (a quote
+                # outage cannot be allowed to strand a position past 15:20),
+                # but a stop, target or trail ratchet off a stale price would
+                # be acting on information we do not have.
+                stale = Paise(row.last_mark_paise)
+                logger.warning("marking position from a stale price", symbol=row.symbol, paise=int(stale))
+                updated, decision = position, time_exit(position, now=as_of, exit_premium=stale)
+            else:
                 # Never priced since it opened, so not even a stale mark
                 # exists. There is nothing honest to act on: acting on the
                 # entry premium is what made stops undetectable in the first
@@ -654,16 +684,6 @@ def run_exit_cycle(
                     detail=f"{row.symbol}: no quote, no bar and no previous mark — exits not evaluated",
                 )
                 continue
-
-            if fresh:
-                updated, decision = evaluate_position(position, current_premium=premium, now=as_of)
-            else:
-                # Stale mark: the clock-driven exits MUST still fire (a quote
-                # outage cannot be allowed to strand a position past 15:20),
-                # but a stop, target or trail ratchet off a stale price would
-                # be acting on information we do not have.
-                logger.warning("marking position from a stale price", symbol=row.symbol, paise=int(premium))
-                updated, decision = position, time_exit(position, now=as_of, exit_premium=premium)
 
             if decision is None:
                 # Only write when the trailing stop actually ratcheted —

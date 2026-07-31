@@ -767,3 +767,67 @@ def test_entry_is_allowed_with_enough_runway(
 
     with session_factory() as session:
         assert session.query(OpenPositionRow).count() == 1
+
+
+def test_disabling_the_percentage_trail_does_not_fall_back_to_the_absolute_one(
+    session_factory,  # noqa: ANN001
+    execution,  # noqa: ANN001
+    cost_model: CostModel,
+    tmp_path: Path,
+) -> None:
+    """`trailing_pct=None` in premium-percentage mode means the trail is OFF.
+
+    It previously fell through to `trailing_distance`, so setting
+    `paper_cycle_trailing_pct=None` to disable the trail silently restored
+    `paper_cycle_trailing_distance_paise=300` — a Rs 3 absolute trail, which
+    on a Rs 81.50 premium is 3.68%, and is the same Rs 3 trail that had
+    closed 14 of 14 live trades on `trailing_stop` at a 3.1-minute average
+    hold. "Disabled" re-enabled the original bug.
+    """
+    store = _breakout_store(tmp_path)
+    config = _config(
+        stop_pct=Decimal(20),
+        target_pct=Decimal(20),
+        trailing_pct=None,
+        trailing_distance=Paise(300),  # the leftover absolute value, still configured
+    )
+
+    run_entry_cycle(
+        session_factory=session_factory,
+        store=store,
+        execution=execution,
+        cost_model=cost_model,
+        config=config,
+        as_of=_open(16),
+    )
+
+    with session_factory() as session:
+        row = session.query(OpenPositionRow).one()
+    assert row.trailing_distance_paise is None, (
+        f"trail is {row.trailing_distance_paise}p despite trailing_pct=None — the absolute fallback fired"
+    )
+
+
+def test_absolute_trailing_distance_still_applies_without_percentage_exits(
+    session_factory,  # noqa: ANN001
+    execution,  # noqa: ANN001
+    cost_model: CostModel,
+    tmp_path: Path,
+) -> None:
+    """The fix must not break configs that legitimately use absolute
+    index-point distances (backtests replayed from `option_bhav`, and every
+    test predating percentage exits)."""
+    store = _breakout_store(tmp_path)
+    config = _config(trailing_distance=Paise(300))  # no stop_pct/target_pct
+
+    run_entry_cycle(
+        session_factory=session_factory,
+        store=store,
+        execution=execution,
+        cost_model=cost_model,
+        config=config,
+        as_of=_open(16),
+    )
+
+    with session_factory() as session:
+        assert session.query(OpenPositionRow).one().trailing_distance_paise == 300

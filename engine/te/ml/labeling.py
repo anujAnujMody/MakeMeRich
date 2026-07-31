@@ -78,20 +78,38 @@ def extract_hypothetical_entry_premium(condition_actual: str) -> Paise:
     return Paise(int((rupees * 100).quantize(Decimal(1), rounding=ROUND_HALF_UP)))
 
 
-def direction_from_breakout(actual: str) -> Direction | None:
-    """Recovers the firing's DIRECTION from the condition string ORB itself
-    recorded, e.g. `"close=23576.70, range=[23587.75, 23733.70]"`.
+def parse_breakout(actual: str) -> tuple[Decimal, Decimal, Decimal] | None:
+    """`(close, range_low, range_high)` from the breakout condition string
+    ORB records, e.g. `"close=23576.70, range=[23587.75, 23733.70]"`.
 
-    `CycleEvaluationRow` carries no direction column, but ORB's own recorded
-    `actual` determines it unambiguously: a close above the range high is
-    the `long_call` breakout, a close below the range low is the `long_put`.
-    Derived from what the rule observed rather than re-computed from bars,
-    for the same reason the entry premium is.
+    THE single parser for that format. `te.strategy.orb` writes it and
+    several readers consume it (direction, entry premium, range width), so
+    every extra copy of this regex is another place to update when the
+    string changes — and the failure mode is silent, since an unmatched
+    string degrades to `None` and the firing is quietly dropped. Public
+    precisely so callers outside this module import it instead of
+    re-deriving it.
     """
     match = _BREAKOUT_RE.match(actual)
     if match is None:
         return None
     close, low, high = (Decimal(g) for g in match.groups())
+    return close, low, high
+
+
+def direction_from_breakout(actual: str) -> Direction | None:
+    """Recovers the firing's DIRECTION from what ORB itself recorded.
+
+    `CycleEvaluationRow` carries no direction column, but the condition
+    string determines it unambiguously: a close above the range high is the
+    `long_call` breakout, a close below the range low is the `long_put`.
+    Derived from what the rule observed rather than re-computed from bars,
+    for the same reason the entry premium is.
+    """
+    parsed = parse_breakout(actual)
+    if parsed is None:
+        return None
+    close, low, high = parsed
     if close > high:
         return "long_call"
     if close < low:

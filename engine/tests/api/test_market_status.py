@@ -27,12 +27,14 @@ def test_reports_open_during_the_regular_session() -> None:
 def test_reports_pre_open_before_915_ist_on_a_weekday() -> None:
     session = _compute_market_session(_at(2026, 7, 31, 9, 0))
     assert session.status == "pre-open"
+    assert session.label == "Market opens soon"
     assert session.nextEvent == "2026-07-31T09:15:00+05:30"
 
 
 def test_reports_closed_after_1530_ist_on_a_weekday() -> None:
     session = _compute_market_session(_at(2026, 7, 31, 16, 0))
     assert session.status == "closed"
+    assert session.label == "Market closed"
     # Next trading day after Friday is Monday.
     assert session.nextEvent == "2026-08-03T09:15:00+05:30"
 
@@ -43,13 +45,3 @@ def test_reports_closed_on_a_weekend() -> None:
     assert session.status == "closed"
     assert "weekend" in session.label.lower()
     assert session.nextEvent == "2026-08-03T09:15:00+05:30"
-
-
-def test_label_is_never_the_literal_unknown_stub() -> None:
-    for moment in (
-        _at(2026, 7, 31, 9, 0),
-        _at(2026, 7, 31, 10, 0),
-        _at(2026, 7, 31, 16, 0),
-        _at(2026, 8, 1, 12, 0),
-    ):
-        assert _compute_market_session(moment).label != "Unknown"

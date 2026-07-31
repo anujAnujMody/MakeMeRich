@@ -87,7 +87,11 @@ class _DayCacheStore(BarStore):
 
     def __init__(self, root: Path | str, frame: pd.DataFrame) -> None:
         super().__init__(root)
-        self._frame = frame
+        # Sorted ONCE here, not per read. `read()` runs once per replayed
+        # minute (~315,000 times for a full backfill), and the frame is a
+        # single symbol's single day, so re-sorting it every call was pure
+        # repeated work on already-ordered rows.
+        self._frame = frame.sort_values("event_ts").reset_index(drop=True)
 
     def read(
         self,
@@ -97,22 +101,25 @@ class _DayCacheStore(BarStore):
         interval: str,
         ingested_before: dt.datetime | None = None,
     ) -> pd.DataFrame:
+        del symbol  # single-symbol frame by construction — see `replay_orb`
         df = self._frame
         if df.empty:
             return pd.DataFrame(columns=BAR_COLUMNS)
-        mask = (
-            (df["symbol"] == symbol)
-            & (df["event_ts"] >= pd.Timestamp(start))
-            & (df["event_ts"] <= pd.Timestamp(end))
-        )
+        mask = (df["event_ts"] >= pd.Timestamp(start)) & (df["event_ts"] <= pd.Timestamp(end))
         if ingested_before is not None:
             mask &= df["ingested_at"] <= pd.Timestamp(ingested_before)
-        return df.loc[mask].sort_values("event_ts").reset_index(drop=True)
+        return df.loc[mask].reset_index(drop=True)
 
 
-def _trading_days(store: BarStore, symbol: str, start: dt.date, end: dt.date) -> list[dt.date]:
-    """Days that actually have bars — derived from the data, never from a
-    weekday calculation, so exchange holidays need no separate calendar."""
+def _days_with_bars(store: BarStore, symbol: str, start: dt.date, end: dt.date) -> list[tuple[dt.date, pd.DataFrame]]:
+    """`(IST date, that day's bars)` for every day that actually HAS bars.
+
+    Days come from the data rather than a weekday calculation, so exchange
+    holidays need no separate calendar. The frame is read once for the whole
+    range and grouped in memory: reading it only to extract the date list and
+    then re-reading each day individually re-opened the same `month=`
+    partitions ~225 more times per symbol, for identical rows.
+    """
     frame = store.read(
         symbol=symbol,
         start=dt.datetime.combine(start, dt.time.min, tzinfo=dt.UTC),
@@ -122,7 +129,7 @@ def _trading_days(store: BarStore, symbol: str, start: dt.date, end: dt.date) ->
     if frame.empty:
         return []
     local_dates = frame["event_ts"].dt.tz_convert(IST).dt.date
-    return sorted(set(local_dates))
+    return list(frame.groupby(local_dates, sort=True))
 
 
 def replay_orb(
@@ -145,12 +152,7 @@ def replay_orb(
     result = ReplayResult()
 
     for symbol, exchange in instruments.items():
-        for day in _trading_days(store, symbol, start, end):
-            day_start = dt.datetime.combine(day, dt.time.min, tzinfo=IST)
-            day_end = dt.datetime.combine(day, dt.time.max, tzinfo=IST)
-            frame = store.read(symbol=symbol, start=day_start, end=day_end, interval="1m")
-            if frame.empty:
-                continue
+        for day, frame in _days_with_bars(store, symbol, start, end):
             day_store = _DayCacheStore(store.root, frame)
 
             # First evaluable minute is the close of the bar that ends the
@@ -200,8 +202,12 @@ def _replay_one_day(
     as_of = first
     pending: list[Evaluation] = []
 
+    # Resolved once: the registry hands back the same entry every time, and
+    # this loop runs once per replayed minute. `OrbStrategy` resets
+    # `last_signal` at the top of every `evaluate()`, so one instance across
+    # the day carries no state forward.
+    strategy = get_strategy(strategy_name)
     while as_of <= last:
-        strategy = get_strategy(strategy_name)
         ctx = StrategyContext(store=day_store, instrument=symbol, exchange=exchange, as_of=as_of)
         evaluation = strategy.evaluate(ctx)
         result.evaluations += 1

@@ -28,6 +28,13 @@ SYMBOL = "NIFTY"
 EXCHANGE = "NSE_INDEX"
 
 
+class _OneBarClient:
+    """Returns a single epoch-stamped bar, whatever is asked of it."""
+
+    def history(self, *a: object, **k: object) -> list[HistoryBar]:
+        return [HistoryBar(timestamp="1780285500", open=1.0, high=2.0, low=0.5, close=1.5, volume=0.0, oi=0.0)]
+
+
 def _open(day: dt.date, minute: int) -> dt.datetime:
     return dt.datetime.combine(day, dt.time(9, 15), tzinfo=IST) + dt.timedelta(minutes=minute)
 
@@ -92,13 +99,9 @@ def test_backfilled_bars_are_visible_to_a_point_in_time_read(tmp_path: Path) -> 
     stamped `now()` would be invisible to every historical replay and the
     replay would silently produce zero signals."""
 
-    class _Client:
-        def history(self, *a: object, **k: object) -> list[HistoryBar]:
-            return [HistoryBar(timestamp="1780285500", open=1.0, high=2.0, low=0.5, close=1.5, volume=0.0, oi=0.0)]
-
     store = BarStore(tmp_path / "bars")
     result = backfill_index_bars(
-        _Client(),  # type: ignore[arg-type]
+        _OneBarClient(),  # type: ignore[arg-type]
         store,
         symbol=SYMBOL,
         exchange=EXCHANGE,
@@ -117,13 +120,9 @@ def test_backfilled_bars_are_visible_to_a_point_in_time_read(tmp_path: Path) -> 
 
 
 def test_a_backfilled_bar_is_distinguishable_from_a_live_recorded_one(tmp_path: Path) -> None:
-    class _Client:
-        def history(self, *a: object, **k: object) -> list[HistoryBar]:
-            return [HistoryBar(timestamp="1780285500", open=1.0, high=2.0, low=0.5, close=1.5, volume=0.0, oi=0.0)]
-
     store = BarStore(tmp_path / "bars")
     backfill_index_bars(
-        _Client(),  # type: ignore[arg-type]
+        _OneBarClient(),  # type: ignore[arg-type]
         store, symbol=SYMBOL, exchange=EXCHANGE, start=dt.date(2026, 6, 1), end=dt.date(2026, 6, 1),
     )
     frame = store.read(

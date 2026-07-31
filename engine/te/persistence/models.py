@@ -24,6 +24,8 @@ from sqlalchemy.engine import Dialect
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.types import TypeDecorator
 
+from te.domain.clock import assume_utc, to_utc
+
 
 class UtcDateTime(TypeDecorator[dt.datetime]):
     """`DateTime(timezone=True)` that actually round-trips the timezone.
@@ -56,6 +58,10 @@ class UtcDateTime(TypeDecorator[dt.datetime]):
     Naive datetimes therefore cannot enter or leave the persistence layer,
     and `assume_utc()` at a call site becomes a harmless no-op rather than a
     load-bearing step someone can forget.
+
+    Both directions DELEGATE to `te.domain.clock` rather than restating the
+    arithmetic: `to_utc`/`assume_utc` are the project's single definition of
+    this invariant, and a second copy here would be a second place to fix.
     """
 
     impl = DateTime(timezone=True)
@@ -64,12 +70,7 @@ class UtcDateTime(TypeDecorator[dt.datetime]):
     def process_bind_param(self, value: dt.datetime | None, dialect: Dialect) -> dt.datetime | None:
         if value is None:
             return None
-        if value.tzinfo is None:
-            raise ValueError(
-                f"refusing to persist naive datetime {value!r}: it has no defined instant. "
-                f"Tag it with a timezone (te.domain.clock.to_utc) at the point it is created."
-            )
-        return value.astimezone(dt.UTC)
+        return to_utc(value, name="persisted timestamp")
 
     def process_result_value(self, value: dt.datetime | None, dialect: Dialect) -> dt.datetime | None:
         if value is None:
@@ -77,7 +78,7 @@ class UtcDateTime(TypeDecorator[dt.datetime]):
         # Sound only because `process_bind_param` normalised every write to
         # UTC — these digits are known to be UTC, so reattach rather than
         # convert (`astimezone` on a naive value would assume system-local).
-        return value if value.tzinfo is not None else value.replace(tzinfo=dt.UTC)
+        return assume_utc(value)
 
 
 class Base(DeclarativeBase):

@@ -114,11 +114,9 @@ def main() -> int:
 
 
 def _pct(sorted_values: list[float], pct: int) -> float:
-    if not sorted_values:
-        return 0.0
-    return float(statistics.quantiles(sorted_values, n=100, method="inclusive")[pct - 1]) if len(
-        sorted_values
-    ) > 1 else sorted_values[0]
+    if len(sorted_values) < 2:
+        return float(sorted_values[0]) if sorted_values else 0.0
+    return float(statistics.quantiles(sorted_values, n=100, method="inclusive")[pct - 1])
 
 
 if __name__ == "__main__":

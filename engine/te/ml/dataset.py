@@ -159,13 +159,41 @@ def _dte(as_of: dt.datetime, instrument: str) -> float:
     return float((expiry - today).days)
 
 
+#: Memoises `_daily_closes` for the lifetime of the process, keyed by
+#: `(store root, symbol, lookback, IST DATE of as_of)`.
+#:
+#: Sound because of how daily bars are gated: `bars_asof` admits a bar only
+#: once `ingested_at <= as_of`, and a daily bar's `ingested_at` is the END of
+#: its day (see `te.data.history_backfill._KNOWN_AFTER`), so every intraday
+#: `as_of` on the same IST date sees exactly the same set of closes. The time
+#: component genuinely cannot change the answer.
+#:
+#: Worth having because training calls `build_training_set` once per firing,
+#: and each call makes three daily reads (VIX 1-day, VIX 60-day, underlying
+#: 20-day). Over ~1,200 firings that is ~3,600 reads of what are only a
+#: handful of distinct series, and each read opens a whole `month=`
+#: partition of many small part files.
+_DAILY_CLOSES_CACHE: dict[tuple[str, str, int, dt.date], pd.Series] = {}
+
+
+def clear_daily_closes_cache() -> None:
+    """Drops the memoised daily-close series. For tests that write new bars
+    into a store they have already read from — nothing in production mutates
+    a past day's closes."""
+    _DAILY_CLOSES_CACHE.clear()
+
+
 def _daily_closes(store: BarStore, symbol: str, as_of: dt.datetime, lookback_days: int) -> pd.Series:
     """Raw CALENDAR-day window. Prefer `_trailing_trading_closes` for any
     window whose size is meant to be a count of trading sessions."""
+    key = (str(store.root), symbol, lookback_days, as_of.astimezone(IST).date())
+    cached = _DAILY_CLOSES_CACHE.get(key)
+    if cached is not None:
+        return cached
     bars = bars_asof(store, symbol, as_of, dt.timedelta(days=lookback_days), interval="1d")
-    if bars.empty:
-        return pd.Series(dtype=float)
-    return bars.set_index("event_ts")["c"].astype(float)
+    closes = pd.Series(dtype=float) if bars.empty else bars.set_index("event_ts")["c"].astype(float)
+    _DAILY_CLOSES_CACHE[key] = closes
+    return closes
 
 
 def _trailing_trading_closes(store: BarStore, symbol: str, as_of: dt.datetime, *, n_trading_days: int) -> pd.Series:

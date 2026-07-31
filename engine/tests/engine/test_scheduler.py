@@ -602,3 +602,45 @@ def test_paper_cycle_reads_live_instrument_selections_without_restart(
     assert by_symbol["NIFTY"].lot_size == 65
     assert by_symbol["BANKNIFTY"].lot_size == 30
     assert by_symbol["NIFTY"].exchange == "NFO"
+
+
+def test_a_position_is_quoted_once_per_cycle_not_once_per_consumer() -> None:
+    """The entry cycle prices every open position (to decide whether to
+    halt) and the exit cycle then prices the same rows (to decide whether to
+    close). Uncached, that is two blocking REST round trips per position per
+    minute — and worse, the two cycles could act on marks taken a second
+    apart, which the caller's own comment claims cannot happen.
+    """
+    import datetime as dt
+
+    from te.broker.openalgo_rest import Quote
+    from te.data.barstore import BarStore
+    from te.engine.scheduler import _current_premium_from_quotes
+
+    calls: list[str] = []
+
+    class _Client:
+        def quotes(self, symbol: str, exchange: str) -> Quote:
+            calls.append(symbol)
+            return Quote(
+                symbol=symbol, exchange=exchange, ltp=100.0, open=0.0, high=0.0, low=0.0,
+                prev_close=0.0, volume=0.0, oi=0.0, bid=99.5, ask=100.5,
+            )
+
+    class _Row:
+        symbol = "NIFTY04AUG2624400CE"
+        exchange = "NFO"
+        entry_premium_paise = 10_000
+        last_mark_paise = None
+
+    source = _current_premium_from_quotes(
+        _Client(),  # type: ignore[arg-type]
+        BarStore("unused"),
+        dt.datetime(2026, 7, 31, 5, 0, tzinfo=dt.UTC),
+    )
+    row = _Row()
+    first = source(row)  # type: ignore[arg-type]
+    second = source(row)  # type: ignore[arg-type]
+
+    assert calls == [_Row.symbol], f"quoted {len(calls)} times for one position in one cycle"
+    assert first == second, "the two cycles saw different marks for the same position in the same minute"

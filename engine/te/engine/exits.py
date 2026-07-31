@@ -146,11 +146,14 @@ def evaluate_position(
     # this gate necessary: an unconditional ratchet let a 15% trail silently
     # replace a 20% stop on the first cycle of every position.
     new_stop = position.current_stop
-    if plan.trailing_distance is not None and plan.trailing_activation is not None:
-        if current_premium >= plan.trailing_activation:
-            new_stop = next_trailing_stop(
-                position.current_stop, current_premium, plan.trailing_distance, position.direction
-            )
+    if (
+        plan.trailing_distance is not None
+        and plan.trailing_activation is not None
+        and current_premium >= plan.trailing_activation
+    ):
+        new_stop = next_trailing_stop(
+            position.current_stop, current_premium, plan.trailing_distance, position.direction
+        )
     updated = replace(position, current_stop=new_stop) if new_stop != position.current_stop else position
 
     if current_premium <= new_stop:

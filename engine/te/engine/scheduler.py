@@ -329,18 +329,39 @@ def _current_premium_from_quotes(
     `OpenAlgoWSClient.subscribe()` only takes effect on the next reconnect,
     so a contract chosen mid-session would not stream until then."""
     from_bars = _current_premium_from_bars(store, as_of)
+    # Memoised for this closure's lifetime, which is exactly one cycle
+    # (`as_of` is fixed at construction). Two things depend on it:
+    #
+    # 1. The entry cycle prices every open position through
+    #    `unrealized_pnl_paise` to decide whether to halt, and the exit cycle
+    #    then prices the SAME rows to decide whether to close. Without a
+    #    cache that is two blocking REST round trips per position per minute,
+    #    and `_post` builds a fresh client per call, so the second is a full
+    #    connect/request/close rather than a pooled reuse.
+    # 2. Those two cycles must agree. Quotes taken a second apart differ, so
+    #    an uncached source could halt on one mark and exit on another within
+    #    the same minute — which the caller's comment already claimed could
+    #    not happen.
+    cache: dict[tuple[str, str], Paise | None] = {}
 
     def _current_premium(row: OpenPositionRow) -> Paise | None:
+        key = (row.symbol, row.exchange)
+        if key in cache:
+            return cache[key]
         try:
             quote = rest_client.quotes(row.symbol, row.exchange)
         except OpenAlgoRestError:
             logger.warning("quote failed for open position; falling back to bars", symbol=row.symbol)
-            return from_bars(row)
-        if quote.bid > 0:
-            return Paise(int(round(quote.bid * 100)))
-        if quote.ltp > 0:
-            return Paise(int(round(quote.ltp * 100)))
-        return from_bars(row)
+            marked = from_bars(row)
+        else:
+            if quote.bid > 0:
+                marked = Paise(int(round(quote.bid * 100)))
+            elif quote.ltp > 0:
+                marked = Paise(int(round(quote.ltp * 100)))
+            else:
+                marked = from_bars(row)
+        cache[key] = marked
+        return marked
 
     return _current_premium
 

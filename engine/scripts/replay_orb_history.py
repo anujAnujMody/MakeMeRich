@@ -36,18 +36,14 @@ from te.backtest.replay import replay_orb
 from te.broker.openalgo_rest import OpenAlgoRestClient
 from te.data.barstore import BarStore
 from te.data.history_backfill import backfill_index_bars, month_windows
+from te.engine.contract import UNDERLYING_INDEX_EXCHANGES
 from te.persistence.db import make_engine, make_session_factory
 from te.settings import Settings
 
-#: Symbol -> the exchange its SPOT quote lives on. Options are placed on
-#: NFO/BFO, but the ORB rule reads the INDEX, and an index quotes on
-#: `NSE_INDEX`/`BSE_INDEX` — the same split `te.engine.contract` handles.
-INSTRUMENTS: dict[str, str] = {
-    "NIFTY": "NSE_INDEX",
-    "BANKNIFTY": "NSE_INDEX",
-    "SENSEX": "BSE_INDEX",
-    "BANKEX": "BSE_INDEX",
-}
+#: Symbol -> the exchange its SPOT quote lives on, straight from
+#: `te.engine.contract` rather than restated here — the engine already owns
+#: this mapping, and a third copy is a third thing to update.
+INSTRUMENTS: dict[str, str] = dict(UNDERLYING_INDEX_EXCHANGES)
 
 #: Symbols backfilled for their DATA only — never replayed, never traded.
 #:

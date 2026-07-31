@@ -27,6 +27,7 @@ from decimal import Decimal
 import structlog
 
 from te.broker.openalgo_rest import OpenAlgoRestClient, OpenAlgoRestError
+from te.domain.clock import IST
 from te.domain.money import Paise
 from te.domain.signal import Direction
 
@@ -93,6 +94,13 @@ class OptionContractResolver:
         self._offset = offset
         self._max_spread_pct = max_spread_pct
         self._min_premium_paise = min_premium_paise
+        # `(underlying, IST trade date) -> expiries`. The listed expiry chain
+        # for an underlying does not change during a session, but this
+        # resolver is long-lived (built once in `build_scheduler`), so
+        # without a cache every firing pays an extra blocking REST round trip
+        # to re-learn a constant. Keyed by date so a session rollover cannot
+        # serve yesterday's chain.
+        self._expiries: dict[tuple[str, dt.date], list[str]] = {}
 
     def __call__(self, underlying: str, direction: Direction, as_of: dt.datetime) -> ResolvedContract | None:
         index_exchange = UNDERLYING_INDEX_EXCHANGES.get(underlying)
@@ -104,7 +112,12 @@ class OptionContractResolver:
         try:
             # `expiry_dates` is nearest-first and broker-confirmed, so [0] is
             # the current weekly WITHOUT any holiday arithmetic on our side.
-            expiries = self._client.expiry_dates(underlying, _placement_exchange(index_exchange))
+            cache_key = (underlying, as_of.astimezone(IST).date())
+            expiries = self._expiries.get(cache_key)
+            if expiries is None:
+                expiries = self._client.expiry_dates(underlying, _placement_exchange(index_exchange))
+                if expiries:
+                    self._expiries[cache_key] = expiries
             if not expiries:
                 logger.warning("broker returned no expiries", underlying=underlying)
                 return None

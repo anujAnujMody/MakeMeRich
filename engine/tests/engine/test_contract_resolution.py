@@ -218,7 +218,7 @@ def test_stop_and_target_are_percentages_of_the_option_premium(
         store=index_store,
         execution=execution,
         cost_model=cost_model,
-        config=_config(stop_pct=Decimal(20), target_pct=Decimal(40)),
+        config=_config(),  # stop_pct/target_pct come from _config's defaults
         as_of=_open(16),
         contract_resolver=_resolver,
     )
