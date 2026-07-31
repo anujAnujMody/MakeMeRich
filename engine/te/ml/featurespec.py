@@ -64,13 +64,28 @@ class FeatureSpec:
 #: makes the wrap-around adjacency real. That changed the feature vector's
 #: SHAPE from 7 columns to 8, so the version is bumped: a model trained
 #: against version 1 cannot be served against this spec.
+#: Version 3 drops `india_vix_term_slope`. The term structure needs a
+#: near-term and a next-term India VIX series, and neither exists: a broker
+#: instrument search on 2026-07-31 returned exactly ONE India VIX symbol —
+#: `INDIAVIX`, the spot index (`instrumenttype: AMXIDX`). NSE does not list
+#: tradeable VIX futures, so this is not a backfill gap that more effort
+#: would close; the data does not exist at this source.
+#:
+#: Keeping a permanently-NaN column would be worse than dropping it. It
+#: consumes a slot against `validate_training_set`'s features-per-sample
+#: overfitting limit, and it lets the model be described as using eight
+#: features when it can only ever use seven. `build_training_set` would
+#: have returned NaN for it on every single row, and nothing would have
+#: raised — the same silent-degradation shape as the missing daily bars.
+#:
+#: Restore it (and bump the version again) only if a real near/next VIX
+#: series becomes available.
 SECONDARY_V1 = FeatureSpec(
     name="secondary",
-    version=2,
+    version=3,
     columns=(
         "iv_rank_60d",
         "india_vix_level",
-        "india_vix_term_slope",
         "rv_iv_spread",
         "day_of_week_sin",
         "day_of_week_cos",

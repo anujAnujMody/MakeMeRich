@@ -92,10 +92,19 @@ def test_inference_features_match_training_features_for_same_timestamp(store: Ba
     pd.testing.assert_series_equal(training_row, inference_row, check_names=False)
 
 
-def test_missing_vix_futures_symbols_yield_nan_not_a_fabricated_slope(store: BarStore) -> None:
+def test_the_spec_does_not_ask_for_a_vix_term_slope_that_cannot_exist(store: BarStore) -> None:
+    """India VIX has no near/next-term series to build a term structure from
+    — a broker instrument search on 2026-07-31 returned exactly one India
+    VIX symbol, the spot index. The column was therefore NaN on every row
+    forever, which `validate_training_set` skips rather than rejects: the
+    model would silently have trained on 7 of its 8 declared features.
+
+    Dropped from the spec rather than left in place returning NaN."""
     as_of = _day(69) + dt.timedelta(hours=6)
     result = build_training_set(as_of, SECONDARY_V1, store, None, instrument=INSTRUMENT)
-    assert pd.isna(result["india_vix_term_slope"])
+
+    assert "india_vix_term_slope" not in SECONDARY_V1.columns
+    assert "india_vix_term_slope" not in result.index
 
 
 def test_dte_computed_from_option_symbol_expiry(store: BarStore) -> None:

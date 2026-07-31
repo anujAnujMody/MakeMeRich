@@ -17,7 +17,6 @@ def test_secondary_spec_encodes_day_of_week_cyclically() -> None:
     assert SECONDARY_V1.columns == (
         "iv_rank_60d",
         "india_vix_level",
-        "india_vix_term_slope",
         "rv_iv_spread",
         "day_of_week_sin",
         "day_of_week_cos",
@@ -26,9 +25,11 @@ def test_secondary_spec_encodes_day_of_week_cyclically() -> None:
     )
     assert "day_of_week" not in SECONDARY_V1.columns
     assert SECONDARY_V1.name == "secondary"
-    # Bumped from 1 — the feature-vector SHAPE changed (7 columns -> 8), so a
-    # model trained against the old spec is not loadable against this one.
-    assert SECONDARY_V1.version == 2
+    # v1 -> v2 added the sin/cos pair (7 columns -> 8). v2 -> v3 dropped
+    # `india_vix_term_slope`, which no data source can supply (8 -> 7). Every
+    # SHAPE change bumps the version, because a model trained against one
+    # spec is not loadable against another.
+    assert SECONDARY_V1.version == 3
 
 
 def test_secondary_v1_columns_are_disjoint_from_primary_vocabulary() -> None:

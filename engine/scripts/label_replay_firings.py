@@ -68,8 +68,13 @@ ATM_PARAMS: dict[str, tuple[float, float, float, float, str]] = {
 #: synced `instruments` table.
 LOT_SIZES: dict[str, int] = {"NIFTY": 65, "BANKNIFTY": 30, "SENSEX": 20, "BANKEX": 30}
 
+#: Must track `Settings.paper_cycle_stop_pct` / `paper_cycle_target_pct`.
+#: 1:1 since the barrier sweep — labelling at a geometry the engine no longer
+#: trades would describe a different strategy, and any runway or filter
+#: derived from those labels would be tuned for a configuration that is not
+#: running. See `scripts/sweep_barriers.py` for the evidence.
 STOP_PCT = 0.20
-TARGET_PCT = 0.40
+TARGET_PCT = 0.20
 MAX_HOLD = dt.timedelta(hours=3)
 
 #: Earliest firing that can be labelled with rates we actually hold.

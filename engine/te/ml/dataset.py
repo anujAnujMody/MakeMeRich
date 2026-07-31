@@ -58,7 +58,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from te.data.asof import bars_asof
 from te.data.barstore import BarStore
 from te.domain.clock import DEFAULT_SESSION, IST
-from te.domain.symbols import parse_option_symbol
+from te.domain.symbols import next_monthly_expiry, next_weekly_expiry, parse_option_symbol
 from te.ml.featurespec import PRIMARY_VOCABULARY, FeatureSpec
 
 DEFAULT_VIX_SYMBOL = "INDIAVIX"
@@ -111,9 +111,52 @@ def _day_of_week_sin_cos(as_of: dt.datetime) -> tuple[float, float]:
     return math.sin(angle), math.cos(angle)
 
 
+def _underlying_base(instrument: str) -> str:
+    """The underlying index, whether `instrument` is a full option symbol
+    (`NIFTY30JUN2626500CE`) or a bare index symbol (`NIFTY`).
+
+    Both shapes genuinely occur. `cycle_evaluations` — the only label source
+    — records the INDEX symbol, because `run_entry_cycle` iterates indices
+    and only resolves a concrete contract afterwards. Tests and backtests
+    replayed from `option_bhav` use option symbols. This module previously
+    assumed the option shape unconditionally, so every call with a real
+    evaluation's instrument raised `ValueError`. It had never fired only
+    because `te.engine.scheduler` calls `run_entry_cycle` without an
+    `ml_hook`, so nothing had ever built features on the live path.
+    """
+    try:
+        return parse_option_symbol(instrument).base
+    except ValueError:
+        return instrument
+
+
 def _dte(as_of: dt.datetime, instrument: str) -> float:
-    parsed = parse_option_symbol(instrument)
-    return float((parsed.expiry - as_of.astimezone(IST).date()).days)
+    """Days to expiry of the contract this firing would trade.
+
+    From the symbol itself when it carries an expiry; otherwise from the
+    exchange's expiry calendar for that underlying — NIFTY/SENSEX trade
+    weeklies, BANKNIFTY/BANKEX are monthly-only (confirmed against the live
+    broker on 2026-07-31: BANKNIFTY's nearest expiry was 25 days out against
+    NIFTY's 4). That difference is precisely why `dte` is a feature worth
+    having, so falling back to a fixed number here would erase the signal.
+
+    The calendar helpers are weekday-based and do not adjust for trading
+    holidays, so this can be a day out when an expiry shifts. Acceptable for
+    a model feature; it would NOT be acceptable for choosing a contract to
+    trade, which is why `te.engine.contract` asks the broker instead.
+    """
+    today = as_of.astimezone(IST).date()
+    try:
+        return float((parse_option_symbol(instrument).expiry - today).days)
+    except ValueError:
+        pass
+
+    base = _underlying_base(instrument)
+    try:
+        expiry = next_weekly_expiry(base, today)
+    except ValueError:
+        expiry = next_monthly_expiry(base, today)
+    return float((expiry - today).days)
 
 
 def _daily_closes(store: BarStore, symbol: str, as_of: dt.datetime, lookback_days: int) -> pd.Series:
@@ -215,7 +258,7 @@ def _rv_iv_spread(store: BarStore, instrument: str, as_of: dt.datetime, *, iv_pr
     `iv_proxy` is the already-computed `_india_vix_level` for this same
     `as_of` — passed in rather than recomputed, since every VIX read goes
     to disk through `bars_asof`."""
-    underlying = parse_option_symbol(instrument).base
+    underlying = _underlying_base(instrument)
     rv = _realized_vol_pct(store, underlying, as_of)
     if math.isnan(rv) or math.isnan(iv_proxy):
         return float("nan")

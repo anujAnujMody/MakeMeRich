@@ -49,6 +49,17 @@ INSTRUMENTS: dict[str, str] = {
     "BANKEX": "BSE_INDEX",
 }
 
+#: Symbols backfilled for their DATA only — never replayed, never traded.
+#:
+#: Four of `te.ml.featurespec.SECONDARY_V1`'s eight columns are volatility
+#: features (`india_vix_level`, `india_vix_term_slope`, `iv_rank_60d`,
+#: `rv_iv_spread`) and `te.ml.dataset` reads them from `INDIAVIX` bars. With
+#: no VIX in the store those four columns come out empty, and
+#: `validate_training_set` SKIPS all-NaN columns rather than rejecting them —
+#: so a model would train quietly on half a feature set and nobody would see
+#: an error. Backfilled here so that cannot happen.
+DATA_ONLY: dict[str, str] = {"INDIAVIX": "NSE_INDEX"}
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -83,15 +94,29 @@ def main() -> int:
         client = OpenAlgoRestClient(settings.openalgo_host, settings.openalgo_api_key.get_secret_value(), timeout=60.0)
         total = 0
         failures: list[str] = []
-        for symbol, exchange in instruments.items():
+        # Data-only symbols first — they feed features for every instrument,
+        # so a partial run should not leave them missing.
+        for symbol, exchange in {**DATA_ONLY, **instruments}.items():
             for window_start, window_end in month_windows(start, end):
-                result = backfill_index_bars(
-                    client, store, symbol=symbol, exchange=exchange, start=window_start, end=window_end
-                )
-                total += result.bars_written
-                if not result.ok:
-                    failures.append(f"{symbol} {window_start}..{window_end}: {result.error}")
-                print(f"  {symbol:10s} {window_start}..{window_end}  {result.bars_written:>7,} bars")
+                # BOTH intervals. 1m drives the ORB replay; DAILY drives the
+                # model's volatility features — `iv_rank_60d`,
+                # `india_vix_level` and `rv_iv_spread` all read
+                # `interval="1d"`. Backfilling only 1m leaves those four
+                # columns silently NaN, which is exactly what the first pass
+                # did: 78,000 bars written, four of eight features dead, and
+                # no error anywhere.
+                for broker_interval in ("1m", "D"):
+                    result = backfill_index_bars(
+                        client, store, symbol=symbol, exchange=exchange,
+                        start=window_start, end=window_end, interval=broker_interval,
+                    )
+                    total += result.bars_written
+                    if not result.ok:
+                        failures.append(f"{symbol} {broker_interval} {window_start}..{window_end}: {result.error}")
+                    print(
+                        f"  {symbol:10s} {broker_interval:>2s} {window_start}..{window_end}"
+                        f"  {result.bars_written:>7,} bars"
+                    )
         print(f"\nbackfill wrote {total:,} bars")
         for failure in failures:
             print(f"  FAILED {failure}", file=sys.stderr)
