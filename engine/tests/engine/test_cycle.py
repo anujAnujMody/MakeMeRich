@@ -709,3 +709,61 @@ def test_exit_cycle_skips_the_db_write_when_the_trailing_stop_did_not_ratchet(
 
     with session_factory() as session:
         assert session.query(OpenPositionRow).one().current_stop_paise == ratcheted
+
+
+def test_no_entry_without_enough_runway_before_the_hard_exit(
+    session_factory,  # noqa: ANN001
+    execution,  # noqa: ANN001
+    cost_model: CostModel,
+    tmp_path: Path,
+) -> None:
+    """A trade needs time to reach its target, or it carries full downside
+    against upside that is unreachable by construction.
+
+    Cost real money on 2026-07-31: a NIFTY position opened at 15:05 was
+    force-closed at 15:20 for -8.7% (-Rs 6,672, 82% of the day's loss). Its
+    stop never fired — the CLOCK closed it.
+    """
+    store = _breakout_store(tmp_path)
+    # 15:05 IST, with a 15:20 hard exit: 15 minutes of runway.
+    as_of = dt.datetime(2026, 7, 29, 15, 5, tzinfo=IST)
+    config = _config(hard_exit_by=dt.time(15, 20), min_minutes_before_hard_exit=30)
+
+    run_entry_cycle(
+        session_factory=session_factory,
+        store=store,
+        execution=execution,
+        cost_model=cost_model,
+        config=config,
+        as_of=as_of,
+    )
+
+    with session_factory() as session:
+        assert session.query(OpenPositionRow).count() == 0
+        reasons = [r.reason for r in session.query(SkippedSignalRow).all()]
+    assert any("before the hard exit" in r for r in reasons), reasons
+
+
+def test_entry_is_allowed_with_enough_runway(
+    session_factory,  # noqa: ANN001
+    execution,  # noqa: ANN001
+    cost_model: CostModel,
+    tmp_path: Path,
+) -> None:
+    """The runway rule must not block a normal mid-session entry — the same
+    signal, far enough from the close, still trades."""
+    store = _breakout_store(tmp_path)
+    as_of = _open(16)  # ~09:31 IST, hours of runway
+    config = _config(hard_exit_by=dt.time(15, 20), min_minutes_before_hard_exit=30)
+
+    run_entry_cycle(
+        session_factory=session_factory,
+        store=store,
+        execution=execution,
+        cost_model=cost_model,
+        config=config,
+        as_of=as_of,
+    )
+
+    with session_factory() as session:
+        assert session.query(OpenPositionRow).count() == 1

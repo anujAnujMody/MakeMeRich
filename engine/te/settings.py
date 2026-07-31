@@ -71,6 +71,16 @@ class Settings(BaseSettings):
     paper_cycle_trailing_distance_paise: int | None = 300
     paper_cycle_max_hold_minutes: int = 180
     paper_cycle_hard_exit_by: dt.time = dt.time(15, 20)
+    #: Minutes of runway a new entry must have before `hard_exit_by`.
+    #:
+    #: `0` preserves the historic behaviour (only the guaranteed-zero-exposure
+    #: case is blocked). A positive value must come from the MEASURED
+    #: time-to-target distribution over labelled firings — see
+    #: `scripts/measure_time_to_target.py`. It is deliberately left at 0
+    #: until that measurement exists, because the failure it prevents (a
+    #: 15:05 entry force-closed at 15:20 for -Rs 6,672 on 2026-07-31)
+    #: does not justify inventing a threshold to replace it.
+    paper_cycle_min_minutes_before_hard_exit: int = 0
     paper_cycle_max_daily_loss_paise: int = 1_000_000
     paper_cycle_max_concurrent_positions: int = 5
     paper_cycle_max_trades_per_day: int = 20

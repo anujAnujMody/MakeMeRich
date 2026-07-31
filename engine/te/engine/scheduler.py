@@ -369,6 +369,7 @@ def _default_cycle_config(settings: Settings) -> CycleConfig:
         ),
         max_hold=dt.timedelta(minutes=settings.paper_cycle_max_hold_minutes),
         hard_exit_by=settings.paper_cycle_hard_exit_by,
+        min_minutes_before_hard_exit=settings.paper_cycle_min_minutes_before_hard_exit,
         risk_limits=RiskLimitsConfig(
             max_daily_loss_paise=Paise(settings.paper_cycle_max_daily_loss_paise),
             max_concurrent_positions=settings.paper_cycle_max_concurrent_positions,

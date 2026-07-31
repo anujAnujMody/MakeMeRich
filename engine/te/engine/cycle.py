@@ -144,6 +144,13 @@ class CycleConfig:
     #: choppy-day over-trading guard. `2` follows that; set `1` for the
     #: strictest common variant.
     max_entries_per_underlying_per_day: int = 2
+    #: Minutes of runway a new entry must have before `hard_exit_by`. `0`
+    #: blocks only the guaranteed-zero-exposure case (entering at or after
+    #: the hard exit itself) and is the historic behaviour; a positive value
+    #: also refuses entries too late to reach their target. Set from the
+    #: measured time-to-target distribution, never guessed — see
+    #: `Settings.paper_cycle_min_minutes_before_hard_exit`.
+    min_minutes_before_hard_exit: int = 0
 
 
 def _exit_levels(config: CycleConfig, entry_premium: Paise) -> tuple[Paise, Paise]:
@@ -359,19 +366,32 @@ def run_entry_cycle(
     stage_ms["risk"] += (time.perf_counter() - _t0) * 1000
     stage_reached["risk"] = True
 
-    # No new entries at or after the hard exit time. `PaperCycleRunner.run_once`
-    # runs `run_entry_cycle` and then `run_exit_cycle` in the SAME invocation,
-    # and `evaluate_position` checks `now_ist >= hard_exit_by` before anything
-    # else — so a position opened at or after that time is closed by the very
-    # next statement, at the same premium, having held zero seconds of market
-    # exposure. Gross P&L is exactly 0 and the round-trip cost (~Rs 55-65) is
-    # pure loss, repeatable across every active underlying.
+    # A new entry must have time left to actually work before the hard exit.
+    #
+    # At zero minutes this only blocks the degenerate case: `run_once` calls
+    # `run_entry_cycle` then `run_exit_cycle` in the SAME invocation, and
+    # `evaluate_position` checks `now_ist >= hard_exit_by` first, so a
+    # position opened at or after that time is closed by the very next
+    # statement at the same premium — zero market exposure, full round-trip
+    # cost, repeatable across every active underlying.
+    #
+    # `min_minutes_before_hard_exit` widens that to the real problem, which
+    # cost real money on 2026-07-31: a NIFTY position opened at 15:05 was
+    # force-closed at 15:20 for -8.7% (-Rs 6,672, 82% of the day's loss).
+    # Its stop never fired — the CLOCK closed it. Fifteen minutes is not
+    # enough for a +40% option move to resolve, so such an entry takes the
+    # full downside while its upside is unreachable by construction.
     if portfolio_blocked_reason is None:
         now_ist_time = as_of.astimezone(IST).timetz().replace(tzinfo=None)
-        if now_ist_time >= config.hard_exit_by:
+        latest_entry = (
+            dt.datetime.combine(dt.date.min, config.hard_exit_by)
+            - dt.timedelta(minutes=config.min_minutes_before_hard_exit)
+        ).time()
+        if now_ist_time >= latest_entry:
             portfolio_blocked_reason = (
-                f"{now_ist_time:%H:%M} IST is at or past the hard exit time ({config.hard_exit_by:%H:%M}) — "
-                f"a new entry would be force-closed this same cycle for a guaranteed round-trip cost"
+                f"{now_ist_time:%H:%M} IST leaves under {config.min_minutes_before_hard_exit}m before the "
+                f"hard exit ({config.hard_exit_by:%H:%M}) — not enough time for the trade to reach its "
+                f"target, so it would carry full downside against unreachable upside"
             )
 
     if portfolio_blocked_reason is not None:
