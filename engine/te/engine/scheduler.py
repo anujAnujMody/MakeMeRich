@@ -364,6 +364,8 @@ def _default_cycle_config(settings: Settings) -> CycleConfig:
         ),
         stop_pct=settings.paper_cycle_stop_pct,
         target_pct=settings.paper_cycle_target_pct,
+        trailing_pct=settings.paper_cycle_trailing_pct,
+        max_entries_per_underlying_per_day=settings.paper_cycle_max_entries_per_underlying_per_day,
     )
 
 

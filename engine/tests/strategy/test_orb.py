@@ -173,6 +173,53 @@ def test_trades_long_call_on_confirmed_upside_breakout(store: BarStore) -> None:
     assert strategy.last_signal.entry_premium == 10_800  # 108.00 rupees -> paise
 
 
+def test_does_not_resignal_while_price_merely_remains_beyond_the_range(store: BarStore) -> None:
+    """Regression for the churn bug found live on 2026-07-31. ORB read only
+    the LATEST bar and asked "is price outside the range?" — true for every
+    minute a move lasts, so one 10:00 breakout that held until 10:30
+    re-signalled ~30 times, each one opening a fresh position at full
+    round-trip cost. A breakout is a CROSSING: the first bar to close beyond
+    the range, per the standard "wait for a candle to close beyond the
+    range" formulation. Bar 16 here is still beyond the range, but bar 15
+    already crossed — so bar 16 must NOT re-signal."""
+    rows = [
+        *_opening_range_rows(high=105, low=95),
+        _bar(_open(15), o=100, h=110, low=100, c=108, v=1_500),  # the crossing
+        _bar(_open(16), o=108, h=112, low=107, c=111, v=1_500),  # still outside, not a new crossing
+    ]
+    _write(store, rows)
+    strategy = OrbStrategy(OrbParams(opening_range_minutes=15, min_opening_bars=3))
+    ctx = StrategyContext(store=store, instrument=INSTRUMENT, exchange=EXCHANGE, as_of=_open(17))
+
+    evaluation = strategy.evaluate(ctx)
+
+    assert evaluation.verdict == "skipped"
+    assert strategy.last_signal is None
+    assert "crossing" in evaluation.reason or "earlier bar" in evaluation.reason
+
+
+def test_a_genuine_second_crossing_signals_again(store: BarStore) -> None:
+    """The flip side: edge-triggering must not become a silent one-shot. If
+    price breaks out, falls back INSIDE the range, then breaks out again,
+    that later move is a real new crossing and should signal — this is what
+    a blunt "one entry per day" rule would have wrongly suppressed."""
+    rows = [
+        *_opening_range_rows(high=105, low=95),
+        _bar(_open(15), o=100, h=110, low=100, c=108, v=1_500),  # first crossing
+        _bar(_open(16), o=108, h=109, low=99, c=100, v=1_200),  # back INSIDE the range
+        _bar(_open(17), o=100, h=112, low=100, c=109, v=1_500),  # second, genuine crossing
+    ]
+    _write(store, rows)
+    strategy = OrbStrategy(OrbParams(opening_range_minutes=15, min_opening_bars=3))
+    ctx = StrategyContext(store=store, instrument=INSTRUMENT, exchange=EXCHANGE, as_of=_open(18))
+
+    evaluation = strategy.evaluate(ctx)
+
+    assert evaluation.verdict == "traded"
+    assert strategy.last_signal is not None
+    assert strategy.last_signal.direction == "long_call"
+
+
 def test_trades_long_put_on_confirmed_downside_breakout(store: BarStore) -> None:
     rows = [*_opening_range_rows(high=105, low=95), _bar(_open(15), o=100, h=95, low=88, c=90, v=2_000)]
     _write(store, rows)

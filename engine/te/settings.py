@@ -87,6 +87,14 @@ class Settings(BaseSettings):
     #: leftovers and mean different things at different premium levels.
     paper_cycle_stop_pct: Decimal | None = Decimal(20)
     paper_cycle_target_pct: Decimal | None = Decimal(40)
+    #: Trailing distance as a % of entry premium. 15% sits between the 20%
+    #: stop and the 40% target: it only starts binding once the trade is
+    #: meaningfully in profit, rather than clipping winners in the first
+    #: minutes. Deliberately far wider than the 1-3% used for equities —
+    #: option premium is several times more volatile in percentage terms,
+    #: and ORB's edge is asymmetry (winners must be allowed to run), so an
+    #: over-tight trail destroys the strategy rather than protecting it.
+    paper_cycle_trailing_pct: Decimal | None = Decimal(15)
     #: Reject a resolved contract whose bid-ask spread exceeds this % of LTP.
     #: Live NIFTY chain (2026-07-31) runs 0.1-0.4% through OTM5 and widens to
     #: ~1.1% by OTM8, so 1.0% admits the liquid band and excludes the rest.
@@ -94,6 +102,12 @@ class Settings(BaseSettings):
     #: Reject a contract quoting below this premium — a near-zero premium is a
     #: dead/untraded strike where the fixed ₹40 brokerage alone dominates.
     paper_cycle_min_premium_paise: int = 500
+    #: Max ORB entries per underlying per session. The strategy literature
+    #: converges on one or two per session (and on stopping for the day after
+    #: two stop-outs) as a choppy-day over-trading guard. Distinct from the
+    #: edge-triggered breakout detection in `te.strategy.orb`, which is what
+    #: actually prevents re-signalling the same crossing.
+    paper_cycle_max_entries_per_underlying_per_day: int = 2
 
     # Automated daily OpenAlgo-app + Angel-broker relogin (te.broker.openalgo_login)
     # — Angel expires its broker session nightly regardless of restarts; ALL

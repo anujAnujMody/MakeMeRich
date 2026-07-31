@@ -248,14 +248,23 @@ def insert_trade(
     )
 
 
-def has_underlying_traded_today(session: Session, *, strategy: str, underlying: str, on: dt.date) -> bool:
-    """Whether `strategy` already has an open OR closed-today position on
-    `underlying` — found live on 2026-07-31: with no such guard, ORB
-    re-evaluates the SAME persisting breakout on every 1-minute cycle and
-    re-signals every time its close/volume conditions still hold, so a
-    stopped-out position immediately re-opens (and often re-stops) on the
-    very next cycle. One underlying observed cycling through 5+ round trips
-    in under 10 minutes, paying full round-trip cost on every one.
+def underlying_entries_today(session: Session, *, strategy: str, underlying: str, on: dt.date) -> int:
+    """How many entries `strategy` has made on `underlying` today — open
+    positions plus positions closed today.
+
+    Feeds the max-entries-per-session risk rule. This is deliberately a
+    COUNT, not a boolean: the ORB literature converges on "one or two"
+    entries per session (and on stopping for the day after two stop-outs),
+    so the caller applies a configurable limit rather than this repo
+    hardcoding one entry.
+
+    Note this is a RISK rule, distinct from the correctness fix in
+    `te.strategy.orb`: the churn observed live on 2026-07-31 (one underlying
+    cycling through 5+ round trips in ten minutes) was caused by
+    level-triggered breakout detection re-signalling every bar, and is fixed
+    there by requiring a genuine crossing. This cap is the independent
+    "don't over-trade a choppy day" guard that standard ORB implementations
+    also carry.
 
     Matches by symbol PREFIX (`symbol LIKE '{underlying}%'`) since a
     position's `symbol` is the resolved OPTION contract
@@ -273,8 +282,6 @@ def has_underlying_traded_today(session: Session, *, strategy: str, underlying: 
             OpenPositionRow.closed_at.is_(None),
         )
     ).scalar_one()
-    if open_count > 0:
-        return True
 
     start, end = _day_bounds(on)
     closed_count = session.execute(
@@ -287,7 +294,7 @@ def has_underlying_traded_today(session: Session, *, strategy: str, underlying: 
             TradeRow.closed_at <= end,
         )
     ).scalar_one()
-    return bool(closed_count > 0)
+    return int(open_count) + int(closed_count)
 
 
 def trades_today(session: Session, on: dt.date) -> list[TradeRow]:

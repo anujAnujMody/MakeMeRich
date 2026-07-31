@@ -221,6 +221,38 @@ def test_stop_and_target_are_percentages_of_the_option_premium(
     assert row.target_paise == int(OPTION_PREMIUM) + int(int(OPTION_PREMIUM) * 40 / 100)
 
 
+def test_trailing_distance_scales_with_the_option_premium(
+    session_factory, execution, cost_model: CostModel, index_store: BarStore
+) -> None:  # noqa: ANN001
+    """Regression for a bug found live on 2026-07-31 that closed 14 of 14
+    trades in an average of 3.1 minutes, none near their real stop or
+    target. `stop`/`target` had been converted to percentages of premium but
+    `trailing_distance` was left at its absolute ₹3 — an index-point-scaled
+    leftover worth 0.44% of a ₹676 option, i.e. tighter than tick-to-tick
+    noise, so the trail ratcheted to just under spot and exited on the first
+    trivial pullback. Option premium is several times more volatile than the
+    underlying in percentage terms, and ORB's edge is asymmetry (winners
+    must be allowed to run), so an over-tight trail destroys the strategy."""
+    run_entry_cycle(
+        session_factory=session_factory,
+        store=index_store,
+        execution=execution,
+        cost_model=cost_model,
+        config=_config(trailing_pct=Decimal(15)),
+        as_of=_open(16),
+        contract_resolver=_resolver,
+    )
+
+    with session_factory() as session:
+        row = session.query(OpenPositionRow).one()
+
+    expected = int(int(OPTION_PREMIUM) * 15 / 100)
+    assert row.trailing_distance_paise == expected
+    # The real point: the trail must be a meaningful fraction of premium,
+    # not the ~0.4% that strangled every live trade.
+    assert row.trailing_distance_paise > int(OPTION_PREMIUM) * 5 // 100
+
+
 def test_cost_gate_passes_once_the_premium_is_real(
     session_factory, execution, cost_model: CostModel, index_store: BarStore
 ) -> None:  # noqa: ANN001
@@ -276,15 +308,11 @@ def test_risk_budget_blocks_a_nifty_lot_at_20k_capital_and_says_so(
 def test_a_stopped_out_position_does_not_reenter_the_same_underlying_same_day(
     session_factory, execution, cost_model: CostModel, index_store: BarStore
 ) -> None:  # noqa: ANN001
-    """Regression for a real, actively-losing bug found live on 2026-07-31:
-    ORB re-evaluates the SAME persisting breakout on every 1-minute cycle,
-    so once a position is stopped out it immediately re-opens (and often
-    re-stops) on the very next cycle — one underlying cycled through 5+
-    round trips in under 10 minutes live, paying full round-trip cost every
-    time. Runs two entry cycles back-to-back on data where the breakout
-    condition still holds on both: the second must be a no-op skip, not a
-    second entry."""
-    config = _config()
+    """The max-entries-per-session RISK cap (distinct from the edge-trigger
+    correctness fix in `te.strategy.orb`). Set to 1 here so a single prior
+    entry exhausts it; the shipped default is 2, matching the ORB
+    literature's "one or two per session"."""
+    config = _config(max_entries_per_underlying_per_day=1)
 
     cycle_id_1 = run_entry_cycle(
         session_factory=session_factory,
@@ -343,7 +371,7 @@ def test_a_stopped_out_position_does_not_reenter_the_same_underlying_same_day(
             s.reason for s in session.query(SkippedSignalRow).filter(SkippedSignalRow.instrument == UNDERLYING)
         ]
     assert open_count == 0, "must not have re-entered — the earlier position was closed, not re-opened"
-    assert any("one entry per underlying per day" in r for r in reasons), reasons
+    assert any("per-session limit" in r for r in reasons), reasons
 
 
 def test_unresolvable_contract_skips_with_a_real_reason_instead_of_trading_the_index(

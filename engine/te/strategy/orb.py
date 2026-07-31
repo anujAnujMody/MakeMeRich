@@ -95,7 +95,14 @@ class OrbStrategy:
         avg_range_volume = float(opening_bars["v"].mean())
 
         local_ts = bars["event_ts"].dt.tz_convert(IST)
-        breakout_bars = bars[local_ts >= range_end]
+        # Drop duplicate timestamps (keeping the latest write) BEFORE the
+        # edge comparison below. Two rows sharing an `event_ts` are the same
+        # minute, and comparing a bar against a duplicate of itself would
+        # read as "the previous bar was already beyond the range" and
+        # silently suppress a real breakout. Duplicates are reachable live:
+        # a WS reconnect or a retried recorder flush can re-append a minute
+        # that is already stored.
+        breakout_bars = bars[local_ts >= range_end].drop_duplicates(subset="event_ts", keep="last")
         if breakout_bars.empty:
             conditions.append(_not_reached("breakout close beyond opening range"))
             conditions.append(_not_reached("breakout volume confirmation"))
@@ -105,25 +112,65 @@ class OrbStrategy:
         close = float(breakout_bar["c"])
         volume = float(breakout_bar["v"])
 
+        # EDGE-triggered, not level-triggered. The breakout is the moment
+        # price CROSSES out of the range — the first bar to close beyond it —
+        # not every subsequent bar that merely remains beyond it.
+        #
+        # Found live on 2026-07-31: reading only `iloc[-1]` asks "is price
+        # outside the range right now?", which stays true for as long as the
+        # move lasts, so a single 10:00 breakout that held until 10:30 re-
+        # signalled ~30 times. Each re-signal opened a fresh position (and
+        # often re-stopped it) at full round-trip cost. Standard ORB is an
+        # entry on the first close beyond the range — see the strategy
+        # literature, which uniformly describes "wait for a candle to CLOSE
+        # beyond the range" as the trigger.
+        #
+        # Comparing against the immediately preceding bar (rather than
+        # remembering that we already fired) also keeps this rule PURE and
+        # stateless, which matters because `te.strategy.registry` hands out a
+        # fresh `OrbStrategy` per evaluation — instance state cannot persist
+        # across cycles by design. It additionally makes a genuine SECOND
+        # breakout tradeable: if price falls back inside the range and later
+        # breaks out again, that is a real new crossing and should signal.
+        prev_close_inside = True
+        if len(breakout_bars) >= 2:
+            prev_close = float(breakout_bars.iloc[-2]["c"])
+            prev_close_inside = range_low <= prev_close <= range_high
+
+        closed_outside = close > range_high or close < range_low
         direction: Direction | None
-        if close > range_high:
-            direction = "long_call"
-        elif close < range_low:
-            direction = "long_put"
+        if closed_outside and prev_close_inside:
+            direction = "long_call" if close > range_high else "long_put"
         else:
             direction = None
 
+        if closed_outside and not prev_close_inside:
+            actual = (
+                f"close={close:.2f} is beyond range=[{range_low:.2f}, {range_high:.2f}], but the previous "
+                f"bar closed beyond it too — the crossing already happened, this is not a new breakout"
+            )
+        else:
+            actual = f"close={close:.2f}, range=[{range_low:.2f}, {range_high:.2f}]"
+
         breakout_cond = ConditionResult(
             label="breakout close beyond opening range",
-            required=f"close > {range_high:.2f} (long_call) or close < {range_low:.2f} (long_put)",
-            actual=f"close={close:.2f}, range=[{range_low:.2f}, {range_high:.2f}]",
+            required=(
+                f"a bar CROSSING out: close > {range_high:.2f} (long_call) or close < {range_low:.2f} "
+                f"(long_put), with the previous bar closed inside the range"
+            ),
+            actual=actual,
             passed=direction is not None,
             evaluated=True,
         )
         conditions.append(breakout_cond)
         if direction is None:
             conditions.append(_not_reached("breakout volume confirmation"))
-            return self._skip(ctx, conditions, "close finished inside the opening range — no breakout")
+            reason = (
+                "already beyond the opening range — the breakout crossing happened on an earlier bar"
+                if closed_outside
+                else "close finished inside the opening range — no breakout"
+            )
+            return self._skip(ctx, conditions, reason)
 
         threshold = avg_range_volume * float(params.volume_confirmation_multiple)
         volume_cond = ConditionResult(

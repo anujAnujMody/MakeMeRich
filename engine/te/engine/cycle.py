@@ -42,7 +42,6 @@ from te.persistence.db import session_scope
 from te.persistence.models import OpenPositionRow
 from te.persistence.repos.paper_trading import (
     find_open_position,
-    has_underlying_traded_today,
     insert_open_position,
     insert_trade,
     mark_position_closed,
@@ -51,6 +50,7 @@ from te.persistence.repos.paper_trading import (
     record_evaluation,
     record_skipped_signal,
     total_net_pnl_paise,
+    underlying_entries_today,
     update_trailing_stop,
 )
 from te.risk.killswitch import KillSwitchTrippedError, is_currently_throttled
@@ -124,6 +124,20 @@ class CycleConfig:
     #: `CycleConfig` and test is unaffected.
     stop_pct: Decimal | None = None
     target_pct: Decimal | None = None
+    #: Trailing distance as a PERCENTAGE of entry premium. Same index-point
+    #: problem as stop/target, but worse in effect: found live on
+    #: 2026-07-31, an absolute ₹3 trail against a ₹676 option premium is
+    #: 0.44% — tighter than tick-to-tick noise — and closed 14 of 14 trades
+    #: on `trailing_stop` at an average hold of 3.1 minutes, none of them
+    #: anywhere near their real stop or target. Option premium is several
+    #: times more volatile than the underlying in percentage terms, so an
+    #: option trail belongs in the tens of percent, not fractions of one.
+    trailing_pct: Decimal | None = None
+    #: Max entries per underlying per session. The ORB literature converges
+    #: on one or two (and on stopping for the day after two stop-outs) as a
+    #: choppy-day over-trading guard. `2` follows that; set `1` for the
+    #: strictest common variant.
+    max_entries_per_underlying_per_day: int = 2
 
 
 def _exit_levels(config: CycleConfig, entry_premium: Paise) -> tuple[Paise, Paise]:
@@ -144,6 +158,14 @@ def _exit_levels(config: CycleConfig, entry_premium: Paise) -> tuple[Paise, Pais
         else config.target_distance
     )
     return Paise(entry_premium - stop_distance), Paise(entry_premium + target_distance)
+
+
+def _trailing_distance(config: CycleConfig, entry_premium: Paise) -> Paise | None:
+    """Trailing distance for one entry — percentage of entry premium when
+    `trailing_pct` is set, else the historic absolute distance."""
+    if config.trailing_pct is None:
+        return config.trailing_distance
+    return Paise(int(Decimal(int(entry_premium)) * config.trailing_pct / Decimal(100)))
 
 
 def _resolve_instruments(config: CycleConfig) -> list[InstrumentConfig]:
@@ -348,20 +370,24 @@ def run_entry_cycle(
             _skip(instrument, "strategy reported verdict=traded but produced no Signal")
             continue
 
-        # One entry per underlying per day. Without this, ORB re-evaluates
-        # the SAME persisting breakout on every 1-minute cycle and re-signals
-        # every time its close/volume conditions still hold — a stopped-out
-        # position immediately re-opens (and often re-stops) on the very
-        # next cycle. Found live: one underlying cycled through 5+ round
-        # trips in under 10 minutes, paying full round-trip cost each time.
-        # Checked here (not folded into the gate block below) because it is
-        # a strategy-discipline rule, not a portfolio/account risk limit.
+        # Max entries per underlying per session — the standard ORB
+        # "don't over-trade a choppy day" guard (the literature converges on
+        # one or two, and on stopping after two stop-outs). This is a RISK
+        # rule and is deliberately NOT the fix for re-entry churn: that was a
+        # correctness bug in the rule itself (level- vs edge-triggered
+        # breakout detection) and is fixed in `te.strategy.orb`. Checked here
+        # rather than in the gate block below because it is per-strategy
+        # discipline, not a portfolio/account limit.
         with session_scope(session_factory) as session:
-            already_traded = has_underlying_traded_today(
+            entries_today = underlying_entries_today(
                 session, strategy=config.strategy_name, underlying=instrument, on=as_of.date()
             )
-        if already_traded:
-            _skip(instrument, "already traded this underlying today — one entry per underlying per day")
+        if entries_today >= config.max_entries_per_underlying_per_day:
+            _skip(
+                instrument,
+                f"{entries_today} entr(ies) on this underlying today, at or above the per-session limit of "
+                f"{config.max_entries_per_underlying_per_day}",
+            )
             continue
 
         # Per-instrument gates only — portfolio-level checks already ran
@@ -476,7 +502,7 @@ def run_entry_cycle(
 
         exit_plan = ExitPlan(
             stop=stop_premium,
-            trailing_distance=config.trailing_distance,
+            trailing_distance=_trailing_distance(config, entry_premium),
             target=target_premium,
             max_hold=config.max_hold,
             hard_exit_by=config.hard_exit_by,
