@@ -126,3 +126,43 @@ describe('DecisionCard', () => {
     expect(notReachedRow?.getAttribute('data-state')).not.toBe('fail')
   })
 })
+
+describe('unmeasurable conditions', () => {
+  it('does not label a reached-but-unmeasurable condition as "not reached"', async () => {
+    const user = userEvent.setup()
+    // ORB's volume filter on an index: the condition WAS reached, but an
+    // index reports no volume, so there is nothing to measure. Rendering it
+    // as "not reached" told a screen-reader user the opposite of the truth.
+    renderCard('traded', 'opening range breakout confirmed', [
+      {
+        label: 'breakout volume confirmation',
+        required: '>= 1x opening-range average volume',
+        actual: 'not evaluated — NIFTY reports no volume on its bars',
+        passed: true,
+        evaluated: false,
+        outcome: 'unmeasurable',
+      },
+    ])
+    await user.click(screen.getByRole('button', { name: /opening range breakout confirmed/i }))
+
+    expect(screen.queryByLabelText('not reached')).not.toBeInTheDocument()
+    expect(screen.getByLabelText(/no data to measure/i)).toBeInTheDocument()
+  })
+
+  it('still labels a short-circuited condition as "not reached"', async () => {
+    const user = userEvent.setup()
+    renderCard('skipped', 'no breakout', [
+      {
+        label: 'breakout volume confirmation',
+        required: 'n/a',
+        actual: 'not reached',
+        passed: false,
+        evaluated: false,
+        outcome: 'not_reached',
+      },
+    ])
+    await user.click(screen.getByRole('button', { name: /no breakout/i }))
+
+    expect(screen.getByLabelText('not reached')).toBeInTheDocument()
+  })
+})

@@ -89,7 +89,9 @@ function Conditions({ items }: { items: ConditionResult[] }) {
               <tr
                 key={item.label}
                 data-state={state}
-                className={`border-t border-border ${state === 'not-reached' ? 'opacity-60' : ''}`}
+                className={`border-t border-border ${
+                  state === 'not-reached' || state === 'unmeasurable' ? 'opacity-60' : ''
+                }`}
               >
                 <td className="py-1.5">{item.label}</td>
                 <td className="font-numeric py-1.5 text-right">{item.required}</td>
@@ -108,6 +110,11 @@ function Conditions({ items }: { items: ConditionResult[] }) {
                   {state === 'not-reached' && (
                     <span className="text-muted-foreground" aria-label="not reached">
                       ⋯
+                    </span>
+                  )}
+                  {state === 'unmeasurable' && (
+                    <span className="text-muted-foreground" aria-label="not evaluated — no data to measure it">
+                      —
                     </span>
                   )}
                 </td>

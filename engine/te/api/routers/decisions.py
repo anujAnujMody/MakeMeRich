@@ -5,11 +5,22 @@ from fastapi import APIRouter, Response
 from te.api.db import session_factory
 from te.api.provenance import set_provenance
 from te.api.schemas.dashboard import CycleEvaluation
-from te.api.schemas.decision import ConditionResult
+from te.api.schemas.decision import ConditionOutcome, ConditionResult
 from te.domain.clock import IST
+from te.domain.evaluation import NOT_EVALUATED_PREFIX
+from te.persistence.models import EvaluationConditionRow
 from te.persistence.repos.paper_trading import conditions_for, evaluations_today
 
 router = APIRouter(prefix="/api/decisions", tags=["decisions"])
+
+
+def _outcome(row: EvaluationConditionRow) -> ConditionOutcome:
+    """Same rule as `te.domain.evaluation.ConditionResult.outcome`, applied
+    to the persisted row (which carries the stored booleans and text, not the
+    domain object)."""
+    if row.evaluated:
+        return "passed" if row.passed else "failed"
+    return "unmeasurable" if row.actual.startswith(NOT_EVALUATED_PREFIX) else "not_reached"
 
 
 @router.get("/today", response_model=list[CycleEvaluation])
@@ -38,6 +49,7 @@ def get_today_decisions(response: Response) -> list[CycleEvaluation]:
                         actual=c.actual,
                         passed=c.passed,
                         evaluated=c.evaluated,
+                        outcome=_outcome(c),
                     )
                     for c in conditions_for(session, row.evaluation_id)
                 ],

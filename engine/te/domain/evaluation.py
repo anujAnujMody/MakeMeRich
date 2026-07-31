@@ -32,6 +32,15 @@ from typing import Literal
 
 DecisionVerdict = Literal["traded", "skipped", "error"]
 
+#: What actually happened to one condition. `passed`/`evaluated` are two
+#: booleans encoding four states, and consumers kept collapsing the two
+#: unevaluated ones together — the dashboard rendered BOTH as "not reached",
+#: so a screen-reader user was told a condition had not been reached when it
+#: had been reached and simply could not be measured. Named states cross the
+#: API boundary instead, so no consumer has to re-derive the distinction (or
+#: worse, re-parse `actual`).
+ConditionOutcome = Literal["passed", "failed", "not_reached", "unmeasurable"]
+
 _NOT_REACHED = "not reached"
 
 #: Required prefix for the `actual` of a condition that was reached but
@@ -52,6 +61,15 @@ class ConditionResult:
     actual: str
     passed: bool
     evaluated: bool
+
+    @property
+    def outcome(self) -> ConditionOutcome:
+        """The four real states, from the two stored booleans plus the
+        `actual` form. THE single place that distinction is interpreted —
+        `NOT_EVALUATED_PREFIX` is a storage detail that stops here."""
+        if self.evaluated:
+            return "passed" if self.passed else "failed"
+        return "unmeasurable" if self.actual.startswith(NOT_EVALUATED_PREFIX) else "not_reached"
 
     def __post_init__(self) -> None:
         if self.evaluated and not self.actual:
