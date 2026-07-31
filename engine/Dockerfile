@@ -17,6 +17,13 @@ COPY config ./config
 
 RUN pip install --no-cache-dir .
 
+# Operational CLIs (bhavcopy backfill, ORB history replay, model promotion).
+# Copied AFTER `pip install` so editing one doesn't invalidate the dependency
+# layer. They run via `docker exec`, against the same TE_* settings and the
+# same database volume as the server process — which is the point: a
+# backfill must write where the engine reads.
+COPY scripts ./scripts
+
 EXPOSE 8000
 
 CMD ["uvicorn", "te.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
