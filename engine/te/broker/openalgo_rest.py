@@ -61,6 +61,25 @@ class HistoryBar:
 
 
 @dataclass(frozen=True, slots=True)
+class OptionContract:
+    """One concrete, tradeable option contract as resolved by OpenAlgo's
+    `optionsymbol` service from an offset (`ATM`/`OTM2`/`ITM1`/...).
+
+    This is what makes strike selection a broker-side lookup rather than
+    arithmetic we maintain: no strike-step table (50 for NIFTY, 100 for
+    BANKNIFTY, ...), no ATM rounding, no expiry-weekday/holiday maths. The
+    returned `lot_size` is broker-authoritative, which is the standing rule
+    for this project (lot sizes change ~every 6 months — see the plan's R7)."""
+
+    symbol: str
+    exchange: str  # placement exchange (NFO/BFO), NOT the underlying's exchange
+    lot_size: int
+    tick_size: float
+    freeze_qty: int
+    underlying_ltp: float
+
+
+@dataclass(frozen=True, slots=True)
 class SymbolMeta:
     """Contract metadata — the authoritative source of lot size, tick size,
     and expiry, per `.agents/skills/openalgo/references/symbol-services.md`.
@@ -177,6 +196,60 @@ class OpenAlgoRestClient:
             )
             for row in data
         ]
+
+    def expiry_dates(self, symbol: str, exchange: str, instrument_type: str = "options") -> list[str]:
+        """Broker-confirmed expiry dates for an underlying, nearest first, in
+        OpenAlgo's `DDMMMYY` form (the API returns `DD-MMM-YY`; the dashes are
+        stripped here because every downstream options endpoint wants the
+        undashed form).
+
+        Preferred over `te.domain.symbols.next_weekly_expiry`, which computes
+        the expiry weekday arithmetically and has **no holiday adjustment** —
+        when an expiry weekday falls on an exchange holiday the real expiry
+        shifts a day earlier and the computed symbol would 404."""
+        data = self._post(
+            "/api/v1/expiry",
+            {"symbol": symbol, "exchange": exchange, "instrumenttype": instrument_type},
+        )["data"]
+        return [str(raw).replace("-", "").upper() for raw in data]
+
+    def option_symbol(
+        self,
+        underlying: str,
+        underlying_exchange: str,
+        expiry_date: str,
+        offset: str,
+        option_type: str,
+    ) -> OptionContract:
+        """Resolves an offset (`ATM`, `OTM1`..`OTM20`, `ITM1`..`ITM20`) to a
+        concrete contract via `POST /api/v1/optionsymbol`.
+
+        `underlying_exchange` is the INDEX exchange (`NSE_INDEX`/`BSE_INDEX`);
+        the returned `exchange` is the placement exchange (`NFO`/`BFO`) and is
+        what orders must be sent to — the two are deliberately different, and
+        conflating them is why the pre-fix engine tried to place `NIFTY` on
+        `NFO`.
+
+        Unlike every other endpoint here, this response carries its fields at
+        the TOP level of the envelope rather than under `data`."""
+        body = self._post(
+            "/api/v1/optionsymbol",
+            {
+                "underlying": underlying,
+                "exchange": underlying_exchange,
+                "expiry_date": expiry_date,
+                "offset": offset,
+                "option_type": option_type,
+            },
+        )
+        return OptionContract(
+            symbol=str(body["symbol"]),
+            exchange=str(body["exchange"]),
+            lot_size=int(body["lotsize"]),
+            tick_size=float(body.get("tick_size", 0.0)),
+            freeze_qty=int(body.get("freeze_qty", 0)),
+            underlying_ltp=float(body.get("underlying_ltp", 0.0)),
+        )
 
     def symbol_meta(self, symbol: str, exchange: str) -> SymbolMeta:
         """Resolves one contract's lot size / tick size / expiry via

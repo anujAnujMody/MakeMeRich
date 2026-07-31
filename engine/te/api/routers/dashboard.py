@@ -1,16 +1,24 @@
 import datetime as dt
 
 from fastapi import APIRouter, Response
+from sqlalchemy.orm import Session
 
 from te.api.db import bar_store, session_factory, settings
 from te.api.provenance import set_provenance
 from te.api.routers.positions import position_from_row
-from te.api.schemas.dashboard import DashboardData, DashboardSnapshot, OpenPosition
+from te.api.schemas.dashboard import DashboardData, DashboardSnapshot, OpenPosition, PipelineStageInfo
 from te.api.trade_stats import summarize_trades
 from te.data.asof import latest_close_paise
 from te.domain.clock import IST
 from te.domain.money import Paise, rupees
-from te.engine.state import get_guardrails, get_mode, get_run_state, guardrails_defaults_from_settings
+from te.engine.state import (
+    PIPELINE_STAGE_KEYS,
+    get_guardrails,
+    get_last_cycle_pipeline,
+    get_mode,
+    get_run_state,
+    guardrails_defaults_from_settings,
+)
 from te.persistence.repos.paper_trading import (
     daily_net_pnl_paise,
     open_positions,
@@ -27,6 +35,41 @@ router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
 #: week — a calendar week can span a weekend/holiday gap that would silently
 #: undercount trading days.
 _TRAILING_SESSIONS = 5
+
+_PIPELINE_STAGE_LABELS: dict[str, str] = {
+    "fetch": "Fetch",
+    "analyze": "Analyze",
+    "risk": "Risk",
+    "decide": "Decide",
+    "act": "Act",
+}
+
+
+def _format_duration_ms(ms: int) -> str:
+    if ms < 1000:
+        return f"{ms}ms"
+    return f"{ms / 1000:.1f}s"
+
+
+def _build_pipeline(session: Session) -> list[PipelineStageInfo]:
+    """The most recently completed `run_entry_cycle`'s real, measured
+    per-stage timing (`te.engine.state.get_last_cycle_pipeline`) — `[]`
+    until the first cycle has run. A stage that genuinely didn't fire this
+    cycle (e.g. every instrument skipped before sizing, so `decide`/`act`
+    never ran) shows `pending`, never fabricated as `done`."""
+    last = get_last_cycle_pipeline(session)
+    if last is None:
+        return []
+    return [
+        PipelineStageInfo(
+            key=key,
+            label=_PIPELINE_STAGE_LABELS[key],
+            state="done" if last.stages[key].reached else "pending",
+            durationLabel=_format_duration_ms(last.stages[key].elapsed_ms) if last.stages[key].reached else None,
+        )
+        for key in PIPELINE_STAGE_KEYS
+        if key in last.stages
+    ]
 
 
 @router.get("", response_model=DashboardData)
@@ -70,10 +113,9 @@ def get_dashboard(response: Response) -> DashboardData:
 @router.get("/snapshot", response_model=DashboardSnapshot)
 def get_dashboard_snapshot(response: Response) -> DashboardSnapshot:
     """Single-call snapshot of engine mode, risk budget usage, open positions
-    and the trailing-session rollup — from real persisted state.
-
-    `pipeline` needs per-cycle stage tracking this endpoint doesn't do yet —
-    stays `[]`, unchanged from before."""
+    and the trailing-session rollup — from real persisted state. `pipeline`
+    is the most recently completed cycle's real, measured per-stage timing
+    (see `_build_pipeline`)."""
     as_of = dt.datetime.now(IST)
     today = as_of.date()
     with session_factory() as session:
@@ -83,6 +125,7 @@ def get_dashboard_snapshot(response: Response) -> DashboardSnapshot:
         today_trade_count = trades_count_today(session, today)
         positions = open_positions(session)
         guardrails = get_guardrails(session, defaults=guardrails_defaults_from_settings(settings))
+        pipeline = _build_pipeline(session)
 
         session_dates = recent_session_dates(session, limit=_TRAILING_SESSIONS)
         week_rows = trades_closed_since(session, min(session_dates)) if session_dates else []
@@ -119,7 +162,7 @@ def get_dashboard_snapshot(response: Response) -> DashboardSnapshot:
             )
             for row in positions
         ],
-        pipeline=[],
+        pipeline=pipeline,
         weekWinRatePct=week_summary.win_rate,
         weekTrades=week_summary.total_trades,
         weekNetPnl=week_summary.total_pnl,

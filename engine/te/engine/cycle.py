@@ -18,6 +18,7 @@ Two entry points, run every cycle:
 from __future__ import annotations
 
 import datetime as dt
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal
@@ -32,7 +33,9 @@ from te.domain.money import Paise
 from te.domain.orders import OrderRequest
 from te.domain.pnl import GrossPnl, mark_to_market_pnl, net_pnl
 from te.domain.signal import ExitPlan, Signal
+from te.engine.contract import ContractResolver
 from te.engine.exits import OpenPosition, evaluate_position
+from te.engine.state import PIPELINE_STAGE_KEYS, PipelineStageTiming, set_last_cycle_pipeline
 from te.execution.manager import ExecutionManager
 from te.ml.gates import MLHook, MLInfluence
 from te.persistence.db import session_scope
@@ -111,6 +114,35 @@ class CycleConfig:
     #: by default so every pre-existing `CycleConfig` construction is
     #: unaffected.
     max_position_size_pct: Decimal = Decimal(100)
+    #: Stop/target as a PERCENTAGE of the entry premium. When set, these take
+    #: priority over the absolute `stop_distance`/`target_distance` above.
+    #: Absolute distances are index-point-scaled leftovers from before option
+    #: contracts were resolved — against a real premium they mean wildly
+    #: different things at ₹30 vs ₹300 (a ₹15 target is 50% of one and 5% of
+    #: the other). `None` keeps the absolute behaviour, so every pre-existing
+    #: `CycleConfig` and test is unaffected.
+    stop_pct: Decimal | None = None
+    target_pct: Decimal | None = None
+
+
+def _exit_levels(config: CycleConfig, entry_premium: Paise) -> tuple[Paise, Paise]:
+    """Stop/target for one entry. Percentage-based when `stop_pct`/
+    `target_pct` are configured, else the historic absolute distances.
+
+    Percentages are the correct form once a real option premium is being
+    traded: a fixed ₹15 target is 50% of a ₹30 premium and 5% of a ₹300 one,
+    so an absolute distance silently changes the strategy as premiums move."""
+    stop_distance = (
+        Paise(int(Decimal(int(entry_premium)) * config.stop_pct / Decimal(100)))
+        if config.stop_pct is not None
+        else config.stop_distance
+    )
+    target_distance = (
+        Paise(int(Decimal(int(entry_premium)) * config.target_pct / Decimal(100)))
+        if config.target_pct is not None
+        else config.target_distance
+    )
+    return Paise(entry_premium - stop_distance), Paise(entry_premium + target_distance)
 
 
 def _resolve_instruments(config: CycleConfig) -> list[InstrumentConfig]:
@@ -178,9 +210,21 @@ def run_entry_cycle(
     config: CycleConfig,
     as_of: dt.datetime,
     ml_hook: MLHook | None = None,
+    contract_resolver: ContractResolver | None = None,
 ) -> int:
     """One fetch->analyze->risk->decide->act pass across every configured
     instrument. Returns the persisted `cycle_id`.
+
+    `contract_resolver` turns the rule's `long_call`/`long_put` intent on an
+    INDEX into a concrete option contract with a real premium (see
+    `te.engine.contract.OptionContractResolver`). It is REQUIRED in
+    production: without it the raw `instrument` symbol and the rule's
+    index-level "premium" are traded directly, which is only ever correct
+    when `instrument` is already an option symbol (as in this module's tests
+    and in backtests replayed from `option_bhav`). Live, `instrument` is
+    `"NIFTY"` and no such contract exists on NFO — that was the defect found
+    on 2026-07-31. `None` therefore preserves the historic behaviour for
+    those callers rather than silently changing them.
 
     `ml_hook` is OPTIONAL and, when supplied, is the only way `te.ml` can
     touch this function — it returns an `MLInfluence`, never a raw model
@@ -207,6 +251,26 @@ def run_entry_cycle(
                 session, ts=as_of, strategy=config.strategy_name, instrument=instrument, reason=reason
             )
 
+    # Real, measured per-stage wall-clock cost for this cycle — feeds the
+    # dashboard's "Current cycle" strip (`PipelineStrip`/`get_dashboard_
+    # snapshot`). `reached=False` for a stage means it genuinely did not run
+    # this cycle (e.g. every instrument skipped before sizing, so
+    # `decide`/`act` never fired) — never marked "done" just to fill the bar.
+    stage_ms: dict[str, float] = dict.fromkeys(PIPELINE_STAGE_KEYS, 0.0)
+    stage_reached: dict[str, bool] = dict.fromkeys(PIPELINE_STAGE_KEYS, False)
+
+    def _persist_pipeline() -> None:
+        with session_scope(session_factory) as session:
+            set_last_cycle_pipeline(
+                session,
+                cycle_id=cycle_id,
+                as_of=as_of,
+                stages={
+                    k: PipelineStageTiming(reached=stage_reached[k], elapsed_ms=round(stage_ms[k]))
+                    for k in PIPELINE_STAGE_KEYS
+                },
+            )
+
     # Portfolio-level risk (daily loss incl. unrealized, and drawdown vs
     # peak equity) is checked ONCE per cycle here, unconditionally — not
     # nested inside the per-instrument loop below. It used to run only when
@@ -219,6 +283,7 @@ def run_entry_cycle(
     # block a later instrument in the same cycle.
     portfolio_blocked_reason: str | None = None
     throttled = False
+    _t0 = time.perf_counter()
     with session_scope(session_factory) as session:
         try:
             check_killswitch(session)
@@ -236,10 +301,13 @@ def run_entry_cycle(
             portfolio_blocked_reason = str(exc)
         else:
             throttled = is_currently_throttled(session)
+    stage_ms["risk"] += (time.perf_counter() - _t0) * 1000
+    stage_reached["risk"] = True
 
     if portfolio_blocked_reason is not None:
         for instrument_config in _resolve_instruments(config):
             _skip(instrument_config.symbol, portfolio_blocked_reason)
+        _persist_pipeline()
         return cycle_id
 
     for instrument_config in _resolve_instruments(config):
@@ -248,8 +316,15 @@ def run_entry_cycle(
         lot_size = instrument_config.lot_size
 
         strategy = get_strategy(config.strategy_name)
+        _t0 = time.perf_counter()
         ctx = StrategyContext(store=store, instrument=instrument, exchange=exchange, as_of=as_of)
+        _t1 = time.perf_counter()
+        stage_ms["fetch"] += (_t1 - _t0) * 1000
+        stage_reached["fetch"] = True
+
         evaluation = strategy.evaluate(ctx)
+        stage_ms["analyze"] += (time.perf_counter() - _t1) * 1000
+        stage_reached["analyze"] = True
 
         with session_scope(session_factory) as session:
             record_evaluation(session, cycle_id=cycle_id, evaluation=evaluation)
@@ -279,6 +354,7 @@ def run_entry_cycle(
         # `check_killswitch` is repeated too: a same-cycle overfill halt
         # from an earlier instrument's synchronous fill must still block a
         # later one.
+        _t2 = time.perf_counter()
         blocked_reason: str | None = None
         with session_scope(session_factory) as session:
             try:
@@ -291,25 +367,46 @@ def run_entry_cycle(
                 # SQLite write transaction inside another.
                 blocked_reason = str(exc)
         if blocked_reason is not None:
+            stage_ms["risk"] += (time.perf_counter() - _t2) * 1000
             _skip(instrument, blocked_reason)
             continue
 
-        stop_premium = Paise(signal.entry_premium - config.stop_distance)
-        target_premium = Paise(signal.entry_premium + config.target_distance)
+        # Contract resolution — the index breakout becomes a real option to
+        # buy. Everything downstream (sizing, cost model, stop/target, the
+        # order itself, MTM) then operates on the OPTION's premium instead of
+        # the index level. Counted under `fetch`: it is I/O to obtain the
+        # tradeable instrument, not a decision.
+        trade_symbol = instrument
+        trade_exchange = exchange
+        entry_premium = signal.entry_premium
+        if contract_resolver is not None:
+            _tc = time.perf_counter()
+            contract = contract_resolver(instrument, signal.direction, as_of)
+            stage_ms["fetch"] += (time.perf_counter() - _tc) * 1000
+            if contract is None:
+                _skip(instrument, "no tradeable option contract could be resolved (see logs for the guard that fired)")
+                continue
+            trade_symbol = contract.symbol
+            trade_exchange = contract.exchange
+            lot_size = contract.lot_size
+            entry_premium = contract.premium
+
+        stop_premium, target_premium = _exit_levels(config, entry_premium)
 
         sizing = size_position(
             capital=config.capital,
             risk_budget_pct=config.risk_budget_pct,
-            premium=signal.entry_premium,
+            premium=entry_premium,
             stop_premium=stop_premium,
             target_premium=target_premium,
             lot_size=lot_size,
             costs=cost_model,
-            exchange=exchange,
+            exchange=trade_exchange,
             on=as_of.date(),
             min_edge_multiple=config.min_edge_multiple,
             max_position_size_pct=config.max_position_size_pct,
         )
+        stage_ms["risk"] += (time.perf_counter() - _t2) * 1000
         if sizing.lots == 0:
             _skip(instrument, sizing.rejected_reason or "sizing rejected with no reason (bug)")
             continue
@@ -318,13 +415,10 @@ def run_entry_cycle(
         # this function's docstring. Below `gating` stage this is always
         # `MLInfluence(1, False, ...)`, so `lots`/the decision to trade are
         # unchanged; this block is a structural no-op in shadow/advisory.
+        _t3 = time.perf_counter()
         influence = MLInfluence(size_multiplier=Decimal(1), veto=False, displayed_verdict=None)
         if ml_hook is not None:
             influence = ml_hook.evaluate(instrument=instrument, as_of=as_of, cycle_id=cycle_id)
-
-        if influence.veto:
-            _skip(instrument, "ML maturity gate vetoed this signal")
-            continue
 
         # `throttle_multiplier` is `1` unless a Phase 7 monitor
         # (`te.risk.monitors`) has thrown the DB-only throttle flag this
@@ -334,26 +428,32 @@ def run_entry_cycle(
         # never applied by widening `size_position()`'s own signature.
         throttle_multiplier = DEFAULT_REGIME_THROTTLE_CONFIG.high_tercile_multiplier if throttled else Decimal(1)
         combined_multiplier = compose_size_multipliers(throttle_multiplier, influence.size_multiplier)
-
         lots = sizing.lots
         if combined_multiplier != 1:
             lots = int(Decimal(sizing.lots) * combined_multiplier)
-            if lots < 1:
-                _skip(
-                    instrument,
-                    "throttle/ML size multiplier resized position below 1 lot "
-                    f"(combined_multiplier={combined_multiplier}, throttled={throttled}, "
-                    f"ml_multiplier={influence.size_multiplier})",
-                )
-                continue
+        stage_ms["decide"] += (time.perf_counter() - _t3) * 1000
+        stage_reached["decide"] = True
 
+        if influence.veto:
+            _skip(instrument, "ML maturity gate vetoed this signal")
+            continue
+        if lots < 1:
+            _skip(
+                instrument,
+                "throttle/ML size multiplier resized position below 1 lot "
+                f"(combined_multiplier={combined_multiplier}, throttled={throttled}, "
+                f"ml_multiplier={influence.size_multiplier})",
+            )
+            continue
+
+        _t4 = time.perf_counter()
         request = OrderRequest(
-            symbol=instrument,
-            exchange=exchange,
+            symbol=trade_symbol,
+            exchange=trade_exchange,
             side="BUY",
             quantity=lot_size * lots,
             order_type="LIMIT",
-            limit_price=signal.entry_premium,
+            limit_price=entry_premium,
         )
         client_order_id = execution.submit(request)
 
@@ -368,17 +468,20 @@ def run_entry_cycle(
             insert_open_position(
                 session,
                 client_order_id=client_order_id,
-                symbol=instrument,
-                exchange=exchange,
+                symbol=trade_symbol,
+                exchange=trade_exchange,
                 strategy=config.strategy_name,
                 direction=signal.direction,
                 lots=lots,
                 lot_size=lot_size,
-                entry_premium=signal.entry_premium,
+                entry_premium=entry_premium,
                 exit_plan=exit_plan,
                 opened_at=as_of,
             )
+        stage_ms["act"] += (time.perf_counter() - _t4) * 1000
+        stage_reached["act"] = True
 
+    _persist_pipeline()
     return cycle_id
 
 

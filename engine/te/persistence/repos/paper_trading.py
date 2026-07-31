@@ -104,6 +104,17 @@ def record_skipped_signal(session: Session, *, ts: dt.datetime, strategy: str, i
     session.add(SkippedSignalRow(ts=_utc(ts), strategy=strategy, instrument=instrument, reason=reason))
 
 
+def recent_skipped_signals(session: Session, *, limit: int = 100) -> list[SkippedSignalRow]:
+    """The most recent `limit` skipped signals, newest first — feeds
+    `GET /api/execution/skipped`. Includes every skip reason ORB/risk/sizing
+    ever recorded (cost-vs-edge rejections, no-breakout, portfolio halts,
+    ...), not filtered to "today" — same unbounded-by-date convention as
+    `recent_trades`."""
+    return list(
+        session.execute(select(SkippedSignalRow).order_by(SkippedSignalRow.ts.desc()).limit(limit)).scalars().all()
+    )
+
+
 def record_risk_event(session: Session, *, ts: dt.datetime, kind: str, detail: str = "") -> None:
     session.add(RiskEventRow(ts=_utc(ts), kind=kind, detail=detail))
 

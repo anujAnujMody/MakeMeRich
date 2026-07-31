@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 
 import te.api.routers.dashboard as dashboard_router
 import te.api.routers.engine as engine_router
+import te.api.routers.execution as execution_router
 import te.api.routers.orders as orders_router
 import te.api.routers.pnl as pnl_router
 import te.api.routers.positions as positions_router
@@ -27,6 +28,7 @@ from te.domain.money import Paise
 from te.execution.store import OrderEventStore
 from te.persistence.db import make_engine, make_session_factory
 from te.persistence.models import Base, OpenPositionRow, TradeRow
+from te.persistence.repos.paper_trading import record_skipped_signal
 
 # The routers under test compute "today" via `dt.datetime.now(IST).date()`
 # directly (no injectable clock yet), and `_day_bounds()` (paper_trading.py)
@@ -45,7 +47,15 @@ def isolated_client(tmp_path: Path, monkeypatch):  # noqa: ANN201
     engine = make_engine(f"sqlite:///{tmp_path / 'tier0_wiring_test.db'}")
     Base.metadata.create_all(engine)
     sf = make_session_factory(engine)
-    for module in (dashboard_router, pnl_router, trades_router, positions_router, orders_router, engine_router):
+    for module in (
+        dashboard_router,
+        pnl_router,
+        trades_router,
+        positions_router,
+        orders_router,
+        engine_router,
+        execution_router,
+    ):
         monkeypatch.setattr(module, "session_factory", sf)
 
     from te.api.main import app
@@ -263,3 +273,26 @@ def test_cancel_order_honestly_reports_failure(isolated_client) -> None:  # noqa
     response = client.post("/api/orders/cancel", json={"id": "nonexistent"})
     assert response.status_code == 200
     assert response.json()["success"] is False
+
+
+def test_execution_skipped_reflects_real_skipped_signals(isolated_client) -> None:  # noqa: ANN001
+    """Regression, found live on 2026-07-31: `/api/execution/skipped`
+    returned a literal `[]` stub even though real ORB signals had already
+    fired and been rejected (e.g. by the cost-vs-edge sizing floor) — the
+    router never called `recent_skipped_signals`."""
+    client, sf = isolated_client
+    with sf() as session:
+        record_skipped_signal(
+            session,
+            ts=NOW,
+            strategy="orb",
+            instrument="NIFTY",
+            reason="gross edge per lot (97500p) < round-trip cost (379471p) x min_edge_multiple (1.2)",
+        )
+        session.commit()
+
+    body = client.get("/api/execution/skipped").json()
+    assert len(body) == 1
+    assert body[0]["symbol"] == "NIFTY"
+    assert body[0]["strategy"] == "orb"
+    assert "min_edge_multiple" in body[0]["reason"]

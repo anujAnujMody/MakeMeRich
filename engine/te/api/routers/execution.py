@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Query, Response
 
+from te.api.db import session_factory
 from te.api.provenance import set_provenance
 from te.api.schemas.execution import (
     CycleStatus,
@@ -13,6 +14,7 @@ from te.api.schemas.execution import (
 from te.api.schemas.learning import MLInfo
 from te.api.schemas.strategy import StrategyAnalysis
 from te.api.state import state
+from te.persistence.repos.paper_trading import recent_skipped_signals
 
 router = APIRouter(prefix="/api/execution", tags=["execution"])
 
@@ -67,10 +69,30 @@ def get_execution_positions(response: Response) -> PaperPositionCount:
 
 @router.get("/skipped", response_model=list[SkippedSignalInfo])
 def get_execution_skipped(response: Response, limit: int = _LIMIT) -> list[SkippedSignalInfo]:
-    """Signals that fired but were not traded, with the reason each was
-    skipped. Empty until signals are evaluated."""
-    set_provenance(response, not_ready_reason="phase-0: no signals evaluated yet")
-    return []
+    """Signals that fired but were not traded, with the real reason each was
+    skipped — from `te.persistence.repos.paper_trading.recent_skipped_
+    signals`. `direction`/`entry_price`/`ml_confidence`/`ml_threshold` stay
+    at their zero-value: `SkippedSignalRow` doesn't capture them (a skip can
+    happen before a `Signal` even exists, e.g. "no breakout"), and no ML
+    gate is active below the `gating` maturity stage — never fabricated to
+    fill the schema."""
+    with session_factory() as session:
+        rows = recent_skipped_signals(session, limit=limit)
+    set_provenance(response, provenance="paper" if rows else "none", sample_size=len(rows))
+    return [
+        SkippedSignalInfo(
+            id=row.id,
+            strategy=row.strategy,
+            symbol=row.instrument,
+            direction="",
+            entry_price=0.0,
+            ml_confidence=0.0,
+            ml_threshold=0.0,
+            reason=row.reason,
+            timestamp=row.ts.isoformat(),
+        )
+        for row in rows
+    ]
 
 
 @router.post("/start", response_model=StatusOnlyResponse)

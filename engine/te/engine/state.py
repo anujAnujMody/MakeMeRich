@@ -356,6 +356,67 @@ def guardrails_defaults_from_settings(settings: Settings) -> AccountGuardrails:
     )
 
 
+_LAST_CYCLE_PIPELINE_KEY = "last_cycle_pipeline_json"
+
+#: Fixed order/keys the dashboard's `PipelineStrip` renders — mirrors
+#: `dashboard/src/types/dashboard-snapshot.ts`'s `PipelineStageKey`.
+PIPELINE_STAGE_KEYS: tuple[str, ...] = ("fetch", "analyze", "risk", "decide", "act")
+
+
+@dataclass(frozen=True)
+class PipelineStageTiming:
+    """One stage's real, measured wall-clock cost from the most recently
+    completed `run_entry_cycle` call. `reached=False` means this stage
+    genuinely did not run this cycle (e.g. every instrument was skipped
+    before sizing, so `decide`/`act` never fired) — never fabricated as
+    `done` just to fill the bar."""
+
+    reached: bool
+    elapsed_ms: int
+
+
+@dataclass(frozen=True)
+class LastCyclePipeline:
+    cycle_id: int
+    as_of: dt.datetime
+    stages: dict[str, PipelineStageTiming]
+
+
+def set_last_cycle_pipeline(
+    session: Session, *, cycle_id: int, as_of: dt.datetime, stages: dict[str, PipelineStageTiming]
+) -> None:
+    """Called once at the end of `run_entry_cycle`, in its own session —
+    same one-writer-per-key convention as every other setter here. Does not
+    commit; caller owns the transaction boundary."""
+    payload = json.dumps(
+        {
+            "cycle_id": cycle_id,
+            "as_of": to_utc(as_of, name="as_of").isoformat(),
+            "stages": {k: {"reached": v.reached, "elapsed_ms": v.elapsed_ms} for k, v in stages.items()},
+        }
+    )
+    upsert_engine_state(session, _LAST_CYCLE_PIPELINE_KEY, payload)
+
+
+def get_last_cycle_pipeline(session: Session) -> LastCyclePipeline | None:
+    """`None` when no cycle has completed yet, or the stored row fails to
+    parse — same lenient-read convention as the rest of this module."""
+    row = session.get(EngineState, _LAST_CYCLE_PIPELINE_KEY)
+    if row is None:
+        return None
+    try:
+        raw = json.loads(row.value)
+        stages = {
+            k: PipelineStageTiming(reached=bool(v["reached"]), elapsed_ms=int(v["elapsed_ms"]))
+            for k, v in raw["stages"].items()
+        }
+        return LastCyclePipeline(
+            cycle_id=int(raw["cycle_id"]), as_of=dt.datetime.fromisoformat(raw["as_of"]), stages=stages
+        )
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
 def instrument_selections_defaults_from_settings(settings: Settings) -> tuple[InstrumentSelection, ...]:
     """Seeds all 4 known F&O underlyings (`te.domain.symbols.
     FNO_UNDERLYING_EXCHANGES` — NIFTY/BANKNIFTY on NFO, SENSEX/BANKEX on

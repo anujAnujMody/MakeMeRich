@@ -21,11 +21,14 @@ from te.domain.clock import IST
 from te.domain.costs import CostModel, select_rates
 from te.domain.money import Paise
 from te.engine.cycle import CycleConfig, InstrumentConfig, run_entry_cycle, run_exit_cycle
+from te.engine.state import get_last_cycle_pipeline
 from te.execution.manager import ExecutionManager
 from te.execution.store import OrderEventStore
 from te.persistence.db import make_engine, make_session_factory
 from te.persistence.models import Base, OpenPositionRow, SkippedSignalRow, TradeRow
+from te.risk.killswitch import reset_in_process_cache as reset_killswitch_cache
 from te.risk.killswitch import throttle as throttle_killswitch
+from te.risk.killswitch import trip as trip_killswitch
 from te.risk.limits import RiskLimitsConfig
 
 _CHARGES_PATH = Path(__file__).resolve().parents[2] / "config" / "charges.yaml"
@@ -149,6 +152,115 @@ def test_entry_cycle_opens_a_position_with_an_exit_plan_on_confirmed_breakout(
         assert row.stop_paise > 0
         assert row.target_paise > row.entry_premium_paise
         assert row.trailing_distance_paise == 300
+
+
+def test_entry_cycle_records_real_pipeline_timing_when_a_trade_fires(
+    session_factory,
+    execution,
+    cost_model: CostModel,
+    tmp_path: Path,  # noqa: ANN001
+) -> None:
+    """Regression for the dashboard's "Current cycle" strip, found live on
+    2026-07-31: `pipeline` was a permanent `[]` stub because nothing ever
+    recorded per-cycle stage timing. Every stage should have genuinely run
+    (and be marked `reached`) when a signal actually gets all the way to a
+    real order."""
+    store = _breakout_store(tmp_path)
+    config = _config()
+    as_of = _open(16)
+
+    cycle_id = run_entry_cycle(
+        session_factory=session_factory,
+        store=store,
+        execution=execution,
+        cost_model=cost_model,
+        config=config,
+        as_of=as_of,
+    )
+
+    with session_factory() as session:
+        pipeline = get_last_cycle_pipeline(session)
+    assert pipeline is not None
+    assert pipeline.cycle_id == cycle_id
+    for key in ("fetch", "analyze", "risk", "decide", "act"):
+        stage = pipeline.stages[key]
+        assert stage.reached is True, f"{key} should have reached on a real trade"
+        assert stage.elapsed_ms >= 0
+
+
+def test_entry_cycle_leaves_decide_and_act_unreached_when_every_instrument_skips(
+    session_factory,
+    execution,
+    cost_model: CostModel,
+    tmp_path: Path,  # noqa: ANN001
+) -> None:
+    """No signal ever fires here (`_no_signal_store` has zero bars), so
+    `decide`/`act` genuinely never ran this cycle — the pipeline must say
+    so honestly rather than mark every stage `done`."""
+    store = _no_signal_store(tmp_path)
+    config = _config()
+    as_of = _open(16)
+
+    run_entry_cycle(
+        session_factory=session_factory,
+        store=store,
+        execution=execution,
+        cost_model=cost_model,
+        config=config,
+        as_of=as_of,
+    )
+
+    with session_factory() as session:
+        pipeline = get_last_cycle_pipeline(session)
+    assert pipeline is not None
+    assert pipeline.stages["fetch"].reached is True
+    assert pipeline.stages["analyze"].reached is True
+    assert pipeline.stages["risk"].reached is True
+    assert pipeline.stages["decide"].reached is False
+    assert pipeline.stages["act"].reached is False
+
+
+def test_entry_cycle_pipeline_shows_only_risk_reached_when_portfolio_halted(
+    session_factory,
+    execution,
+    cost_model: CostModel,
+    tmp_path: Path,  # noqa: ANN001
+) -> None:
+    """A portfolio-level halt short-circuits BEFORE the per-instrument loop
+    (see `run_entry_cycle`'s docstring) — `fetch`/`analyze`/`decide`/`act`
+    never ran this cycle at all, only the portfolio risk check did."""
+    store = _breakout_store(tmp_path)
+    config = _config()
+    as_of = _open(16)
+
+    try:
+        with session_factory() as session:
+            trip_killswitch(session, "test halt")
+            session.commit()
+
+        run_entry_cycle(
+            session_factory=session_factory,
+            store=store,
+            execution=execution,
+            cost_model=cost_model,
+            config=config,
+            as_of=as_of,
+        )
+
+        with session_factory() as session:
+            pipeline = get_last_cycle_pipeline(session)
+        assert pipeline is not None
+        assert pipeline.stages["risk"].reached is True
+        assert pipeline.stages["fetch"].reached is False
+        assert pipeline.stages["analyze"].reached is False
+        assert pipeline.stages["decide"].reached is False
+        assert pipeline.stages["act"].reached is False
+    finally:
+        # `trip()` sets the in-process kill-switch flag as a MODULE-level
+        # global (see `te.risk.killswitch`'s docstring) — it survives past
+        # this test's own DB teardown and would silently halt every later
+        # test in this same pytest process without this reset.
+        reset_killswitch_cache()
 
 
 def test_entry_cycle_sizes_two_instruments_independently_across_exchanges(

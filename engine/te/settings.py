@@ -75,6 +75,26 @@ class Settings(BaseSettings):
     paper_cycle_max_concurrent_positions: int = 5
     paper_cycle_max_trades_per_day: int = 20
 
+    # --- Option contract resolution (see te/engine/contract.py) ---
+    #: Strike offset handed to OpenAlgo's `optionsymbol` service: `ATM`,
+    #: `OTM1`..`OTM20`, `ITM1`..`ITM20`. ATM (delta ~0.5) is the standard
+    #: intraday choice — tightest spreads, most linear response to the
+    #: underlying. Deep OTM is the classic small-capital trap: cheap premium
+    #: buys a low delta, so a correct directional call still loses to costs.
+    paper_cycle_option_offset: str = "ATM"
+    #: Stop/target as a % of the OPTION premium. These take priority over the
+    #: absolute `*_distance_paise` values above, which are index-point-scaled
+    #: leftovers and mean different things at different premium levels.
+    paper_cycle_stop_pct: Decimal | None = Decimal(20)
+    paper_cycle_target_pct: Decimal | None = Decimal(40)
+    #: Reject a resolved contract whose bid-ask spread exceeds this % of LTP.
+    #: Live NIFTY chain (2026-07-31) runs 0.1-0.4% through OTM5 and widens to
+    #: ~1.1% by OTM8, so 1.0% admits the liquid band and excludes the rest.
+    paper_cycle_max_spread_pct: Decimal = Decimal(1)
+    #: Reject a contract quoting below this premium — a near-zero premium is a
+    #: dead/untraded strike where the fixed ₹40 brokerage alone dominates.
+    paper_cycle_min_premium_paise: int = 500
+
     # Automated daily OpenAlgo-app + Angel-broker relogin (te.broker.openalgo_login)
     # — Angel expires its broker session nightly regardless of restarts; ALL
     # FIVE optional so every existing `Settings()` call site (tests included)

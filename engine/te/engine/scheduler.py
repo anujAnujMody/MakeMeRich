@@ -45,7 +45,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from te.broker.instrument_sync import fetch_instruments, sync_instruments
 from te.broker.openalgo_login import LoginResult, login_openalgo
-from te.broker.openalgo_rest import OpenAlgoRestClient
+from te.broker.openalgo_rest import OpenAlgoRestClient, OpenAlgoRestError
 from te.broker.openalgo_ws import Instrument, OpenAlgoWSClient
 from te.data.asof import bars_asof
 from te.data.barstore import BarStore
@@ -57,6 +57,7 @@ from te.domain.clock import DEFAULT_SESSION, IST, SessionWindow, is_market_open
 from te.domain.costs import ChargeRateTable
 from te.domain.money import Paise
 from te.domain.symbols import FNO_UNDERLYING_EXCHANGES, build_future_symbol, next_monthly_expiry
+from te.engine.contract import ContractResolver, OptionContractResolver
 from te.engine.cycle import CycleConfig, InstrumentConfig, run_entry_cycle, run_exit_cycle
 from te.engine.state import (
     get_guardrails,
@@ -299,6 +300,39 @@ def _current_premium_from_bars(store: BarStore, as_of: dt.datetime) -> Callable[
     return _current_premium
 
 
+def _current_premium_from_quotes(
+    rest_client: OpenAlgoRestClient, store: BarStore, as_of: dt.datetime
+) -> Callable[[OpenPositionRow], Paise]:
+    """Marks open positions from a LIVE quote on the position's own symbol,
+    falling back to `_current_premium_from_bars`.
+
+    Necessary because open positions are option contracts, and the WS
+    recorder only subscribes to the four index spot symbols
+    (`NSE_UNDERLYINGS`/`BSE_UNDERLYINGS`) — chosen dynamically per signal,
+    an option contract has no recorded bars at all. Without this, every
+    option position would mark at its own entry premium forever, so no
+    stop/target/trailing exit could ever fire and positions would only ever
+    close on the time exit.
+
+    Polling one quote per open position per cycle (a handful per minute) is
+    deliberately preferred over widening the WS subscription:
+    `OpenAlgoWSClient.subscribe()` only takes effect on the next reconnect,
+    so a contract chosen mid-session would not stream until then."""
+    from_bars = _current_premium_from_bars(store, as_of)
+
+    def _current_premium(row: OpenPositionRow) -> Paise:
+        try:
+            quote = rest_client.quotes(row.symbol, row.exchange)
+        except OpenAlgoRestError:
+            logger.warning("quote failed for open position; falling back to bars", symbol=row.symbol)
+            return from_bars(row)
+        if quote.ltp <= 0:
+            return from_bars(row)
+        return Paise(int(round(quote.ltp * 100)))
+
+    return _current_premium
+
+
 def _default_cycle_config(settings: Settings) -> CycleConfig:
     """Builds `CycleConfig` entirely from `Settings.paper_cycle_*` — never a
     hardcoded literal, per the task. An empty `paper_cycle_instruments` is a
@@ -328,6 +362,8 @@ def _default_cycle_config(settings: Settings) -> CycleConfig:
             max_concurrent_positions=settings.paper_cycle_max_concurrent_positions,
             max_trades_per_day=settings.paper_cycle_max_trades_per_day,
         ),
+        stop_pct=settings.paper_cycle_stop_pct,
+        target_pct=settings.paper_cycle_target_pct,
     )
 
 
@@ -421,6 +457,14 @@ class PaperCycleRunner:
     settings: Settings
     session_window: SessionWindow = DEFAULT_SESSION
     clock: Callable[[], dt.datetime] = _now_ist
+    #: Turns the rule's index breakout into a real option contract. `None`
+    #: trades the raw configured symbol at the rule's own price — correct
+    #: only when that symbol is already an option (tests/backtests), never
+    #: live. `build_scheduler` always supplies one.
+    contract_resolver: ContractResolver | None = None
+    #: Used to mark open OPTION positions, which have no recorded bars. See
+    #: `_current_premium_from_quotes`. `None` falls back to bar-based marks.
+    rest_client: OpenAlgoRestClient | None = None
     #: Not an init argument — always starts empty and is rewritten by
     #: `run_once`. `GET /api/engine/scheduler-status` reads it directly.
     status: PaperCycleStatus = field(default_factory=PaperCycleStatus, init=False)
@@ -497,12 +541,17 @@ class PaperCycleRunner:
                 cost_model=cost_model,
                 config=config,
                 as_of=as_of,
+                contract_resolver=self.contract_resolver,
             )
         run_exit_cycle(
             session_factory=self.session_factory,
             execution=execution,
             cost_model=cost_model,
-            current_premium=_current_premium_from_bars(self.store, as_of),
+            current_premium=(
+                _current_premium_from_quotes(self.rest_client, self.store, as_of)
+                if self.rest_client is not None
+                else _current_premium_from_bars(self.store, as_of)
+            ),
             as_of=as_of,
         )
         self.status = PaperCycleStatus(
@@ -546,6 +595,13 @@ def build_scheduler(
         config=_default_cycle_config(settings),
         max_orders_per_second=settings.max_orders_per_second,
         settings=settings,
+        contract_resolver=OptionContractResolver(
+            rest_client,
+            offset=settings.paper_cycle_option_offset,
+            max_spread_pct=settings.paper_cycle_max_spread_pct,
+            min_premium_paise=settings.paper_cycle_min_premium_paise,
+        ),
+        rest_client=rest_client,
     )
 
     scheduler = BackgroundScheduler(timezone=IST)
