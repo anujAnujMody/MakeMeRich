@@ -63,6 +63,11 @@ ATM_PARAMS: dict[str, tuple[float, float, float, float, str]] = {
     "BANKEX": (1020.90, 0.5441, 65125.2, 27.0, "BFO"),
 }
 
+#: Broker-authoritative lot sizes (eff. Jan 2026). Used ONLY to convert the
+#: round-trip cost into a per-unit figure — never for sizing, which reads the
+#: synced `instruments` table.
+LOT_SIZES: dict[str, int] = {"NIFTY": 65, "BANKNIFTY": 30, "SENSEX": 20, "BANKEX": 30}
+
 STOP_PCT = 0.20
 TARGET_PCT = 0.40
 MAX_HOLD = dt.timedelta(hours=3)
@@ -94,6 +99,29 @@ def index_barriers(symbol: str) -> tuple[Paise, Paise, float, float]:
         stop_points / spot * 100,
         target_points / spot * 100,
     )
+
+
+def round_trip_cost_in_index_points(symbol: str, cost_model: CostModel, on: dt.date) -> Paise:
+    """The real option round-trip cost, expressed as an INDEX move.
+
+    The barriers here are index distances, so the cost adjustment must be
+    too. Costing a round trip on the index LEVEL (~24,400) as though it were
+    an option premium returns ~Rs 105/unit and inflates a 73.9-point target
+    to 179.1 — 2.42x — which is what produced an 8.7% apparent win rate
+    against a ~33% random-walk baseline.
+
+    The conversion is: price the round trip on the real option notional
+    (premium x lot), divide by lot to get cost per option unit, then divide
+    by delta, since an option unit moves `delta` per index point.
+    """
+    premium_rs, delta, _spot, _dte, exchange = ATM_PARAMS[symbol]
+    lot = LOT_SIZES[symbol]
+    premium = Paise(int(round(premium_rs * 100)))
+    total = cost_model.round_trip(
+        entry_premium=premium, exit_premium=premium, qty=lot, exchange=exchange, on=on
+    ).total
+    cost_per_option_unit = int(total) / lot
+    return Paise(int(round(cost_per_option_unit / delta)))
 
 
 def main() -> int:
@@ -139,6 +167,7 @@ def main() -> int:
             max_hold=MAX_HOLD,
             instrument=symbol,
             since=RATES_VERIFIED_FROM,
+            cost_per_unit=round_trip_cost_in_index_points(symbol, cost_model, RATES_VERIFIED_FROM),
         )
         counts = Counter(f.barrier for f in firings)
         grand.update(counts)

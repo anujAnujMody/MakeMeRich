@@ -40,12 +40,14 @@ from te.data.barstore import BarStore
 from te.domain.clock import assume_utc as _as_utc
 from te.domain.costs import CostModel
 from te.domain.money import Paise
+from te.domain.signal import Direction
 from te.persistence.models import CycleEvaluationRow, EvaluationConditionRow
 
 Barrier = Literal["target", "stop", "time"]
 
 _BREAKOUT_CONDITION_LABEL = "breakout close beyond opening range"
 _CLOSE_RE = re.compile(r"close=([0-9.]+)")
+_BREAKOUT_RE = re.compile(r"close=([0-9.]+), range=\[([0-9.]+), ([0-9.]+)\]")
 
 
 @dataclass(frozen=True)
@@ -76,6 +78,27 @@ def extract_hypothetical_entry_premium(condition_actual: str) -> Paise:
     return Paise(int((rupees * 100).quantize(Decimal(1), rounding=ROUND_HALF_UP)))
 
 
+def direction_from_breakout(actual: str) -> Direction | None:
+    """Recovers the firing's DIRECTION from the condition string ORB itself
+    recorded, e.g. `"close=23576.70, range=[23587.75, 23733.70]"`.
+
+    `CycleEvaluationRow` carries no direction column, but ORB's own recorded
+    `actual` determines it unambiguously: a close above the range high is
+    the `long_call` breakout, a close below the range low is the `long_put`.
+    Derived from what the rule observed rather than re-computed from bars,
+    for the same reason the entry premium is.
+    """
+    match = _BREAKOUT_RE.match(actual)
+    if match is None:
+        return None
+    close, low, high = (Decimal(g) for g in match.groups())
+    if close > high:
+        return "long_call"
+    if close < low:
+        return "long_put"
+    return None
+
+
 def label_one_firing(
     *,
     store: BarStore,
@@ -88,25 +111,57 @@ def label_one_firing(
     cost_model: CostModel,
     exchange: str,
     interval: str = "1m",
+    direction: Direction = "long_call",
+    cost_per_unit: Paise | None = None,
 ) -> tuple[int, Barrier, dt.datetime]:
-    """Walks forward from `entry_ts` through recorded bars (via
-    `bars_asof`) to see which barrier is touched first:
+    """Walks forward from `entry_ts` through recorded bars (via `bars_asof`)
+    to see which barrier is touched first, in the direction actually traded:
 
-    - the bar's high reaching `net_target` (`target_premium +
-      round_trip_cost_per_unit`, computed via the real `CostModel`) -> label
-      1, barrier "target";
-    - the bar's low reaching the (gross) stop premium -> label 0, barrier
-      "stop";
+    - the target reached -> label 1, barrier "target";
+    - the (gross) stop reached -> label 0, barrier "stop";
     - neither touched by `entry_ts + max_hold` -> label 0, barrier "time".
+
+    **`direction` is load-bearing.** ORB fires `long_put` on a DOWNSIDE
+    breakout, and that trade wins when the underlying FALLS. This function
+    used to assume every firing was long the underlying — checking the bar
+    HIGH for the target and the LOW for the stop unconditionally — which
+    inverted the label of every downside firing. Measured on the 6,172
+    replayed firings: 3,078 of them (49.9%) are `long_put`, so essentially
+    half the training set was labelled backwards, and the apparent win rate
+    came out at 8.7% against a ~33% random-walk baseline for these 1:2
+    barriers.
+
+    **`cost_per_unit` must be supplied when the barriers are not in the
+    traded instrument's own price unit.** The internal `CostModel` call
+    prices a round trip on `entry_premium`, which is only meaningful when
+    that IS the option premium (the live path). In a replay the barriers are
+    INDEX distances and `entry_premium` is an index LEVEL, so pricing costs
+    on ~24,400 as though it were a premium returned Rs 105.18 per unit and
+    inflated a 73.9-point target to 179.1 points — 2.42x — while leaving the
+    stop untouched. That is the same index-level-as-premium confusion that
+    once stopped the engine trading at all; here it silently poisons labels
+    instead. Pass the cost already converted into the barrier's unit.
 
     Returns `(label, barrier, resolved_at)`.
     """
-    stop_premium = Paise(entry_premium - stop_distance)
-    gross_target_premium = Paise(entry_premium + target_distance)
-    cost_per_unit = cost_model.round_trip(
-        entry_premium=entry_premium, exit_premium=gross_target_premium, qty=1, exchange=exchange, on=entry_ts.date()
-    ).total
-    net_target_premium = Paise(gross_target_premium + cost_per_unit)
+    if cost_per_unit is None:
+        gross_for_costing = Paise(entry_premium + target_distance)
+        cost_per_unit = cost_model.round_trip(
+            entry_premium=entry_premium,
+            exit_premium=gross_for_costing,
+            qty=1,
+            exchange=exchange,
+            on=entry_ts.date(),
+        ).total
+
+    # Costs always make the TARGET harder to reach, never the stop easier —
+    # the plan states the net adjustment for the target side only.
+    if direction == "long_call":
+        target_level = Paise(entry_premium + target_distance + cost_per_unit)
+        stop_level = Paise(entry_premium - stop_distance)
+    else:
+        target_level = Paise(entry_premium - target_distance - cost_per_unit)
+        stop_level = Paise(entry_premium + stop_distance)
 
     horizon_end = entry_ts + max_hold
     bar_span = interval_to_timedelta(interval)
@@ -119,10 +174,16 @@ def label_one_firing(
             break
         high = Paise(int(round(float(bar["h"]) * 100)))
         low = Paise(int(round(float(bar["l"]) * 100)))
-        if high >= net_target_premium:
-            return 1, "target", bar_ts
-        if low <= stop_premium:
-            return 0, "stop", bar_ts
+        if direction == "long_call":
+            if high >= target_level:
+                return 1, "target", bar_ts
+            if low <= stop_level:
+                return 0, "stop", bar_ts
+        else:
+            if low <= target_level:
+                return 1, "target", bar_ts
+            if high >= stop_level:
+                return 0, "stop", bar_ts
 
     return 0, "time", horizon_end
 
@@ -172,6 +233,7 @@ def label_firings_from_evaluations(
     interval: str = "1m",
     instrument: str | None = None,
     since: dt.date | None = None,
+    cost_per_unit: Paise | None = None,
 ) -> list[LabeledFiring]:
     """Labels every `verdict == "traded"` evaluation for `strategy` — the
     plan's explicit instruction to include vetoed/zero-sized firings, since
@@ -225,6 +287,12 @@ def label_firings_from_evaluations(
 
             entry_premium = extract_hypothetical_entry_premium(condition.actual)
             entry_ts = _as_utc(evaluation.ts)
+            # A firing whose direction cannot be recovered is DROPPED, never
+            # defaulted to long: a wrong direction inverts the label, which
+            # is worse than one fewer sample.
+            firing_direction = direction_from_breakout(condition.actual)
+            if firing_direction is None:
+                continue
             label, barrier, resolved_at = label_one_firing(
                 store=store,
                 instrument=evaluation.instrument,
@@ -236,6 +304,8 @@ def label_firings_from_evaluations(
                 cost_model=cost_model,
                 exchange=exchange,
                 interval=interval,
+                direction=firing_direction,
+                cost_per_unit=cost_per_unit,
             )
             firings.append(
                 LabeledFiring(

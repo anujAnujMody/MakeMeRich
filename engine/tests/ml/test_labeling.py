@@ -17,6 +17,7 @@ from te.domain.costs import CostModel, select_rates
 from te.domain.money import Paise
 from te.ml.labeling import (
     compute_uniqueness_weights,
+    direction_from_breakout,
     extract_hypothetical_entry_premium,
     label_one_firing,
 )
@@ -320,3 +321,92 @@ def test_label_firings_fetches_all_condition_rows_in_one_query(
     )
 
     assert condition_queries == 1, f"expected 1 batched conditions query, got {condition_queries}"
+
+
+def test_a_downside_breakout_is_labelled_in_its_own_direction(tmp_path: Path, cost_model: CostModel) -> None:
+    """ORB fires `long_put` on a DOWNSIDE breakout, and that trade WINS when
+    the underlying falls.
+
+    This function used to check the bar HIGH for the target and the LOW for
+    the stop on every firing — i.e. it assumed every firing was long the
+    underlying. Measured on 6,172 replayed firings, 3,078 (49.9%) are
+    `long_put`, so half the training set had its label inverted, and the
+    apparent win rate came out at 8.7% against a ~33% random-walk baseline
+    for these 1:2 barriers.
+    """
+    store = BarStore(tmp_path / "bars")
+    entry_ts = _entry_ts()
+    # A steady fall: a winner for a put, a loser for a call.
+    rows = [
+        _bar(entry_ts + dt.timedelta(minutes=i), h=100.0, low=100.0 - i, c=100.0 - i)
+        for i in range(1, 11)
+    ]
+    store.append(pd.DataFrame(rows, columns=list(BAR_COLUMNS)))
+
+    common: dict[str, object] = {
+        "store": store,
+        "instrument": INSTRUMENT,
+        "entry_ts": entry_ts,
+        "entry_premium": Paise(10_000),
+        "stop_distance": Paise(300),
+        "target_distance": Paise(500),
+        "max_hold": dt.timedelta(hours=1),
+        "cost_model": cost_model,
+        "exchange": EXCHANGE,
+        "cost_per_unit": Paise(0),
+    }
+
+    put_label, put_barrier, _ = label_one_firing(**common, direction="long_put")  # type: ignore[arg-type]
+    call_label, call_barrier, _ = label_one_firing(**common, direction="long_call")  # type: ignore[arg-type]
+
+    assert (put_label, put_barrier) == (1, "target"), "a falling market must be a WIN for a long_put"
+    assert (call_label, call_barrier) == (0, "stop"), "the same fall must be a LOSS for a long_call"
+
+
+@pytest.mark.parametrize(
+    ("actual", "expected"),
+    [
+        ("close=23800.00, range=[23587.75, 23733.70]", "long_call"),
+        ("close=23576.70, range=[23587.75, 23733.70]", "long_put"),
+        ("close=23600.00, range=[23587.75, 23733.70]", None),
+        ("not a breakout string", None),
+    ],
+)
+def test_direction_is_recovered_from_orbs_own_condition_string(actual: str, expected: object) -> None:
+    """`CycleEvaluationRow` has no direction column, so direction is derived
+    from what the rule itself recorded — never guessed, and never defaulted
+    to long, because a wrong direction inverts the label."""
+    assert direction_from_breakout(actual) == expected
+
+
+def test_supplied_cost_per_unit_overrides_the_premium_based_estimate(
+    tmp_path: Path, cost_model: CostModel
+) -> None:
+    """When the barriers are INDEX distances, `entry_premium` is an index
+    LEVEL, and costing a round trip on it as though it were an option premium
+    returns a wildly inflated figure — Rs 105/unit against a 73.9-point
+    target, 2.42x. The caller must be able to pass the cost already converted
+    into the barrier's own unit."""
+    store = BarStore(tmp_path / "bars")
+    entry_ts = _entry_ts()
+    rows = [_bar(entry_ts + dt.timedelta(minutes=1), h=106.0, low=100.0, c=106.0)]
+    store.append(pd.DataFrame(rows, columns=list(BAR_COLUMNS)))
+
+    common: dict[str, object] = {
+        "store": store,
+        "instrument": INSTRUMENT,
+        "entry_ts": entry_ts,
+        "entry_premium": Paise(10_000),
+        "stop_distance": Paise(300),
+        "target_distance": Paise(500),
+        "max_hold": dt.timedelta(hours=1),
+        "cost_model": cost_model,
+        "exchange": EXCHANGE,
+        "direction": "long_call",
+    }
+
+    cheap = label_one_firing(**common, cost_per_unit=Paise(10))  # type: ignore[arg-type]
+    dear = label_one_firing(**common, cost_per_unit=Paise(20_000))  # type: ignore[arg-type]
+
+    assert (cheap[0], cheap[1]) == (1, "target")
+    assert (dear[0], dear[1]) == (0, "time"), "an inflated cost must push the target out of reach"
