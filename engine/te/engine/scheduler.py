@@ -487,12 +487,23 @@ class PaperCycleRunner:
             logger.info("paper cycle skipped: engine mode is live, not dry-run", as_of=as_of.isoformat())
             return
 
-        if run_state == "paused":
-            self.status = PaperCycleStatus(last_run_at=as_of, last_result="skipped_paused")
-            logger.info("paper cycle skipped: engine is paused", as_of=as_of.isoformat())
-            return
+        # Pause blocks NEW ENTRIES only — exits still run, exactly as the
+        # kill-switch branch below does, and for the same reason: abandoning
+        # open positions violates this project's non-negotiable "every
+        # position always has a working exit plan" rule. Pausing is an
+        # operator saying "stop opening trades", never "stop protecting the
+        # ones I already have". Before this, `paused` returned here, above
+        # `run_exit_cycle`, so a single dashboard click silently disabled
+        # every stop-loss, target, trailing stop and the 15:20 hard exit —
+        # leaving positions to run unmanaged into the close and overnight.
+        paused = run_state == "paused"
+        halted = paused
+        if paused:
+            logger.info(
+                "paper cycle: engine paused — new entries blocked, exits still run (exiting is risk-reducing)",
+                as_of=as_of.isoformat(),
+            )
 
-        halted = False
         with self.session_factory() as session:
             try:
                 check_killswitch(session)
@@ -556,10 +567,17 @@ class PaperCycleRunner:
             ),
             as_of=as_of,
         )
-        self.status = PaperCycleStatus(
-            last_run_at=as_of, last_result="skipped_halted_entries_only" if halted else "ran"
-        )
-        logger.debug("paper cycle ran", as_of=as_of.isoformat(), halted=halted)
+        # `paused` and `halted` both block entries and both still run exits,
+        # but they stay distinguishable in the status: one is an operator
+        # choice to stop trading, the other is a risk breaker that tripped.
+        if paused:
+            result = "skipped_paused_entries_only"
+        elif halted:
+            result = "skipped_halted_entries_only"
+        else:
+            result = "ran"
+        self.status = PaperCycleStatus(last_run_at=as_of, last_result=result)
+        logger.debug("paper cycle ran", as_of=as_of.isoformat(), halted=halted, paused=paused)
 
 
 def build_scheduler(

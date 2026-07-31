@@ -680,10 +680,22 @@ def test_exit_cycle_skips_the_db_write_when_the_trailing_stop_did_not_ratchet(
             as_of=entry_at + dt.timedelta(minutes=minute),
         )
 
-    # First cycle at the entry mark DOES ratchet (initial stop is
-    # `stop_distance` below entry, the trailing distance is tighter), so the
-    # guard is not simply disabling trailing stops.
+    # A mark at the ENTRY price must NOT ratchet: the trail activates at
+    # `entry + trailing_distance` (3_600 + 300 = 3_900), so below that the
+    # hard stop stands. This assertion used to read the other way round, and
+    # its old comment ("the trailing distance is tighter") was stating the
+    # bug: a 300p trail silently replaced a 700p stop on the first cycle of
+    # every position. See `ExitPlan.trailing_activation`.
     assert _cycle(entry_premium, 1) == []
+    assert calls == [], "the trail engaged before the position was in profit"
+    with session_factory() as session:
+        assert session.query(OpenPositionRow).one().current_stop_paise == stop_before
+
+    # Above activation it DOES ratchet, so the guard is not simply disabling
+    # trailing stops. 4_000 is past activation (3_900) and short of the
+    # target (3_600 + 1_500 = 5_100).
+    in_profit = 4_000
+    assert _cycle(in_profit, 2) == []
     assert len(calls) == 1
     with session_factory() as session:
         ratcheted = session.query(OpenPositionRow).one().current_stop_paise
@@ -691,8 +703,8 @@ def test_exit_cycle_skips_the_db_write_when_the_trailing_stop_did_not_ratchet(
 
     # Every subsequent cycle at the SAME mark makes no new favourable
     # extreme -> nothing to write.
-    assert _cycle(entry_premium, 2) == []
-    assert _cycle(entry_premium, 3) == []
+    assert _cycle(in_profit, 3) == []
+    assert _cycle(in_profit, 4) == []
     assert len(calls) == 1, "unchanged trailing stop must not be written back"
 
     with session_factory() as session:

@@ -20,7 +20,64 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
+from sqlalchemy.engine import Dialect
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.types import TypeDecorator
+
+
+class UtcDateTime(TypeDecorator[dt.datetime]):
+    """`DateTime(timezone=True)` that actually round-trips the timezone.
+
+    SQLite has no native timestamp type: SQLAlchemy stores a datetime as the
+    ISO string `YYYY-MM-DD HH:MM:SS.ffffff` and **silently discards any UTC
+    offset**, so a tz-aware value written through a plain
+    `DateTime(timezone=True)` column comes back tz-NAIVE. That is a real
+    sqlite3 limitation, not a configuration mistake — `te/domain/clock.py`'s
+    `to_utc()`/`assume_utc()` pair was written to work around it by hand.
+
+    Doing it by hand is what failed. Found live on 2026-07-31: every
+    timestamp on every dashboard page displayed 5h30m early, because the
+    read routers serialised `row.ts.isoformat()` — a naive value — and
+    browsers parse an offset-less datetime string as LOCAL time.
+    `te/api/routers/trades.py` had already called `assume_utc()` for its
+    filter comparisons and still serialised the same column naive twelve
+    lines below, which is the clearest possible evidence that "remember to
+    call `assume_utc()` at each site" is not a workable invariant.
+
+    So enforce it at the type instead, in both directions:
+
+    * **write** — reject naive input outright (a naive datetime has no
+      defined instant, and guessing its zone is how the digits get corrupted
+      in the first place), then normalise to UTC so every stored row is on
+      one common offset and string ordering matches chronological ordering.
+    * **read** — reattach `dt.UTC`, which is sound precisely *because* the
+      write side refuses anything it hasn't normalised.
+
+    Naive datetimes therefore cannot enter or leave the persistence layer,
+    and `assume_utc()` at a call site becomes a harmless no-op rather than a
+    load-bearing step someone can forget.
+    """
+
+    impl = DateTime(timezone=True)
+    cache_ok = True
+
+    def process_bind_param(self, value: dt.datetime | None, dialect: Dialect) -> dt.datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            raise ValueError(
+                f"refusing to persist naive datetime {value!r}: it has no defined instant. "
+                f"Tag it with a timezone (te.domain.clock.to_utc) at the point it is created."
+            )
+        return value.astimezone(dt.UTC)
+
+    def process_result_value(self, value: dt.datetime | None, dialect: Dialect) -> dt.datetime | None:
+        if value is None:
+            return None
+        # Sound only because `process_bind_param` normalised every write to
+        # UTC — these digits are known to be UTC, so reattach rather than
+        # convert (`astimezone` on a naive value would assume system-local).
+        return value if value.tzinfo is not None else value.replace(tzinfo=dt.UTC)
 
 
 class Base(DeclarativeBase):
@@ -36,7 +93,7 @@ class EngineState(Base):
     key: Mapped[str] = mapped_column(String(64), primary_key=True)
     value: Mapped[str] = mapped_column(Text, nullable=False)
     updated_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=lambda: dt.datetime.now(dt.UTC)
+        UtcDateTime, nullable=False, default=lambda: dt.datetime.now(dt.UTC)
     )
 
 
@@ -53,7 +110,7 @@ class BarIngestLog(Base):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     source: Mapped[str] = mapped_column(String(32), nullable=False)
     trade_date: Mapped[dt.date] = mapped_column(nullable=False)
-    ingested_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ingested_at: Mapped[dt.datetime] = mapped_column(UtcDateTime, nullable=False)
     row_count: Mapped[int] = mapped_column(nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False)
     detail: Mapped[str] = mapped_column(Text, nullable=False, default="")
@@ -75,7 +132,7 @@ class Instrument(Base):
     lot_size: Mapped[int] = mapped_column(nullable=False)
     tick_size: Mapped[float] = mapped_column(nullable=False)
     source: Mapped[str] = mapped_column(String(32), nullable=False, default="openalgo")
-    updated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[dt.datetime] = mapped_column(UtcDateTime, nullable=False)
 
 
 class OptionBhav(Base):
@@ -135,7 +192,7 @@ class OrderEventRow(Base):
     seq: Mapped[int] = mapped_column(Integer, nullable=False)
     event_type: Mapped[str] = mapped_column(String(32), nullable=False)
     payload_json: Mapped[str] = mapped_column(Text, nullable=False)
-    ts: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ts: Mapped[dt.datetime] = mapped_column(UtcDateTime, nullable=False)
 
 
 class CycleRow(Base):
@@ -146,7 +203,7 @@ class CycleRow(Base):
     __tablename__ = "cycles"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    ts: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ts: Mapped[dt.datetime] = mapped_column(UtcDateTime, nullable=False)
     mode: Mapped[str] = mapped_column(String(16), nullable=False)
 
 
@@ -160,7 +217,7 @@ class CycleEvaluationRow(Base):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     cycle_id: Mapped[int] = mapped_column(nullable=False)
     evaluation_id: Mapped[str] = mapped_column(String(160), nullable=False, unique=True)
-    ts: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ts: Mapped[dt.datetime] = mapped_column(UtcDateTime, nullable=False)
     strategy: Mapped[str] = mapped_column(String(32), nullable=False)
     instrument: Mapped[str] = mapped_column(String(64), nullable=False)
     verdict: Mapped[str] = mapped_column(String(16), nullable=False)
@@ -193,7 +250,7 @@ class SkippedSignalRow(Base):
     __tablename__ = "skipped_signals"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    ts: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ts: Mapped[dt.datetime] = mapped_column(UtcDateTime, nullable=False)
     strategy: Mapped[str] = mapped_column(String(32), nullable=False)
     instrument: Mapped[str] = mapped_column(String(64), nullable=False)
     reason: Mapped[str] = mapped_column(Text, nullable=False)
@@ -207,7 +264,7 @@ class RiskEventRow(Base):
     __tablename__ = "risk_events"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    ts: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ts: Mapped[dt.datetime] = mapped_column(UtcDateTime, nullable=False)
     kind: Mapped[str] = mapped_column(String(32), nullable=False)
     detail: Mapped[str] = mapped_column(Text, nullable=False, default="")
 
@@ -238,8 +295,8 @@ class OpenPositionRow(Base):
     target_paise: Mapped[int] = mapped_column(nullable=False)
     max_hold_seconds: Mapped[int] = mapped_column(nullable=False)
     hard_exit_by: Mapped[str] = mapped_column(String(8), nullable=False)
-    opened_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    closed_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    opened_at: Mapped[dt.datetime] = mapped_column(UtcDateTime, nullable=False)
+    closed_at: Mapped[dt.datetime | None] = mapped_column(UtcDateTime, nullable=True)
 
 
 class TradeRow(Base):
@@ -266,8 +323,8 @@ class TradeRow(Base):
     net_pnl_paise: Mapped[int] = mapped_column(nullable=False)
     exit_reason: Mapped[str] = mapped_column(String(16), nullable=False)
     mode: Mapped[str] = mapped_column(String(16), nullable=False, default="paper")
-    opened_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    closed_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    opened_at: Mapped[dt.datetime] = mapped_column(UtcDateTime, nullable=False)
+    closed_at: Mapped[dt.datetime] = mapped_column(UtcDateTime, nullable=False)
 
     # --- post-hoc trade-review fields (nullable: pre-existing rows have none) ---
 
@@ -301,8 +358,8 @@ class ApprovalRow(Base):
     __tablename__ = "approvals"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    expires_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[dt.datetime] = mapped_column(UtcDateTime, nullable=False)
+    expires_at: Mapped[dt.datetime] = mapped_column(UtcDateTime, nullable=False)
     instrument: Mapped[str] = mapped_column(String(64), nullable=False)
     side: Mapped[str] = mapped_column(String(8), nullable=False)
     lots: Mapped[int] = mapped_column(nullable=False)
@@ -325,7 +382,7 @@ class TrialLedgerRow(Base):
     __tablename__ = "trial_ledger"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    ts: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ts: Mapped[dt.datetime] = mapped_column(UtcDateTime, nullable=False)
     kind: Mapped[str] = mapped_column(String(32), nullable=False)
     config_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     sharpe: Mapped[float] = mapped_column(nullable=False)
@@ -343,7 +400,7 @@ class MlMaturityState(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     stage: Mapped[str] = mapped_column(String(16), nullable=False)
-    updated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[dt.datetime] = mapped_column(UtcDateTime, nullable=False)
 
 
 class ModelPromotionRow(Base):
@@ -353,7 +410,7 @@ class ModelPromotionRow(Base):
     __tablename__ = "model_promotions"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    ts: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ts: Mapped[dt.datetime] = mapped_column(UtcDateTime, nullable=False)
     from_stage: Mapped[str] = mapped_column(String(16), nullable=False)
     to_stage: Mapped[str] = mapped_column(String(16), nullable=False)
     actor: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -369,7 +426,7 @@ class MlPredictionRow(Base):
     __tablename__ = "ml_predictions"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    ts: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ts: Mapped[dt.datetime] = mapped_column(UtcDateTime, nullable=False)
     cycle_id: Mapped[int] = mapped_column(nullable=False)
     instrument: Mapped[str] = mapped_column(String(64), nullable=False)
     feature_spec_name: Mapped[str] = mapped_column(String(32), nullable=False)
@@ -400,7 +457,7 @@ class ModelRegistryRow(Base):
     pbo: Mapped[float] = mapped_column(Float, nullable=False)
     n_trials_at_training: Mapped[int] = mapped_column(nullable=False)
     n_labeled_samples: Mapped[int] = mapped_column(nullable=False)
-    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[dt.datetime] = mapped_column(UtcDateTime, nullable=False)
     notes: Mapped[str] = mapped_column(Text, nullable=False, default="")
 
 
@@ -415,7 +472,7 @@ class SlippageObservationRow(Base):
     __table_args__ = (Index("ix_slippage_observations_instrument_id", "instrument", "id"),)
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    ts: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ts: Mapped[dt.datetime] = mapped_column(UtcDateTime, nullable=False)
     instrument: Mapped[str] = mapped_column(String(64), nullable=False)
     expected_paise: Mapped[int] = mapped_column(nullable=False)
     actual_paise: Mapped[int] = mapped_column(nullable=False)
@@ -436,7 +493,7 @@ class MonitorStateRow(Base):
     s_pos: Mapped[float] = mapped_column(Float, nullable=False)
     s_neg: Mapped[float] = mapped_column(Float, nullable=False)
     last_action: Mapped[str] = mapped_column(String(16), nullable=False, default="none")
-    updated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[dt.datetime] = mapped_column(UtcDateTime, nullable=False)
 
 
 class BacktestDrawdownEnvelopeRow(Base):
@@ -453,7 +510,7 @@ class BacktestDrawdownEnvelopeRow(Base):
     run_id: Mapped[str] = mapped_column(String(64), nullable=False)
     percentile: Mapped[float] = mapped_column(Float, nullable=False)
     drawdown_paise: Mapped[int] = mapped_column(nullable=False)
-    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[dt.datetime] = mapped_column(UtcDateTime, nullable=False)
 
 
 class AuditLog(Base):
@@ -464,7 +521,7 @@ class AuditLog(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     created_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=lambda: dt.datetime.now(dt.UTC)
+        UtcDateTime, nullable=False, default=lambda: dt.datetime.now(dt.UTC)
     )
     actor: Mapped[str] = mapped_column(String(64), nullable=False)
     action: Mapped[str] = mapped_column(String(128), nullable=False)

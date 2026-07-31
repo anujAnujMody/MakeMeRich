@@ -138,6 +138,21 @@ class OptionContractResolver:
                 premium_paise=int(resolved.premium),
             )
             return None
+        # A quote with no usable depth must be REJECTED, not waved through.
+        # `openalgo_rest.quotes()` defaults a missing `bid`/`ask` to 0.0, so
+        # an envelope without depth fields yields `spread_pct = (0-0)/ltp =
+        # 0%` — which sails past the ceiling below and turns the liquidity
+        # guard into a no-op precisely on the illiquid strikes it exists to
+        # exclude. `ask < bid` is likewise a crossed/stale book, not a
+        # tradeable one.
+        if int(resolved.bid) <= 0 or int(resolved.ask) <= 0 or int(resolved.ask) < int(resolved.bid):
+            logger.info(
+                "contract rejected: no usable bid/ask depth",
+                symbol=resolved.symbol,
+                bid_paise=int(resolved.bid),
+                ask_paise=int(resolved.ask),
+            )
+            return None
         if resolved.spread_pct > self._max_spread_pct:
             logger.info(
                 "contract rejected: spread too wide",

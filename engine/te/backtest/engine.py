@@ -30,7 +30,7 @@ from te.domain.costs import CostBreakdown, CostModel
 from te.domain.money import Paise
 from te.domain.orders import OrderIntent
 from te.domain.pnl import GrossPnl, NetPnl, net_pnl
-from te.domain.signal import Direction, ExitPlan
+from te.domain.signal import Direction, ExitPlan, trailing_activation_for
 from te.engine.exits import ExitReason, OpenPosition, evaluate_position, open_position
 from te.risk.sizing import size_position
 from te.strategy.base import Strategy
@@ -212,8 +212,12 @@ def _step_entry(
     fill = fills.fill(entry_intent)
 
     exit_plan = ExitPlan(
-        stop=stop_premium, trailing_distance=config.trailing_distance, target=target_premium,
-        max_hold=config.max_hold, hard_exit_by=config.hard_exit_by,
+        stop=stop_premium, trailing_distance=config.trailing_distance,
+        # Same derivation as the paper path (`te.engine.cycle`) — backtest
+        # and paper must share exit semantics or the backtest measures a
+        # strategy that will never be traded.
+        trailing_activation=trailing_activation_for(fill.fill_price, config.trailing_distance),
+        target=target_premium, max_hold=config.max_hold, hard_exit_by=config.hard_exit_by,
     )
     return open_position(
         symbol=instrument, exchange=exchange, strategy=strategy.name, direction=signal.direction,

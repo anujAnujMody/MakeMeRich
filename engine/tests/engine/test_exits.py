@@ -21,6 +21,8 @@ def _plan(**overrides: object) -> ExitPlan:
     defaults: dict[str, object] = {
         "stop": Paise(1_800),
         "trailing_distance": Paise(200),
+        # entry 2_000 + trail 200; engages at 2_000, above the 1_800 stop.
+        "trailing_activation": Paise(2_200),
         "target": Paise(3_000),
         "max_hold": dt.timedelta(hours=3),
         "hard_exit_by": dt.time(15, 20),
@@ -178,7 +180,7 @@ def test_hard_exit_before_close_fires() -> None:
 
 
 def test_no_trailing_distance_means_static_stop_only() -> None:
-    position = _position(exit_plan=_plan(trailing_distance=None))
+    position = _position(exit_plan=_plan(trailing_distance=None, trailing_activation=None))
     now = OPENED_AT + dt.timedelta(minutes=5)
     updated, decision = evaluate_position(position, current_premium=Paise(2_500), now=now)
 

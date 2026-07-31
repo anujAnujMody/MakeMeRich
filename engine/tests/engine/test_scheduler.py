@@ -423,10 +423,20 @@ def test_paper_cycle_only_runs_during_session_window(tmp_path: Path, monkeypatch
     assert runner.status.last_result == "skipped_outside_session"
 
 
-def test_paper_cycle_skips_when_paused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The dashboard-wiring remediation's Tier 2 fix: Pause/Resume used to
-    flip a display-only field this loop never read. `run_once` must now
-    actually skip when `run_state == "paused"`, same as a halt."""
+def test_paper_cycle_blocks_entries_but_still_manages_exits_when_paused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pause means "stop opening trades", never "stop protecting the ones I
+    already have".
+
+    This test previously asserted `exit: 0`, which pinned a real defect: the
+    `paused` branch returned above `run_exit_cycle`, so one dashboard click
+    disabled every stop-loss, target, trailing stop and the 15:20 hard exit
+    on all open positions, leaving them to run unmanaged into the close and
+    then overnight. The kill-switch branch immediately below it had already
+    been fixed to keep running exits (exiting is risk-reducing); pause was
+    the one gate that had not been.
+    """
     calls = _patch_cycle_calls(monkeypatch)
 
     runner = _runner(tmp_path, clock=_during_session_clock)
@@ -436,8 +446,8 @@ def test_paper_cycle_skips_when_paused(tmp_path: Path, monkeypatch: pytest.Monke
 
     runner.run_once()
 
-    assert calls == {"entry": 0, "exit": 0}
-    assert runner.status.last_result == "skipped_paused"
+    assert calls == {"entry": 0, "exit": 1}
+    assert runner.status.last_result == "skipped_paused_entries_only"
 
 
 def _patch_cycle_calls_capturing_config(monkeypatch: pytest.MonkeyPatch) -> list[object]:

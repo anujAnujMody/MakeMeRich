@@ -27,12 +27,13 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from te.data.asof import latest_close_paise
 from te.data.barstore import BarStore
+from te.domain.clock import IST
 from te.domain.clock import assume_utc as _as_utc
 from te.domain.costs import CostModel
 from te.domain.money import Paise
 from te.domain.orders import OrderRequest
 from te.domain.pnl import GrossPnl, mark_to_market_pnl, net_pnl
-from te.domain.signal import ExitPlan, Signal
+from te.domain.signal import ExitPlan, Signal, trailing_activation_for
 from te.engine.contract import ContractResolver
 from te.engine.exits import OpenPosition, evaluate_position
 from te.engine.state import PIPELINE_STAGE_KEYS, PipelineStageTiming, set_last_cycle_pipeline
@@ -203,9 +204,14 @@ def unrealized_pnl_paise(
 
 
 def _row_to_position(row: OpenPositionRow) -> OpenPosition:
+    trailing_distance = Paise(row.trailing_distance_paise) if row.trailing_distance_paise is not None else None
     exit_plan = ExitPlan(
         stop=Paise(row.stop_paise),
-        trailing_distance=Paise(row.trailing_distance_paise) if row.trailing_distance_paise is not None else None,
+        trailing_distance=trailing_distance,
+        # Derived, not stored — see `trailing_activation_for`. `current_stop`
+        # (the ratchet's actual state) IS persisted, so nothing about an
+        # already-trailing position is lost by recomputing the threshold.
+        trailing_activation=trailing_activation_for(Paise(row.entry_premium_paise), trailing_distance),
         target=Paise(row.target_paise),
         max_hold=dt.timedelta(seconds=row.max_hold_seconds),
         hard_exit_by=dt.time.fromisoformat(row.hard_exit_by),
@@ -326,6 +332,21 @@ def run_entry_cycle(
             throttled = is_currently_throttled(session)
     stage_ms["risk"] += (time.perf_counter() - _t0) * 1000
     stage_reached["risk"] = True
+
+    # No new entries at or after the hard exit time. `PaperCycleRunner.run_once`
+    # runs `run_entry_cycle` and then `run_exit_cycle` in the SAME invocation,
+    # and `evaluate_position` checks `now_ist >= hard_exit_by` before anything
+    # else — so a position opened at or after that time is closed by the very
+    # next statement, at the same premium, having held zero seconds of market
+    # exposure. Gross P&L is exactly 0 and the round-trip cost (~Rs 55-65) is
+    # pure loss, repeatable across every active underlying.
+    if portfolio_blocked_reason is None:
+        now_ist_time = as_of.astimezone(IST).timetz().replace(tzinfo=None)
+        if now_ist_time >= config.hard_exit_by:
+            portfolio_blocked_reason = (
+                f"{now_ist_time:%H:%M} IST is at or past the hard exit time ({config.hard_exit_by:%H:%M}) — "
+                f"a new entry would be force-closed this same cycle for a guaranteed round-trip cost"
+            )
 
     if portfolio_blocked_reason is not None:
         for instrument_config in _resolve_instruments(config):
@@ -500,9 +521,11 @@ def run_entry_cycle(
         )
         client_order_id = execution.submit(request)
 
+        trailing_distance = _trailing_distance(config, entry_premium)
         exit_plan = ExitPlan(
             stop=stop_premium,
-            trailing_distance=_trailing_distance(config, entry_premium),
+            trailing_distance=trailing_distance,
+            trailing_activation=trailing_activation_for(entry_premium, trailing_distance),
             target=target_premium,
             max_hold=config.max_hold,
             hard_exit_by=config.hard_exit_by,

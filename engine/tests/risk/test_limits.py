@@ -117,6 +117,7 @@ def test_max_concurrent_positions_blocks_at_limit(db_path: Path) -> None:
     plan = ExitPlan(
         stop=Paise(1_800),
         trailing_distance=Paise(200),
+        trailing_activation=Paise(2_200),
         target=Paise(3_000),
         max_hold=dt.timedelta(hours=3),
         hard_exit_by=dt.time(15, 20),
