@@ -252,3 +252,50 @@ def test_last_signal_resets_between_evaluate_calls(store: BarStore, tmp_path) ->
     evaluation = strategy.evaluate(ctx_skip)
     assert evaluation.verdict == "skipped"
     assert strategy.last_signal is None
+
+
+def _breakout_rows(*, breakout_volume: int, range_volume: int) -> list[dict[str, object]]:
+    """A clean upside crossing: flat 3-bar opening range, then one bar that
+    closes above it. `range_volume` drives `avg_range_volume`."""
+    return [
+        _bar(_open(0), o=100, h=105, low=95, c=100, v=range_volume),
+        _bar(_open(1), o=100, h=101, low=99, c=100.5, v=range_volume),
+        _bar(_open(2), o=100, h=101, low=99, c=100.2, v=range_volume),
+        _bar(_open(15), o=100, h=110, low=100, c=109, v=breakout_volume),
+    ]
+
+
+def test_volume_confirmation_is_not_reported_as_passed_when_there_is_no_volume(store: BarStore) -> None:
+    """An index has no traded volume of its own, and OpenAlgo returns
+    `volume=0` for `NSE_INDEX`/`BSE_INDEX` on both the WS feed and the
+    history endpoint. That made `avg_range_volume == 0`, the threshold 0, and
+    `volume >= 0` vacuously true — so this condition reported a green PASS on
+    every evaluation for a filter that had never once been applied.
+
+    It must now report itself as NOT evaluated, with a real explanation. It
+    still does not block (an absent measurement is not evidence to block on),
+    but the dashboard can no longer show a tick for a check that never ran.
+    """
+    _write(store, _breakout_rows(breakout_volume=0, range_volume=0))
+    ctx = StrategyContext(store=store, instrument=INSTRUMENT, exchange=EXCHANGE, as_of=_open(16))
+
+    evaluation = OrbStrategy().evaluate(ctx)
+
+    volume_cond = next(c for c in evaluation.conditions if c.label == "breakout volume confirmation")
+    assert volume_cond.evaluated is False, "claimed to have evaluated a volume filter with no volume data"
+    assert "no volume" in volume_cond.actual
+    assert evaluation.verdict == "traded", "an unmeasurable condition must not block a genuine breakout"
+
+
+def test_volume_confirmation_still_applies_when_volume_is_present(store: BarStore) -> None:
+    """The fix must not disable the filter on an instrument that DOES carry
+    volume — only stop faking it on one that does not."""
+    _write(store, _breakout_rows(breakout_volume=1, range_volume=1_000))
+    ctx = StrategyContext(store=store, instrument=INSTRUMENT, exchange=EXCHANGE, as_of=_open(16))
+
+    evaluation = OrbStrategy().evaluate(ctx)
+
+    volume_cond = next(c for c in evaluation.conditions if c.label == "breakout volume confirmation")
+    assert volume_cond.evaluated is True
+    assert volume_cond.passed is False
+    assert evaluation.verdict == "skipped"

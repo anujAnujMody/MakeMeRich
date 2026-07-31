@@ -170,21 +170,37 @@ def label_firings_from_evaluations(
     target_distance: Paise,
     max_hold: dt.timedelta,
     interval: str = "1m",
+    instrument: str | None = None,
+    since: dt.date | None = None,
 ) -> list[LabeledFiring]:
     """Labels every `verdict == "traded"` evaluation for `strategy` — the
     plan's explicit instruction to include vetoed/zero-sized firings, since
     censoring on trades risk already accepted biases the model toward sizes
-    already taken."""
+    already taken.
+
+    `instrument` restricts the run to one underlying. Barriers here are
+    absolute distances on the INDEX, and the indices are on wildly different
+    point scales — NIFTY trades near 24,400 while SENSEX trades near 78,000,
+    so a single `stop_distance` that is a 0.15% move on one is a 0.05% move
+    on the other. Labelling a mixed set with one barrier would silently
+    assign the four underlyings four different risk/reward geometries and
+    call them one dataset. Callers therefore label one instrument at a time
+    with that instrument's own barriers; `None` keeps the historic
+    label-everything behaviour for existing call sites.
+    """
     with session_factory() as session:
-        evaluations = list(
-            session.execute(
-                select(CycleEvaluationRow).where(
-                    CycleEvaluationRow.strategy == strategy, CycleEvaluationRow.verdict == "traded"
-                )
-            )
-            .scalars()
-            .all()
-        )
+        where = [CycleEvaluationRow.strategy == strategy, CycleEvaluationRow.verdict == "traded"]
+        if instrument is not None:
+            where.append(CycleEvaluationRow.instrument == instrument)
+        if since is not None:
+            # `CostModel` refuses to price a trade that predates its rate
+            # row's `effective_from`, deliberately: STT rose 0.10% -> 0.15%
+            # on 2026-04-01, so labelling an older firing with today's rates
+            # would cost-adjust its target barrier with a rate that was not
+            # in force. `since` restricts a run to the era whose rates the
+            # caller actually holds, rather than silently mispricing.
+            where.append(CycleEvaluationRow.ts >= dt.datetime.combine(since, dt.time.min, tzinfo=dt.UTC))
+        evaluations = list(session.execute(select(CycleEvaluationRow).where(*where)).scalars().all())
         # ONE query for every evaluation's breakout condition, grouped in
         # memory — a per-evaluation SELECT here is quadratic over the whole
         # firing history, which is exactly the table this function is meant

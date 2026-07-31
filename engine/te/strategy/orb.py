@@ -172,15 +172,42 @@ class OrbStrategy:
             )
             return self._skip(ctx, conditions, reason)
 
-        threshold = avg_range_volume * float(params.volume_confirmation_multiple)
-        volume_cond = ConditionResult(
-            label="breakout volume confirmation",
-            required=f">= {params.volume_confirmation_multiple}x opening-range average volume "
-            f"({avg_range_volume:.0f})",
-            actual=f"breakout bar volume={volume:.0f}",
-            passed=volume >= threshold,
-            evaluated=True,
-        )
+        # An INDEX has no traded volume of its own — only its derivatives do.
+        # Both OpenAlgo's WS feed and its history endpoint return `volume=0`
+        # for `NSE_INDEX`/`BSE_INDEX` symbols (verified against stored parquet
+        # and the live API, 2026-07-31). With `avg_range_volume == 0` the
+        # threshold is 0 and `volume >= 0` is vacuously true, so this
+        # condition silently PASSED on every single evaluation while
+        # presenting itself as a filter that had been applied.
+        #
+        # Reporting that as `evaluated=True, passed=True` is the kind of
+        # unearned number this project exists to not produce. When there is
+        # no volume to confirm, say so and mark the condition NOT evaluated;
+        # it still does not block (there is no evidence to block on), but it
+        # no longer claims a check that never happened. On an instrument that
+        # does carry volume the original comparison is unchanged.
+        volume_available = avg_range_volume > 0
+        if volume_available:
+            threshold = avg_range_volume * float(params.volume_confirmation_multiple)
+            volume_cond = ConditionResult(
+                label="breakout volume confirmation",
+                required=f">= {params.volume_confirmation_multiple}x opening-range average volume "
+                f"({avg_range_volume:.0f})",
+                actual=f"breakout bar volume={volume:.0f}",
+                passed=volume >= threshold,
+                evaluated=True,
+            )
+        else:
+            volume_cond = ConditionResult(
+                label="breakout volume confirmation",
+                required=f">= {params.volume_confirmation_multiple}x opening-range average volume",
+                actual=(
+                    f"not evaluated — {ctx.instrument} reports no volume on its bars "
+                    f"(an index has no traded volume of its own, only its derivatives do)"
+                ),
+                passed=True,
+                evaluated=False,
+            )
         conditions.append(volume_cond)
         if not volume_cond.passed:
             return self._skip(ctx, conditions, "breakout volume below confirmation threshold")
