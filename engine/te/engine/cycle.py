@@ -42,6 +42,7 @@ from te.persistence.db import session_scope
 from te.persistence.models import OpenPositionRow
 from te.persistence.repos.paper_trading import (
     find_open_position,
+    has_underlying_traded_today,
     insert_open_position,
     insert_trade,
     mark_position_closed,
@@ -345,6 +346,22 @@ def run_entry_cycle(
             # crash the whole cycle if a future Strategy implementation
             # ever violates that contract.
             _skip(instrument, "strategy reported verdict=traded but produced no Signal")
+            continue
+
+        # One entry per underlying per day. Without this, ORB re-evaluates
+        # the SAME persisting breakout on every 1-minute cycle and re-signals
+        # every time its close/volume conditions still hold — a stopped-out
+        # position immediately re-opens (and often re-stops) on the very
+        # next cycle. Found live: one underlying cycled through 5+ round
+        # trips in under 10 minutes, paying full round-trip cost each time.
+        # Checked here (not folded into the gate block below) because it is
+        # a strategy-discipline rule, not a portfolio/account risk limit.
+        with session_scope(session_factory) as session:
+            already_traded = has_underlying_traded_today(
+                session, strategy=config.strategy_name, underlying=instrument, on=as_of.date()
+            )
+        if already_traded:
+            _skip(instrument, "already traded this underlying today — one entry per underlying per day")
             continue
 
         # Per-instrument gates only — portfolio-level checks already ran

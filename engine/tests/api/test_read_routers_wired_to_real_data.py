@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 import te.api.routers.dashboard as dashboard_router
 import te.api.routers.engine as engine_router
 import te.api.routers.execution as execution_router
+import te.api.routers.market as market_router
 import te.api.routers.orders as orders_router
 import te.api.routers.pnl as pnl_router
 import te.api.routers.positions as positions_router
@@ -55,6 +56,7 @@ def isolated_client(tmp_path: Path, monkeypatch):  # noqa: ANN201
         orders_router,
         engine_router,
         execution_router,
+        market_router,
     ):
         monkeypatch.setattr(module, "session_factory", sf)
 
@@ -296,3 +298,43 @@ def test_execution_skipped_reflects_real_skipped_signals(isolated_client) -> Non
     assert body[0]["symbol"] == "NIFTY"
     assert body[0]["strategy"] == "orb"
     assert "min_edge_multiple" in body[0]["reason"]
+
+
+def test_daily_pnl_reflects_real_closed_trades(isolated_client) -> None:  # noqa: ANN001
+    """Regression, found live on 2026-07-31 alongside `/api/execution/
+    skipped`: `/api/daily-pnl` and `/api/equity-curve` were still permanent
+    `[]` stubs even with real closed trades on record — a market-hours
+    Performance page showed n=0/₹0.00 net to the right of a Dashboard
+    showing real trades and a real loss."""
+    client, sf = isolated_client
+    _seed_closed_trade(sf, net_pnl_paise=5_000)
+
+    body = client.get("/api/daily-pnl").json()
+    assert len(body) == 1
+    assert body[0]["date"] == TODAY.isoformat()
+    assert body[0]["pnl"] == 50.0
+    assert body[0]["trades"] == 1
+
+
+def test_equity_curve_reflects_capital_plus_real_realized_pnl(isolated_client) -> None:  # noqa: ANN001
+    client, sf = isolated_client
+    _seed_closed_trade(sf, net_pnl_paise=5_000)
+
+    put_response = client.put(
+        "/api/engine/guardrails",
+        json={
+            "capitalRupees": 20000,
+            "maxDailyLossRupees": 700,
+            "maxPositionSizePct": 100,
+            "maxDrawdownPct": 100,
+            "maxTradesPerDay": 10,
+            "maxConcurrentPositions": 5,
+            "riskPerTradePct": 2,
+        },
+    )
+    assert put_response.status_code == 200
+
+    body = client.get("/api/equity-curve").json()
+    assert len(body) == 1
+    assert body[0]["date"] == TODAY.isoformat()
+    assert body[0]["value"] == 20_050.0  # 20,000 capital + 50 realized

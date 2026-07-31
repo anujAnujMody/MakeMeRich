@@ -2,10 +2,15 @@ import datetime as dt
 
 from fastapi import APIRouter, Query, Response
 
+from te.api.db import session_factory, settings
 from te.api.provenance import set_provenance
 from te.api.schemas.dashboard import DailyPnL, EquityPoint, MarketSession, WatchlistItem
 from te.api.schemas.trading import MarketData
 from te.domain.clock import DEFAULT_SESSION, IST, is_market_open
+from te.domain.money import Paise, rupees
+from te.engine.state import get_guardrails, guardrails_defaults_from_settings
+from te.persistence.repos.paper_trading import daily_pnl as repo_daily_pnl
+from te.persistence.repos.paper_trading import equity_curve as repo_equity_curve
 
 # Prefix is only `/api`: this router's paths (`/api/quotes`, `/api/history`,
 # `/api/equity-curve`, `/api/daily-pnl`, `/api/watchlist`,
@@ -44,18 +49,30 @@ def get_equity_curve(
     from_: str | None = Query(default=None, alias="from"),
     to: str | None = None,
 ) -> list[EquityPoint]:
-    """Account equity over the `from`..`to` window. Empty until account
-    snapshots are recorded."""
-    set_provenance(response, not_ready_reason="phase-0: no account snapshots recorded yet")
-    return []
+    """Real end-of-day account equity over the `from`..`to` window —
+    `capital + cumulative realized net P&L`, reconstructed from closed
+    trades (see `te.persistence.repos.paper_trading.equity_curve` for why
+    there is no separate snapshot table to read from)."""
+    with session_factory() as session:
+        guardrails = get_guardrails(session, defaults=guardrails_defaults_from_settings(settings))
+        curve = repo_equity_curve(
+            session,
+            capital_paise=int(guardrails.capital),
+            from_=dt.date.fromisoformat(from_) if from_ else None,
+            to=dt.date.fromisoformat(to) if to else None,
+        )
+    set_provenance(response, provenance="paper" if curve else "none", sample_size=len(curve))
+    return [EquityPoint(date=day.isoformat(), value=float(rupees(Paise(equity)))) for day, equity in curve]
 
 
 @router.get("/daily-pnl", response_model=list[DailyPnL])
 def get_daily_pnl(response: Response, month: str | None = None) -> list[DailyPnL]:
-    """Per-day net P&L for the given `month`. Empty until closed trades are
-    recorded."""
-    set_provenance(response, not_ready_reason="phase-0: no closed trades recorded yet")
-    return []
+    """Real per-day net P&L for the given `month` (`"YYYY-MM"`), or every day
+    with a closed trade when `month` is omitted."""
+    with session_factory() as session:
+        rows = repo_daily_pnl(session, month=month)
+    set_provenance(response, provenance="paper" if rows else "none", sample_size=len(rows))
+    return [DailyPnL(date=day.isoformat(), pnl=float(rupees(Paise(pnl))), trades=count) for day, pnl, count in rows]
 
 
 @router.get("/watchlist", response_model=list[WatchlistItem])

@@ -248,6 +248,48 @@ def insert_trade(
     )
 
 
+def has_underlying_traded_today(session: Session, *, strategy: str, underlying: str, on: dt.date) -> bool:
+    """Whether `strategy` already has an open OR closed-today position on
+    `underlying` — found live on 2026-07-31: with no such guard, ORB
+    re-evaluates the SAME persisting breakout on every 1-minute cycle and
+    re-signals every time its close/volume conditions still hold, so a
+    stopped-out position immediately re-opens (and often re-stops) on the
+    very next cycle. One underlying observed cycling through 5+ round trips
+    in under 10 minutes, paying full round-trip cost on every one.
+
+    Matches by symbol PREFIX (`symbol LIKE '{underlying}%'`) since a
+    position's `symbol` is the resolved OPTION contract
+    (`BANKNIFTY25AUG2657200PE`), not the underlying `cycle.py` evaluates —
+    this project has exactly 4 known underlyings
+    (`te.domain.symbols.FNO_UNDERLYING_EXCHANGES`) and none is a prefix of
+    another, so this is unambiguous without a schema change."""
+    prefix = f"{underlying}%"
+    open_count = session.execute(
+        select(func.count())
+        .select_from(OpenPositionRow)
+        .where(
+            OpenPositionRow.strategy == strategy,
+            OpenPositionRow.symbol.like(prefix),
+            OpenPositionRow.closed_at.is_(None),
+        )
+    ).scalar_one()
+    if open_count > 0:
+        return True
+
+    start, end = _day_bounds(on)
+    closed_count = session.execute(
+        select(func.count())
+        .select_from(TradeRow)
+        .where(
+            TradeRow.strategy == strategy,
+            TradeRow.symbol.like(prefix),
+            TradeRow.closed_at >= start,
+            TradeRow.closed_at <= end,
+        )
+    ).scalar_one()
+    return bool(closed_count > 0)
+
+
 def trades_today(session: Session, on: dt.date) -> list[TradeRow]:
     start, end = _day_bounds(on)
     return list(
@@ -332,6 +374,52 @@ def order_ids_today(session: Session, on: dt.date) -> list[str]:
         .where(OrderEventRow.ts >= start, OrderEventRow.ts <= end)
     ).scalars().all()
     return list(rows)
+
+
+def daily_pnl(session: Session, *, month: str | None = None) -> list[tuple[dt.date, int, int]]:
+    """Real closed trades grouped by calendar day: `(date, net_pnl_paise,
+    trade_count)`, oldest first. `month` (a `"YYYY-MM"` string) filters to
+    that month when given, else every day that has a closed trade.
+
+    Feeds `GET /api/daily-pnl` — previously a permanent `[]` stub (found
+    live on 2026-07-31 alongside `equity_curve`, both missed by the earlier
+    Tier-0 dashboard-wiring pass that fixed the other read routers)."""
+    query = select(
+        func.date(TradeRow.closed_at), func.sum(TradeRow.net_pnl_paise), func.count()
+    ).group_by(func.date(TradeRow.closed_at))
+    if month is not None:
+        query = query.where(func.strftime("%Y-%m", TradeRow.closed_at) == month)
+    rows = session.execute(query.order_by(func.date(TradeRow.closed_at))).all()
+    return [(dt.date.fromisoformat(str(day)), int(pnl), int(count)) for day, pnl, count in rows]
+
+
+def equity_curve(
+    session: Session, *, capital_paise: int, from_: dt.date | None = None, to: dt.date | None = None
+) -> list[tuple[dt.date, int]]:
+    """Real end-of-day equity — `capital_paise` plus the CUMULATIVE realized
+    net P&L up to and including each day that has a closed trade:
+    `(date, equity_paise)`, oldest first.
+
+    Derived from real `TradeRow`s rather than a separate snapshot table —
+    this project has no `account_snapshots` writer (the table is named in a
+    docstring but no model/job for it exists), and reconstructing end-of-day
+    equity from closed trades is exact for realized P&L, so a real number is
+    available today without first building that infrastructure. Excludes
+    intraday unrealized swings, which matches the day-level granularity this
+    endpoint reports at.
+
+    The running total accumulates over EVERY day (not just the requested
+    `from_`/`to` window) before the window is applied — equity on the first
+    day of a requested range must still reflect every trade that happened
+    before it, or the curve would silently reset to `capital_paise` at the
+    window's start instead of showing the account's real equity there."""
+    running = capital_paise
+    curve: list[tuple[dt.date, int]] = []
+    for day, pnl, _count in daily_pnl(session):
+        running += pnl
+        if (from_ is None or day >= from_) and (to is None or day <= to):
+            curve.append((day, running))
+    return curve
 
 
 def trades_closed_since(session: Session, cutoff: dt.date) -> list[TradeRow]:

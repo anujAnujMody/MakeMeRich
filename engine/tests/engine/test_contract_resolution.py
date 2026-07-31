@@ -32,7 +32,7 @@ from te.engine.cycle import CycleConfig, run_entry_cycle
 from te.execution.manager import ExecutionManager
 from te.execution.store import OrderEventStore
 from te.persistence.db import make_engine, make_session_factory
-from te.persistence.models import Base, OpenPositionRow, SkippedSignalRow
+from te.persistence.models import Base, OpenPositionRow, SkippedSignalRow, TradeRow
 from te.risk.limits import RiskLimitsConfig
 
 _CHARGES_PATH = Path(__file__).resolve().parents[2] / "config" / "charges.yaml"
@@ -271,6 +271,79 @@ def test_risk_budget_blocks_a_nifty_lot_at_20k_capital_and_says_so(
         assert session.query(OpenPositionRow).count() == 0
         reasons = [s.reason for s in session.query(SkippedSignalRow).all()]
     assert any("risk budget" in reason for reason in reasons), reasons
+
+
+def test_a_stopped_out_position_does_not_reenter_the_same_underlying_same_day(
+    session_factory, execution, cost_model: CostModel, index_store: BarStore
+) -> None:  # noqa: ANN001
+    """Regression for a real, actively-losing bug found live on 2026-07-31:
+    ORB re-evaluates the SAME persisting breakout on every 1-minute cycle,
+    so once a position is stopped out it immediately re-opens (and often
+    re-stops) on the very next cycle — one underlying cycled through 5+
+    round trips in under 10 minutes live, paying full round-trip cost every
+    time. Runs two entry cycles back-to-back on data where the breakout
+    condition still holds on both: the second must be a no-op skip, not a
+    second entry."""
+    config = _config()
+
+    cycle_id_1 = run_entry_cycle(
+        session_factory=session_factory,
+        store=index_store,
+        execution=execution,
+        cost_model=cost_model,
+        config=config,
+        as_of=_open(16),
+        contract_resolver=_resolver,
+    )
+    with session_factory() as session:
+        row = session.query(OpenPositionRow).one()
+        # Simulate the position having been stopped out before the next
+        # cycle runs — the bug reproduces on a CLOSED position, not just an
+        # open one (an open one is already covered by
+        # `check_max_concurrent_positions`). Mirrors `_close_position`: both
+        # the position row AND a `TradeRow` are required for a real close.
+        closed_at = _open(17).astimezone(dt.UTC)
+        row.closed_at = closed_at
+        session.add(
+            TradeRow(
+                client_order_id=row.client_order_id,
+                symbol=row.symbol,
+                exchange=row.exchange,
+                strategy=row.strategy,
+                direction=row.direction,
+                lots=row.lots,
+                lot_size=row.lot_size,
+                entry_premium_paise=row.entry_premium_paise,
+                exit_premium_paise=row.stop_paise,
+                gross_pnl_paise=row.stop_paise - row.entry_premium_paise,
+                costs_paise=0,
+                net_pnl_paise=row.stop_paise - row.entry_premium_paise,
+                exit_reason="stop",
+                mode="paper",
+                opened_at=row.opened_at,
+                closed_at=closed_at,
+            )
+        )
+        session.commit()
+
+    cycle_id_2 = run_entry_cycle(
+        session_factory=session_factory,
+        store=index_store,
+        execution=execution,
+        cost_model=cost_model,
+        config=config,
+        as_of=_open(18),
+        contract_resolver=_resolver,
+    )
+    assert cycle_id_2 != cycle_id_1
+
+    with session_factory() as session:
+        open_count = session.query(OpenPositionRow).filter(OpenPositionRow.closed_at.is_(None)).count()
+        reasons = [
+            s.reason for s in session.query(SkippedSignalRow).filter(SkippedSignalRow.instrument == UNDERLYING)
+        ]
+    assert open_count == 0, "must not have re-entered — the earlier position was closed, not re-opened"
+    assert any("one entry per underlying per day" in r for r in reasons), reasons
 
 
 def test_unresolvable_contract_skips_with_a_real_reason_instead_of_trading_the_index(
