@@ -24,6 +24,7 @@ from te.data.barstore import BAR_COLUMNS, BarStore
 from te.data.charges_loader import load_charge_rate_table
 from te.domain.clock import IST
 from te.domain.costs import CostModel, select_rates
+from te.domain.geometry import PremiumPercentGeometry
 from te.domain.money import Paise
 from te.domain.signal import Direction
 from te.domain.symbols import parse_option_symbol
@@ -136,16 +137,12 @@ def _config(**overrides: object) -> CycleConfig:
         "capital": Paise(10_000_000),
         "risk_budget_pct": Decimal(2),
         "min_edge_multiple": Decimal("1.2"),
-        "stop_distance": Paise(700),
-        "target_distance": Paise(1_500),
-        "trailing_distance": Paise(300),
+        "exit_geometry": PremiumPercentGeometry(stop_pct=Decimal(20), target_pct=Decimal(40)),
         "max_hold": dt.timedelta(hours=3),
         "hard_exit_by": dt.time(15, 20),
         "risk_limits": RiskLimitsConfig(
             max_daily_loss_paise=Paise(10_000_00), max_concurrent_positions=5, max_trades_per_day=20
         ),
-        "stop_pct": Decimal(20),
-        "target_pct": Decimal(40),
     }
     defaults.update(overrides)
     return CycleConfig(**defaults)  # type: ignore[arg-type]
@@ -249,7 +246,11 @@ def test_trailing_distance_scales_with_the_option_premium(
         store=index_store,
         execution=execution,
         cost_model=cost_model,
-        config=_config(trailing_pct=Decimal(15)),
+        config=_config(
+            exit_geometry=PremiumPercentGeometry(
+                stop_pct=Decimal(20), target_pct=Decimal(40), trailing_pct=Decimal(15)
+            )
+        ),
         as_of=_open(16),
         contract_resolver=_resolver,
     )

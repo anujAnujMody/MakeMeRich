@@ -15,10 +15,9 @@ from te.domain.signal import ExitPlan, Signal
 
 def _exit_plan(**overrides: object) -> ExitPlan:
     defaults: dict[str, object] = {
+        "entry_premium": Paise(2_000),
         "stop": Paise(1_800),
         "trailing_distance": Paise(200),
-        # entry 2_000 + trail 200; engages at 2_000, above the 1_800 stop.
-        "trailing_activation": Paise(2_200),
         "target": Paise(2_400),
         "max_hold": dt.timedelta(hours=2),
         "hard_exit_by": dt.time(15, 20),
@@ -37,16 +36,27 @@ def test_exit_plan_constructs_with_required_fields() -> None:
 
 
 def test_exit_plan_trailing_distance_is_optional() -> None:
-    plan = _exit_plan(trailing_distance=None, trailing_activation=None)
+    plan = _exit_plan(trailing_distance=None)
     assert plan.trailing_distance is None
     assert plan.trailing_activation is None
 
 
-def test_exit_plan_rejects_a_trail_distance_without_an_activation_level() -> None:
-    """The two fields are meaningless apart: a distance with no activation is
-    the unconditional ratchet that silently overrode the stop-loss."""
-    with pytest.raises(ValueError, match="set or unset together"):
-        _exit_plan(trailing_distance=Paise(200), trailing_activation=None)
+def test_trailing_activation_is_derived_from_entry_and_distance() -> None:
+    """Activation is a PROPERTY, not a supplied field. It was briefly the
+    latter, set by a helper at three call sites — so three places had to
+    remember `entry + trailing_distance`, and the rehydration path computed
+    it separately. Deriving it makes drift unrepresentable."""
+    plan = _exit_plan(entry_premium=Paise(2_000), trailing_distance=Paise(200))
+
+    assert plan.trailing_activation == Paise(2_200)
+    # Engaging the trail can never tighten past the hard stop, by construction:
+    # activation - distance is always exactly the entry price.
+    assert plan.trailing_activation - Paise(200) == plan.entry_premium > plan.stop
+
+
+def test_exit_plan_rejects_an_entry_outside_its_own_barriers() -> None:
+    with pytest.raises(ValueError, match="must sit between stop"):
+        _exit_plan(entry_premium=Paise(1_500))  # below the 1_800 stop
 
 
 def test_exit_plan_rejects_target_not_above_stop() -> None:

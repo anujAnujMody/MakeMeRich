@@ -119,6 +119,27 @@ forbidden_modules = [
 ]
 
 [[tool.importlinter.contracts]]
+# `te.sqltypes` is shared by te.persistence's ORM models, te.ml's Core
+# tables and te.broker's — tiers that may not import each other. That is
+# only safe while it stays a leaf: if it could import upward it would become
+# a back door between those tiers rather than a shared primitive.
+name = "sqltypes is a leaf — may import te.domain and nothing else from te"
+type = "forbidden"
+source_modules = ["te.sqltypes"]
+forbidden_modules = [
+    "te.data",
+    "te.broker",
+    "te.execution",
+    "te.risk",
+    "te.strategy",
+    "te.ml",
+    "te.engine",
+    "te.backtest",
+    "te.persistence",
+    "te.api",
+]
+
+[[tool.importlinter.contracts]]
 name = "strategy may never import ml — ML cannot generate a signal"
 type = "forbidden"
 source_modules = ["te.strategy"]

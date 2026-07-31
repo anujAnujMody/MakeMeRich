@@ -27,10 +27,11 @@ from te.backtest.fills import BacktestFillEngine
 from te.data.asof import bars_asof
 from te.data.barstore import BarStore
 from te.domain.costs import CostBreakdown, CostModel
+from te.domain.geometry import ExitGeometry
 from te.domain.money import Paise
 from te.domain.orders import OrderIntent
 from te.domain.pnl import GrossPnl, NetPnl, net_pnl
-from te.domain.signal import Direction, ExitPlan, trailing_activation_for
+from te.domain.signal import Direction, ExitPlan
 from te.engine.exits import ExitReason, OpenPosition, evaluate_position, open_position
 from te.risk.sizing import size_position
 from te.strategy.base import Strategy
@@ -46,12 +47,21 @@ class BacktestConfig:
     capital: Paise
     risk_budget_pct: Decimal
     min_edge_multiple: Decimal
-    stop_distance: Paise
-    target_distance: Paise
-    trailing_distance: Paise | None
+    #: THE SAME type `CycleConfig` holds, deliberately. The two configs
+    #: previously restated exit levels as six separate fields each, and the
+    #: newer live rules simply never arrived here — so a backtest measured a
+    #: strategy the engine does not trade, which is exactly what this class's
+    #: docstring promises cannot happen.
+    exit_geometry: ExitGeometry
     max_hold: dt.timedelta
     hard_exit_by: dt.time
     lot_size: int
+    #: Mirrors `CycleConfig`. A firing too close to the hard exit carries
+    #: full downside against upside that is unreachable by construction; a
+    #: backtest that still takes those trades overstates the strategy.
+    min_minutes_before_hard_exit: int = 0
+    #: Mirrors `CycleConfig`'s over-trading guard.
+    max_entries_per_underlying_per_day: int = 2
 
 
 @dataclass(frozen=True)
@@ -195,8 +205,8 @@ def _step_entry(
     if signal is None:
         return None
 
-    stop_premium = Paise(signal.entry_premium - config.stop_distance)
-    target_premium = Paise(signal.entry_premium + config.target_distance)
+    levels = config.exit_geometry.levels(signal.entry_premium)
+    stop_premium, target_premium = levels.stop, levels.target
     sizing = size_position(
         capital=config.capital, risk_budget_pct=config.risk_budget_pct, premium=signal.entry_premium,
         stop_premium=stop_premium, target_premium=target_premium, lot_size=config.lot_size, costs=cost_model,
@@ -211,16 +221,14 @@ def _step_entry(
     )
     fill = fills.fill(entry_intent)
 
+    # Levels re-derived from the ACTUAL fill, not the signal price, so the
+    # plan's barriers and its `entry_premium` describe the same trade.
+    filled = config.exit_geometry.levels(fill.fill_price)
     exit_plan = ExitPlan(
-        stop=stop_premium, trailing_distance=config.trailing_distance,
-        # Same derivation as the paper path (`te.engine.cycle`) — backtest
-        # and paper must share exit semantics or the backtest measures a
-        # strategy that will never be traded.
-        trailing_activation=trailing_activation_for(fill.fill_price, config.trailing_distance),
-        target=target_premium, max_hold=config.max_hold, hard_exit_by=config.hard_exit_by,
+        entry_premium=fill.fill_price, stop=filled.stop, trailing_distance=filled.trailing_distance,
+        target=filled.target, max_hold=config.max_hold, hard_exit_by=config.hard_exit_by,
     )
     return open_position(
         symbol=instrument, exchange=exchange, strategy=strategy.name, direction=signal.direction,
-        entry_premium=fill.fill_price, lot_size=config.lot_size, lots=sizing.lots, opened_at=as_of,
-        exit_plan=exit_plan,
+        lot_size=config.lot_size, lots=sizing.lots, opened_at=as_of, exit_plan=exit_plan,
     )

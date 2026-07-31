@@ -55,6 +55,7 @@ from te.data.charges_loader import load_charge_rate_table
 from te.data.recorder import BarRecorder
 from te.domain.clock import DEFAULT_SESSION, IST, SessionWindow, is_market_open
 from te.domain.costs import ChargeRateTable
+from te.domain.geometry import AbsolutePointGeometry, ExitGeometry, PremiumPercentGeometry
 from te.domain.money import Paise
 from te.domain.symbols import FNO_UNDERLYING_EXCHANGES, build_future_symbol, next_monthly_expiry
 from te.engine.contract import ContractResolver, OptionContractResolver
@@ -366,6 +367,33 @@ def _current_premium_from_quotes(
     return _current_premium
 
 
+def _exit_geometry(settings: Settings) -> ExitGeometry:
+    """Percentages of premium when configured, else the historic absolute
+    distances — as ONE object, so the two forms can never both be live.
+
+    Previously both were passed to `CycleConfig` and resolved per use site,
+    which meant setting `paper_cycle_trailing_pct=None` to disable the trail
+    silently fell back to `paper_cycle_trailing_distance_paise=300` — a Rs 3
+    absolute trail, 3.68% of that day's Rs 81.50 NIFTY premium, and the same
+    trail that had closed 14 of 14 trades on `trailing_stop` at a 3.1-minute
+    average hold."""
+    if settings.paper_cycle_stop_pct is not None and settings.paper_cycle_target_pct is not None:
+        return PremiumPercentGeometry(
+            stop_pct=settings.paper_cycle_stop_pct,
+            target_pct=settings.paper_cycle_target_pct,
+            trailing_pct=settings.paper_cycle_trailing_pct,
+        )
+    return AbsolutePointGeometry(
+        stop_distance=Paise(settings.paper_cycle_stop_distance_paise),
+        target_distance=Paise(settings.paper_cycle_target_distance_paise),
+        trailing_distance=(
+            Paise(settings.paper_cycle_trailing_distance_paise)
+            if settings.paper_cycle_trailing_distance_paise is not None
+            else None
+        ),
+    )
+
+
 def _default_cycle_config(settings: Settings) -> CycleConfig:
     """Builds `CycleConfig` entirely from `Settings.paper_cycle_*` — never a
     hardcoded literal, per the task. An empty `paper_cycle_instruments` is a
@@ -381,13 +409,7 @@ def _default_cycle_config(settings: Settings) -> CycleConfig:
         capital=Paise(settings.paper_cycle_capital_paise),
         risk_budget_pct=settings.paper_cycle_risk_budget_pct,
         min_edge_multiple=settings.paper_cycle_min_edge_multiple,
-        stop_distance=Paise(settings.paper_cycle_stop_distance_paise),
-        target_distance=Paise(settings.paper_cycle_target_distance_paise),
-        trailing_distance=(
-            Paise(settings.paper_cycle_trailing_distance_paise)
-            if settings.paper_cycle_trailing_distance_paise is not None
-            else None
-        ),
+        exit_geometry=_exit_geometry(settings),
         max_hold=dt.timedelta(minutes=settings.paper_cycle_max_hold_minutes),
         hard_exit_by=settings.paper_cycle_hard_exit_by,
         min_minutes_before_hard_exit=settings.paper_cycle_min_minutes_before_hard_exit,
@@ -396,9 +418,6 @@ def _default_cycle_config(settings: Settings) -> CycleConfig:
             max_concurrent_positions=settings.paper_cycle_max_concurrent_positions,
             max_trades_per_day=settings.paper_cycle_max_trades_per_day,
         ),
-        stop_pct=settings.paper_cycle_stop_pct,
-        target_pct=settings.paper_cycle_target_pct,
-        trailing_pct=settings.paper_cycle_trailing_pct,
         max_entries_per_underlying_per_day=settings.paper_cycle_max_entries_per_underlying_per_day,
     )
 

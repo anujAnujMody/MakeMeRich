@@ -27,7 +27,7 @@ import datetime as dt
 import pytest
 
 from te.domain.money import Paise
-from te.domain.signal import ExitPlan, trailing_activation_for
+from te.domain.signal import ExitPlan
 from te.engine.exits import evaluate_position, open_position
 
 ENTRY = Paise(67_630)  # Rs 676.30 — a real BANKNIFTY entry from that session
@@ -40,16 +40,16 @@ NOW = OPENED_AT + dt.timedelta(minutes=1)
 
 def _position() -> object:
     plan = ExitPlan(
+        entry_premium=ENTRY,
         stop=STOP,
         trailing_distance=TRAIL,
-        trailing_activation=trailing_activation_for(ENTRY, TRAIL),
         target=TARGET,
         max_hold=dt.timedelta(hours=3),
         hard_exit_by=dt.time(15, 20),
     )
     return open_position(
         symbol="BANKNIFTY25AUG2657200PE", exchange="NFO", strategy="orb", direction="long_put",
-        entry_premium=ENTRY, lot_size=30, lots=1, opened_at=OPENED_AT, exit_plan=plan,
+        lot_size=30, lots=1, opened_at=OPENED_AT, exit_plan=plan,
     )
 
 
@@ -129,16 +129,21 @@ def test_the_ratchet_never_loosens_when_price_falls_back() -> None:
     assert position.current_stop == locked, "the trailing stop moved backward"
 
 
-def test_an_activation_below_the_hard_stop_is_rejected_at_construction() -> None:
-    """A trail that would engage BELOW the hard stop loosens risk instead of
-    tightening it — reject it where it is built, not after it has traded."""
-    with pytest.raises(ValueError, match="BELOW the hard stop"):
+def test_the_trail_can_no_longer_be_built_below_the_hard_stop() -> None:
+    """Activation is DERIVED (`entry + trailing_distance`), so a trail that
+    engages below the hard stop is now unrepresentable rather than merely
+    rejected — it would require an entry already at or under its own stop,
+    which the constructor refuses outright."""
+    plan = ExitPlan(
+        entry_premium=ENTRY, stop=STOP, trailing_distance=TRAIL, target=TARGET,
+        max_hold=dt.timedelta(hours=3), hard_exit_by=dt.time(15, 20),
+    )
+    assert plan.trailing_activation is not None
+    assert plan.trailing_activation - TRAIL == ENTRY > STOP
+
+    with pytest.raises(ValueError, match="must sit between stop"):
         ExitPlan(
-            stop=STOP,
-            trailing_distance=TRAIL,
-            # Engages at 0.90x - 0.15x = 0.75x entry, below the 0.80x stop.
-            trailing_activation=Paise(int(ENTRY * 0.90)),
-            target=TARGET,
-            max_hold=dt.timedelta(hours=3),
-            hard_exit_by=dt.time(15, 20),
+            entry_premium=Paise(int(ENTRY * 0.70)),  # already below its own stop
+            stop=STOP, trailing_distance=TRAIL, target=TARGET,
+            max_hold=dt.timedelta(hours=3), hard_exit_by=dt.time(15, 20),
         )

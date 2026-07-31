@@ -115,9 +115,9 @@ def test_max_concurrent_positions_blocks_at_limit(db_path: Path) -> None:
     factory = _session_factory(db_path)
     config = _config(max_concurrent_positions=1)
     plan = ExitPlan(
+        entry_premium=Paise(2_000),
         stop=Paise(1_800),
         trailing_distance=Paise(200),
-        trailing_activation=Paise(2_200),
         target=Paise(3_000),
         max_hold=dt.timedelta(hours=3),
         hard_exit_by=dt.time(15, 20),

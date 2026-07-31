@@ -33,6 +33,7 @@ import sqlalchemy as sa
 from sqlalchemy.orm import Session, sessionmaker
 
 from te.persistence.db import session_scope
+from te.sqltypes import UtcDateTime
 
 metadata = sa.MetaData()
 
@@ -44,7 +45,7 @@ ml_maturity_state = sa.Table(
     metadata,
     sa.Column("id", sa.Integer, primary_key=True),
     sa.Column("stage", sa.String(16), nullable=False),
-    sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("updated_at", UtcDateTime, nullable=False),
 )
 
 #: Audit trail for every stage promotion/demotion ever made — evidence
@@ -54,7 +55,7 @@ model_promotions = sa.Table(
     "model_promotions",
     metadata,
     sa.Column("id", sa.Integer, primary_key=True, autoincrement=True),
-    sa.Column("ts", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("ts", UtcDateTime, nullable=False),
     sa.Column("from_stage", sa.String(16), nullable=False),
     sa.Column("to_stage", sa.String(16), nullable=False),
     sa.Column("actor", sa.String(64), nullable=False),
@@ -69,7 +70,7 @@ ml_predictions = sa.Table(
     "ml_predictions",
     metadata,
     sa.Column("id", sa.Integer, primary_key=True, autoincrement=True),
-    sa.Column("ts", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("ts", UtcDateTime, nullable=False),
     sa.Column("cycle_id", sa.Integer, nullable=False),
     sa.Column("instrument", sa.String(64), nullable=False),
     sa.Column("feature_spec_name", sa.String(32), nullable=False),
@@ -87,7 +88,7 @@ _engine_state = sa.Table(
     sa.MetaData(),
     sa.Column("key", sa.String(64), primary_key=True),
     sa.Column("value", sa.Text, nullable=False),
-    sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("updated_at", UtcDateTime, nullable=False),
 )
 
 _MODE_KEY = "mode"

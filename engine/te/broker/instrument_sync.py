@@ -22,6 +22,7 @@ import datetime as dt
 import sqlalchemy as sa
 
 from te.broker.openalgo_rest import OpenAlgoRestClient, SymbolMeta
+from te.sqltypes import UtcDateTime
 
 metadata = sa.MetaData()
 
@@ -37,7 +38,7 @@ instruments = sa.Table(
     sa.Column("lot_size", sa.Integer, nullable=False),
     sa.Column("tick_size", sa.Float, nullable=False),
     sa.Column("source", sa.String(32), nullable=False, default="openalgo"),
-    sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("updated_at", UtcDateTime, nullable=False),
 )
 
 #: The `instruments.source` value written by this module — every row here

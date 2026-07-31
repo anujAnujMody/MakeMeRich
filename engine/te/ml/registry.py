@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from te.ml.model import MetaModel
 from te.persistence.db import session_scope
+from te.sqltypes import UtcDateTime
 
 metadata = sa.MetaData()
 
@@ -39,7 +40,7 @@ model_registry = sa.Table(
     sa.Column("pbo", sa.Float, nullable=False),
     sa.Column("n_trials_at_training", sa.Integer, nullable=False),
     sa.Column("n_labeled_samples", sa.Integer, nullable=False),
-    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("created_at", UtcDateTime, nullable=False),
     sa.Column("notes", sa.Text, nullable=False, default=""),
 )
 

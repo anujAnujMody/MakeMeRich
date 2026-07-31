@@ -19,10 +19,9 @@ OPENED_AT = dt.datetime(2026, 7, 29, 9, 45, tzinfo=IST)
 
 def _plan(**overrides: object) -> ExitPlan:
     defaults: dict[str, object] = {
+        "entry_premium": Paise(2_000),
         "stop": Paise(1_800),
         "trailing_distance": Paise(200),
-        # entry 2_000 + trail 200; engages at 2_000, above the 1_800 stop.
-        "trailing_activation": Paise(2_200),
         "target": Paise(3_000),
         "max_hold": dt.timedelta(hours=3),
         "hard_exit_by": dt.time(15, 20),
@@ -37,7 +36,6 @@ def _position(**overrides: object) -> OpenPosition:
         "exchange": "NFO",
         "strategy": "orb",
         "direction": "long_call",
-        "entry_premium": Paise(2_000),
         "lot_size": 65,
         "lots": 1,
         "opened_at": OPENED_AT,
@@ -56,7 +54,6 @@ def test_every_open_position_has_an_exit_plan() -> None:
             exchange="NFO",
             strategy="orb",
             direction="long_call",
-            entry_premium=Paise(2_000),
             lot_size=65,
             lots=1,
             opened_at=OPENED_AT,
@@ -69,7 +66,6 @@ def test_every_open_position_has_an_exit_plan() -> None:
         "exchange": "NFO",
         "strategy": "orb",
         "direction": "long_call",
-        "entry_premium": Paise(2_000),
         "lot_size": 65,
         "lots": 1,
         "opened_at": OPENED_AT,
@@ -81,6 +77,14 @@ def test_every_open_position_has_an_exit_plan() -> None:
 def test_open_position_seeds_current_stop_from_plan() -> None:
     position = _position()
     assert position.current_stop == position.exit_plan.stop
+
+
+def test_entry_premium_is_stored_once_on_the_plan() -> None:
+    """`OpenPosition.entry_premium` reads through to the plan. Held in both
+    places, a position and its own exit levels could disagree about what was
+    paid — and the levels are derived from it."""
+    position = _position()
+    assert position.entry_premium == position.exit_plan.entry_premium == Paise(2_000)
 
 
 def test_trailing_stop_only_ratchets_forward() -> None:
@@ -180,7 +184,7 @@ def test_hard_exit_before_close_fires() -> None:
 
 
 def test_no_trailing_distance_means_static_stop_only() -> None:
-    position = _position(exit_plan=_plan(trailing_distance=None, trailing_activation=None))
+    position = _position(exit_plan=_plan(trailing_distance=None))
     now = OPENED_AT + dt.timedelta(minutes=5)
     updated, decision = evaluate_position(position, current_premium=Paise(2_500), now=now)
 

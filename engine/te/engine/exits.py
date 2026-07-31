@@ -48,12 +48,18 @@ class OpenPosition:
     exchange: str
     strategy: str
     direction: Direction
-    entry_premium: Paise
     lot_size: int
     lots: int
     opened_at: dt.datetime
     exit_plan: ExitPlan
     current_stop: Paise
+
+    @property
+    def entry_premium(self) -> Paise:
+        """Read through to the plan — ONE stored entry price. Holding it in
+        both places would let a position and its own exit levels disagree
+        about what was paid."""
+        return self.exit_plan.entry_premium
 
 
 @dataclass(frozen=True)
@@ -68,7 +74,6 @@ def open_position(
     exchange: str,
     strategy: str,
     direction: Direction,
-    entry_premium: Paise,
     lot_size: int,
     lots: int,
     opened_at: dt.datetime,
@@ -82,7 +87,6 @@ def open_position(
         exchange=exchange,
         strategy=strategy,
         direction=direction,
-        entry_premium=entry_premium,
         lot_size=lot_size,
         lots=lots,
         opened_at=opened_at,

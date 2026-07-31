@@ -16,6 +16,7 @@ from te.backtest.fills import BacktestFillEngine
 from te.data.barstore import BAR_COLUMNS, BarStore
 from te.domain.clock import IST
 from te.domain.costs import ChargeRates, CostModel
+from te.domain.geometry import AbsolutePointGeometry
 from te.domain.money import Paise
 from te.domain.pnl import net_pnl
 from te.strategy.orb import OrbParams, OrbStrategy
@@ -66,9 +67,9 @@ def _config() -> BacktestConfig:
         capital=Paise(30_000_00),
         risk_budget_pct=Decimal("2"),
         min_edge_multiple=Decimal("1"),
-        stop_distance=Paise(300),
-        target_distance=Paise(200),
-        trailing_distance=None,
+        exit_geometry=AbsolutePointGeometry(
+            stop_distance=Paise(300), target_distance=Paise(200), trailing_distance=None
+        ),
         max_hold=dt.timedelta(hours=6),
         hard_exit_by=dt.time(15, 20),
         lot_size=65,
@@ -164,9 +165,11 @@ def test_backtest_rejects_zero_lot_sizing_silently_as_a_skip(store: BarStore, co
     fills = BacktestFillEngine(cost_model=cost_model)
     tiny_capital_config = BacktestConfig(
         capital=Paise(100),  # cannot afford even 1 lot at premium 108.00 x 65
-        risk_budget_pct=Decimal("2"), min_edge_multiple=Decimal("1"), stop_distance=Paise(300),
-        target_distance=Paise(200), trailing_distance=None, max_hold=dt.timedelta(hours=6),
-        hard_exit_by=dt.time(15, 20), lot_size=65,
+        risk_budget_pct=Decimal("2"), min_edge_multiple=Decimal("1"),
+        exit_geometry=AbsolutePointGeometry(
+            stop_distance=Paise(300), target_distance=Paise(200), trailing_distance=None
+        ),
+        max_hold=dt.timedelta(hours=6), hard_exit_by=dt.time(15, 20), lot_size=65,
     )
 
     result = run_backtest(

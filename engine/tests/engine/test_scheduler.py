@@ -19,6 +19,7 @@ from te.broker.openalgo_ws import Instrument, OpenAlgoWSClient
 from te.data.barstore import BarStore
 from te.data.recorder import BarRecorder
 from te.domain.clock import IST
+from te.domain.geometry import AbsolutePointGeometry
 from te.domain.money import Paise
 from te.engine import scheduler as scheduler_module
 from te.engine.scheduler import (
@@ -303,9 +304,9 @@ def _cycle_config() -> object:
         capital=Paise(2_500_000),
         risk_budget_pct=Decimal(2),
         min_edge_multiple=Decimal("1.2"),
-        stop_distance=Paise(700),
-        target_distance=Paise(1_500),
-        trailing_distance=Paise(300),
+        exit_geometry=AbsolutePointGeometry(
+            stop_distance=Paise(700), target_distance=Paise(1_500), trailing_distance=Paise(300)
+        ),
         max_hold=dt.timedelta(hours=3),
         hard_exit_by=dt.time(15, 20),
         risk_limits=RiskLimitsConfig(

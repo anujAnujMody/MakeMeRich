@@ -31,10 +31,11 @@ from te.data.barstore import BarStore
 from te.domain.clock import IST
 from te.domain.clock import assume_utc as _as_utc
 from te.domain.costs import CostModel
+from te.domain.geometry import ExitGeometry
 from te.domain.money import Paise
 from te.domain.orders import OrderRequest
 from te.domain.pnl import GrossPnl, mark_to_market_pnl, net_pnl
-from te.domain.signal import ExitPlan, Signal, trailing_activation_for
+from te.domain.signal import ExitPlan, Signal
 from te.engine.contract import ContractResolver
 from te.engine.exits import OpenPosition, evaluate_position, time_exit
 from te.engine.state import PIPELINE_STAGE_KEYS, PipelineStageTiming, set_last_cycle_pipeline
@@ -104,9 +105,11 @@ class CycleConfig:
     capital: Paise
     risk_budget_pct: Decimal
     min_edge_multiple: Decimal
-    stop_distance: Paise
-    target_distance: Paise
-    trailing_distance: Paise | None
+    #: Where this position's exits sit — ONE representation, either
+    #: percentages of premium or absolute distances, never both. See
+    #: `te.domain.geometry`: carrying both forms at once is what let
+    #: "trailing disabled" silently restore a Rs 3 absolute trail.
+    exit_geometry: ExitGeometry
     max_hold: dt.timedelta
     hard_exit_by: dt.time
     risk_limits: RiskLimitsConfig
@@ -121,24 +124,6 @@ class CycleConfig:
     #: by default so every pre-existing `CycleConfig` construction is
     #: unaffected.
     max_position_size_pct: Decimal = Decimal(100)
-    #: Stop/target as a PERCENTAGE of the entry premium. When set, these take
-    #: priority over the absolute `stop_distance`/`target_distance` above.
-    #: Absolute distances are index-point-scaled leftovers from before option
-    #: contracts were resolved — against a real premium they mean wildly
-    #: different things at ₹30 vs ₹300 (a ₹15 target is 50% of one and 5% of
-    #: the other). `None` keeps the absolute behaviour, so every pre-existing
-    #: `CycleConfig` and test is unaffected.
-    stop_pct: Decimal | None = None
-    target_pct: Decimal | None = None
-    #: Trailing distance as a PERCENTAGE of entry premium. Same index-point
-    #: problem as stop/target, but worse in effect: found live on
-    #: 2026-07-31, an absolute ₹3 trail against a ₹676 option premium is
-    #: 0.44% — tighter than tick-to-tick noise — and closed 14 of 14 trades
-    #: on `trailing_stop` at an average hold of 3.1 minutes, none of them
-    #: anywhere near their real stop or target. Option premium is several
-    #: times more volatile than the underlying in percentage terms, so an
-    #: option trail belongs in the tens of percent, not fractions of one.
-    trailing_pct: Decimal | None = None
     #: Max entries per underlying per session. The ORB literature converges
     #: on one or two (and on stopping for the day after two stop-outs) as a
     #: choppy-day over-trading guard. `2` follows that; set `1` for the
@@ -151,59 +136,6 @@ class CycleConfig:
     #: measured time-to-target distribution, never guessed — see
     #: `Settings.paper_cycle_min_minutes_before_hard_exit`.
     min_minutes_before_hard_exit: int = 0
-
-
-def _exit_levels(config: CycleConfig, entry_premium: Paise) -> tuple[Paise, Paise]:
-    """Stop/target for one entry. Percentage-based when `stop_pct`/
-    `target_pct` are configured, else the historic absolute distances.
-
-    Percentages are the correct form once a real option premium is being
-    traded: a fixed ₹15 target is 50% of a ₹30 premium and 5% of a ₹300 one,
-    so an absolute distance silently changes the strategy as premiums move."""
-    stop_distance = _pct_of(entry_premium, config.stop_pct) if config.stop_pct is not None else config.stop_distance
-    target_distance = (
-        _pct_of(entry_premium, config.target_pct) if config.target_pct is not None else config.target_distance
-    )
-    return Paise(entry_premium - stop_distance), Paise(entry_premium + target_distance)
-
-
-def _pct_of(premium: Paise, pct: Decimal) -> Paise:
-    """`pct` percent of `premium`, TRUNCATED toward zero.
-
-    One definition rather than three: the rounding is the load-bearing part
-    (tests pin the truncating form), so restating it per call site is how the
-    stop and the target quietly stop agreeing."""
-    return Paise(int(Decimal(int(premium)) * pct / Decimal(100)))
-
-
-def _uses_premium_percentages(config: CycleConfig) -> bool:
-    """Whether this config expresses exits as percentages of the option
-    premium rather than as absolute index-point distances."""
-    return config.stop_pct is not None or config.target_pct is not None
-
-
-def _trailing_distance(config: CycleConfig, entry_premium: Paise) -> Paise | None:
-    """Trailing distance for one entry.
-
-    In premium-percentage mode `trailing_pct` is the ONLY source, and `None`
-    means the trail is OFF. It must never fall back to `trailing_distance`:
-    those absolute values are index-point-scaled leftovers, and falling back
-    is not a neutral default — it silently re-enables the exact bug this
-    project has already been bitten by twice.
-
-    Found by review on 2026-07-31, after `paper_cycle_trailing_pct` was set
-    to `None` to disable the trail (so live behaviour would match the
-    barrier sweep, which modelled only stop/target/time). The fallback
-    quietly restored `paper_cycle_trailing_distance_paise = 300` — a Rs 3
-    absolute trail, 3.68% of that day's Rs 81.50 NIFTY premium — which is
-    the same Rs 3 trail that had closed 14 of 14 trades on `trailing_stop`
-    at a 3.1-minute average hold. "Disabled" had re-enabled it.
-    """
-    if _uses_premium_percentages(config):
-        if config.trailing_pct is None:
-            return None
-        return _pct_of(entry_premium, config.trailing_pct)
-    return config.trailing_distance
 
 
 def _resolve_instruments(config: CycleConfig) -> list[InstrumentConfig]:
@@ -259,14 +191,10 @@ def unrealized_pnl_paise(
 
 
 def _row_to_position(row: OpenPositionRow) -> OpenPosition:
-    trailing_distance = Paise(row.trailing_distance_paise) if row.trailing_distance_paise is not None else None
     exit_plan = ExitPlan(
+        entry_premium=Paise(row.entry_premium_paise),
         stop=Paise(row.stop_paise),
-        trailing_distance=trailing_distance,
-        # Derived, not stored — see `trailing_activation_for`. `current_stop`
-        # (the ratchet's actual state) IS persisted, so nothing about an
-        # already-trailing position is lost by recomputing the threshold.
-        trailing_activation=trailing_activation_for(Paise(row.entry_premium_paise), trailing_distance),
+        trailing_distance=Paise(row.trailing_distance_paise) if row.trailing_distance_paise is not None else None,
         target=Paise(row.target_paise),
         max_hold=dt.timedelta(seconds=row.max_hold_seconds),
         hard_exit_by=dt.time.fromisoformat(row.hard_exit_by),
@@ -276,7 +204,6 @@ def _row_to_position(row: OpenPositionRow) -> OpenPosition:
         exchange=row.exchange,
         strategy=row.strategy,
         direction=row.direction,  # type: ignore[arg-type]
-        entry_premium=Paise(row.entry_premium_paise),
         lot_size=row.lot_size,
         lots=row.lots,
         opened_at=_as_utc(row.opened_at),
@@ -533,7 +460,8 @@ def run_entry_cycle(
             # is guaranteed non-zero by it.
             entry_premium = contract.ask
 
-        stop_premium, target_premium = _exit_levels(config, entry_premium)
+        levels = config.exit_geometry.levels(entry_premium)
+        stop_premium, target_premium = levels.stop, levels.target
 
         sizing = size_position(
             capital=config.capital,
@@ -599,11 +527,10 @@ def run_entry_cycle(
         )
         client_order_id = execution.submit(request)
 
-        trailing_distance = _trailing_distance(config, entry_premium)
         exit_plan = ExitPlan(
+            entry_premium=entry_premium,
             stop=stop_premium,
-            trailing_distance=trailing_distance,
-            trailing_activation=trailing_activation_for(entry_premium, trailing_distance),
+            trailing_distance=levels.trailing_distance,
             target=target_premium,
             max_hold=config.max_hold,
             hard_exit_by=config.hard_exit_by,

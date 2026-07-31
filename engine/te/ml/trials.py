@@ -29,13 +29,15 @@ import datetime as dt
 
 import sqlalchemy as sa
 
+from te.sqltypes import UtcDateTime
+
 metadata = sa.MetaData()
 
 trial_ledger = sa.Table(
     "trial_ledger",
     metadata,
     sa.Column("id", sa.Integer, primary_key=True, autoincrement=True),
-    sa.Column("ts", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("ts", UtcDateTime, nullable=False),
     sa.Column("kind", sa.String(32), nullable=False),  # the `scope` n_trials() counts against
     sa.Column("config_hash", sa.String(64), nullable=False),
     sa.Column("sharpe", sa.Float, nullable=False),

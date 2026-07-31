@@ -33,7 +33,7 @@ from te.broker.simulated import SimulatedBroker
 from te.data.charges_loader import load_charge_rate_table
 from te.domain.costs import CostModel, select_rates
 from te.domain.money import Paise
-from te.domain.signal import ExitPlan, trailing_activation_for
+from te.domain.signal import ExitPlan
 from te.engine.cycle import run_exit_cycle, unrealized_pnl_paise
 from te.execution.manager import ExecutionManager
 from te.execution.store import OrderEventStore
@@ -72,9 +72,9 @@ def execution(session_factory, cost_model: CostModel):  # noqa: ANN001, ANN201
 
 def _seed(factory: sessionmaker[Session], *, hard_exit_by: dt.time = dt.time(15, 20)) -> None:
     plan = ExitPlan(
+        entry_premium=ENTRY,
         stop=Paise(8_000),  # -20%
         trailing_distance=Paise(1_500),
-        trailing_activation=trailing_activation_for(ENTRY, Paise(1_500)),
         target=Paise(14_000),  # +40%
         max_hold=dt.timedelta(hours=3),
         hard_exit_by=hard_exit_by,

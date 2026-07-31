@@ -19,6 +19,7 @@ from te.data.barstore import BAR_COLUMNS, BarStore
 from te.data.charges_loader import load_charge_rate_table
 from te.domain.clock import IST
 from te.domain.costs import CostModel, select_rates
+from te.domain.geometry import AbsolutePointGeometry, PremiumPercentGeometry
 from te.domain.money import Paise
 from te.engine.cycle import CycleConfig, InstrumentConfig, run_entry_cycle, run_exit_cycle
 from te.engine.state import get_last_cycle_pipeline
@@ -95,9 +96,9 @@ def _config(**overrides: object) -> CycleConfig:
         "capital": Paise(2_500_000),
         "risk_budget_pct": Decimal(2),
         "min_edge_multiple": Decimal("1.2"),
-        "stop_distance": Paise(700),
-        "target_distance": Paise(1_500),
-        "trailing_distance": Paise(300),
+        "exit_geometry": AbsolutePointGeometry(
+            stop_distance=Paise(700), target_distance=Paise(1_500), trailing_distance=Paise(300)
+        ),
         "max_hold": dt.timedelta(hours=3),
         "hard_exit_by": dt.time(15, 20),
         "risk_limits": RiskLimitsConfig(
@@ -786,10 +787,7 @@ def test_disabling_the_percentage_trail_does_not_fall_back_to_the_absolute_one(
     """
     store = _breakout_store(tmp_path)
     config = _config(
-        stop_pct=Decimal(20),
-        target_pct=Decimal(20),
-        trailing_pct=None,
-        trailing_distance=Paise(300),  # the leftover absolute value, still configured
+        exit_geometry=PremiumPercentGeometry(stop_pct=Decimal(20), target_pct=Decimal(20), trailing_pct=None)
     )
 
     run_entry_cycle(
@@ -818,7 +816,11 @@ def test_absolute_trailing_distance_still_applies_without_percentage_exits(
     index-point distances (backtests replayed from `option_bhav`, and every
     test predating percentage exits)."""
     store = _breakout_store(tmp_path)
-    config = _config(trailing_distance=Paise(300))  # no stop_pct/target_pct
+    config = _config(
+        exit_geometry=AbsolutePointGeometry(
+            stop_distance=Paise(700), target_distance=Paise(1_500), trailing_distance=Paise(300)
+        )
+    )
 
     run_entry_cycle(
         session_factory=session_factory,
