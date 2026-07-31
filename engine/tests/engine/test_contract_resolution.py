@@ -48,6 +48,10 @@ ON = dt.date(2026, 7, 29)
 OPTION_SYMBOL = "NIFTY04AUG2624350CE"
 OPTION_EXCHANGE = "NFO"
 OPTION_PREMIUM = Paise(9_655)
+#: The ask is what a BUY actually pays, so it — not the LTP — is the entry
+#: fill the engine must record. Half a rupee wide here, matching the ~0.1-0.4%
+#: spreads the live NIFTY chain showed through OTM5 on 2026-07-31.
+OPTION_ASK = Paise(9_660)
 OPTION_LOT_SIZE = 65
 
 
@@ -155,7 +159,7 @@ def _resolver(underlying: str, direction: Direction, as_of: dt.datetime) -> Reso
         lot_size=OPTION_LOT_SIZE,
         premium=OPTION_PREMIUM,
         bid=Paise(9_650),
-        ask=Paise(9_660),
+        ask=OPTION_ASK,
         underlying_ltp=24_358.9,
     )
 
@@ -193,7 +197,11 @@ def test_index_breakout_opens_a_position_on_a_real_option_contract(
 
     # The premium must be the OPTION's, not the index level. The old bug
     # stored 2_435_000p (₹24,350); the real premium is ~9_655p (₹96.55).
-    assert row.entry_premium_paise == int(OPTION_PREMIUM)
+    #
+    # Specifically the ASK, not the LTP: this is a BUY, so the ask is what is
+    # actually payable. Booking the entry at LTP handed the engine half the
+    # spread as free profit on every trade.
+    assert row.entry_premium_paise == int(OPTION_ASK)
     assert row.entry_premium_paise < 100_000, "premium is at index scale — the resolver was bypassed"
     assert row.lot_size == OPTION_LOT_SIZE
 
@@ -217,8 +225,11 @@ def test_stop_and_target_are_percentages_of_the_option_premium(
 
     with session_factory() as session:
         row = session.query(OpenPositionRow).one()
-    assert row.stop_paise == int(OPTION_PREMIUM) - int(int(OPTION_PREMIUM) * 20 / 100)
-    assert row.target_paise == int(OPTION_PREMIUM) + int(int(OPTION_PREMIUM) * 40 / 100)
+    # Percentages are taken off the ACTUAL entry fill (the ask), so the
+    # stop really is 20% of what was paid rather than 20% of a price the
+    # engine never traded at.
+    assert row.stop_paise == int(OPTION_ASK) - int(int(OPTION_ASK) * 20 / 100)
+    assert row.target_paise == int(OPTION_ASK) + int(int(OPTION_ASK) * 40 / 100)
 
 
 def test_trailing_distance_scales_with_the_option_premium(
@@ -246,11 +257,11 @@ def test_trailing_distance_scales_with_the_option_premium(
     with session_factory() as session:
         row = session.query(OpenPositionRow).one()
 
-    expected = int(int(OPTION_PREMIUM) * 15 / 100)
+    expected = int(int(OPTION_ASK) * 15 / 100)
     assert row.trailing_distance_paise == expected
     # The real point: the trail must be a meaningful fraction of premium,
     # not the ~0.4% that strangled every live trade.
-    assert row.trailing_distance_paise > int(OPTION_PREMIUM) * 5 // 100
+    assert row.trailing_distance_paise > int(OPTION_ASK) * 5 // 100
 
 
 def test_cost_gate_passes_once_the_premium_is_real(

@@ -282,18 +282,22 @@ def run_openalgo_relogin(settings: Settings) -> LoginResult:
     return result
 
 
-def _current_premium_from_bars(store: BarStore, as_of: dt.datetime) -> Callable[[OpenPositionRow], Paise]:
+def _current_premium_from_bars(store: BarStore, as_of: dt.datetime) -> Callable[[OpenPositionRow], Paise | None]:
     """The scheduled paper-cycle job's `current_premium` for `run_exit_cycle`
     — the latest CLOSED bar (via `bars_asof`, never a direct `BarStore.read`)
-    for the position's symbol. Falls back to the position's own entry
-    premium (a neutral, non-crashing mark) if no bar is visible yet at
-    `as_of`, e.g. immediately after `run_entry_cycle` opened it in the same
-    process before the WS recorder has appended a fresh bar."""
+    for the position's symbol.
 
-    def _current_premium(row: OpenPositionRow) -> Paise:
+    Returns `None` when no bar is visible at `as_of`. It previously returned
+    the position's own ENTRY premium, described as "a neutral, non-crashing
+    mark" — but there is no such thing as a neutral mark. Reporting entry as
+    the current price reads as "unchanged", which silently disables every
+    price-based exit and reports a P&L of exactly zero. `None` means unknown,
+    and the caller decides what unknown implies."""
+
+    def _current_premium(row: OpenPositionRow) -> Paise | None:
         df = bars_asof(store, row.symbol, as_of, lookback=dt.timedelta(minutes=5))
         if df.empty:
-            return Paise(row.entry_premium_paise)
+            return None
         last_close = float(df.iloc[-1]["c"])
         return Paise(int(round(last_close * 100)))
 
@@ -302,9 +306,9 @@ def _current_premium_from_bars(store: BarStore, as_of: dt.datetime) -> Callable[
 
 def _current_premium_from_quotes(
     rest_client: OpenAlgoRestClient, store: BarStore, as_of: dt.datetime
-) -> Callable[[OpenPositionRow], Paise]:
+) -> Callable[[OpenPositionRow], Paise | None]:
     """Marks open positions from a LIVE quote on the position's own symbol,
-    falling back to `_current_premium_from_bars`.
+    falling back to bars, then to `None` (unknown).
 
     Necessary because open positions are option contracts, and the WS
     recorder only subscribes to the four index spot symbols
@@ -314,21 +318,29 @@ def _current_premium_from_quotes(
     stop/target/trailing exit could ever fire and positions would only ever
     close on the time exit.
 
+    Marks at the **bid**, not the LTP. The position is long the option, so
+    the price that matters is the one it could actually be SOLD at; LTP is
+    the last trade at either side of the book and systematically flatters
+    both the mark-to-market and the recorded exit fill. Falls back to LTP
+    only when the book carries no usable bid.
+
     Polling one quote per open position per cycle (a handful per minute) is
     deliberately preferred over widening the WS subscription:
     `OpenAlgoWSClient.subscribe()` only takes effect on the next reconnect,
     so a contract chosen mid-session would not stream until then."""
     from_bars = _current_premium_from_bars(store, as_of)
 
-    def _current_premium(row: OpenPositionRow) -> Paise:
+    def _current_premium(row: OpenPositionRow) -> Paise | None:
         try:
             quote = rest_client.quotes(row.symbol, row.exchange)
         except OpenAlgoRestError:
             logger.warning("quote failed for open position; falling back to bars", symbol=row.symbol)
             return from_bars(row)
-        if quote.ltp <= 0:
-            return from_bars(row)
-        return Paise(int(round(quote.ltp * 100)))
+        if quote.bid > 0:
+            return Paise(int(round(quote.bid * 100)))
+        if quote.ltp > 0:
+            return Paise(int(round(quote.ltp * 100)))
+        return from_bars(row)
 
     return _current_premium
 
@@ -546,6 +558,16 @@ class PaperCycleRunner:
             on=as_of.date(),
         )
 
+        # ONE premium source for both cycles: the entry cycle's risk gates
+        # price open positions to decide whether to halt, and the exit cycle
+        # prices them to decide whether to close. Those two must never see
+        # different marks for the same position in the same minute.
+        premium_source = (
+            _current_premium_from_quotes(self.rest_client, self.store, as_of)
+            if self.rest_client is not None
+            else _current_premium_from_bars(self.store, as_of)
+        )
+
         if not halted:
             run_entry_cycle(
                 session_factory=self.session_factory,
@@ -555,16 +577,13 @@ class PaperCycleRunner:
                 config=config,
                 as_of=as_of,
                 contract_resolver=self.contract_resolver,
+                current_premium=premium_source,
             )
         run_exit_cycle(
             session_factory=self.session_factory,
             execution=execution,
             cost_model=cost_model,
-            current_premium=(
-                _current_premium_from_quotes(self.rest_client, self.store, as_of)
-                if self.rest_client is not None
-                else _current_premium_from_bars(self.store, as_of)
-            ),
+            current_premium=premium_source,
             as_of=as_of,
         )
         # `paused` and `halted` both block entries and both still run exits,

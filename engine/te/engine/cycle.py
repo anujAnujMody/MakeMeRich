@@ -23,6 +23,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal
 
+import structlog
 from sqlalchemy.orm import Session, sessionmaker
 
 from te.data.asof import latest_close_paise
@@ -35,7 +36,7 @@ from te.domain.orders import OrderRequest
 from te.domain.pnl import GrossPnl, mark_to_market_pnl, net_pnl
 from te.domain.signal import ExitPlan, Signal, trailing_activation_for
 from te.engine.contract import ContractResolver
-from te.engine.exits import OpenPosition, evaluate_position
+from te.engine.exits import OpenPosition, evaluate_position, time_exit
 from te.engine.state import PIPELINE_STAGE_KEYS, PipelineStageTiming, set_last_cycle_pipeline
 from te.execution.manager import ExecutionManager
 from te.ml.gates import MLHook, MLInfluence
@@ -49,9 +50,11 @@ from te.persistence.repos.paper_trading import (
     open_positions,
     record_cycle,
     record_evaluation,
+    record_risk_event,
     record_skipped_signal,
     total_net_pnl_paise,
     underlying_entries_today,
+    update_last_mark,
     update_trailing_stop,
 )
 from te.risk.killswitch import KillSwitchTrippedError, is_currently_throttled
@@ -68,6 +71,8 @@ from te.risk.regime import DEFAULT_REGIME_THROTTLE_CONFIG, compose_size_multipli
 from te.risk.sizing import size_position
 from te.strategy.context import StrategyContext
 from te.strategy.registry import get as get_strategy
+
+logger = structlog.get_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -176,7 +181,12 @@ def _resolve_instruments(config: CycleConfig) -> list[InstrumentConfig]:
 
 
 def unrealized_pnl_paise(
-    session: Session, *, store: BarStore, cost_model: CostModel, as_of: dt.datetime
+    session: Session,
+    *,
+    store: BarStore,
+    cost_model: CostModel,
+    as_of: dt.datetime,
+    current_premium: Callable[[OpenPositionRow], Paise | None] | None = None,
 ) -> Paise:
     """Sum of every open position's mark-to-market P&L (negative when
     underwater), via the same `mark_to_market_pnl` formula a real close
@@ -184,10 +194,23 @@ def unrealized_pnl_paise(
     halt sees unrealized losses too, not only realized ones — see that
     function's docstring for why the check itself can't compute this
     (pricing a mark needs a `BarStore`/`CostModel`, both above `te.risk` in
-    the layer rule)."""
+    the layer rule).
+
+    `current_premium` MUST be supplied on the live path. Without it this
+    falls back to `store`, and an option contract has no recorded bars at
+    all (only the four index spot symbols are subscribed) — so every mark
+    resolved to the position's own entry premium and this function returned
+    ~0 no matter how far underwater the book actually was. The daily-loss
+    halt and the drawdown breaker were reading that zero and could not see
+    an open loss of any size. The parameter is optional only so that
+    backtest/test callers, which price from a real bar store, keep working
+    unchanged."""
     total = 0
     for row in open_positions(session):
-        current = Paise(
+        marked: Paise | None = current_premium(row) if current_premium is not None else None
+        if marked is None and row.last_mark_paise is not None:
+            marked = Paise(row.last_mark_paise)
+        current = marked if marked is not None else Paise(
             latest_close_paise(store, row.symbol, as_of, fallback=row.entry_premium_paise)
         )
         total += int(
@@ -240,6 +263,7 @@ def run_entry_cycle(
     as_of: dt.datetime,
     ml_hook: MLHook | None = None,
     contract_resolver: ContractResolver | None = None,
+    current_premium: Callable[[OpenPositionRow], Paise | None] | None = None,
 ) -> int:
     """One fetch->analyze->risk->decide->act pass across every configured
     instrument. Returns the persisted `cycle_id`.
@@ -316,7 +340,9 @@ def run_entry_cycle(
     with session_scope(session_factory) as session:
         try:
             check_killswitch(session)
-            unrealized = unrealized_pnl_paise(session, store=store, cost_model=cost_model, as_of=as_of)
+            unrealized = unrealized_pnl_paise(
+                session, store=store, cost_model=cost_model, as_of=as_of, current_premium=current_premium
+            )
             equity = Paise(int(config.capital) + int(total_net_pnl_paise(session)) + int(unrealized))
             check_daily_loss_limit(
                 session, config.risk_limits, on=as_of.date(), now=as_of, unrealized_pnl_paise=unrealized
@@ -453,7 +479,14 @@ def run_entry_cycle(
             trade_symbol = contract.symbol
             trade_exchange = contract.exchange
             lot_size = contract.lot_size
-            entry_premium = contract.premium
+            # Buy at the ASK, not the LTP. This is a BUY order, so the ask is
+            # the price actually payable; LTP is the last trade on either
+            # side of the book. Using LTP booked the half-spread as free
+            # profit on entry (and the exit mark does the same at the bid),
+            # which on a 0.8%-spread contract silently overstated every
+            # round trip. `ask` is already fetched for the spread guard and
+            # is guaranteed non-zero by it.
+            entry_premium = contract.ask
 
         stop_premium, target_premium = _exit_levels(config, entry_premium)
 
@@ -556,16 +589,17 @@ def run_exit_cycle(
     session_factory: sessionmaker[Session],
     execution: ExecutionManager,
     cost_model: CostModel,
-    current_premium: Callable[[OpenPositionRow], Paise],
+    current_premium: Callable[[OpenPositionRow], Paise | None],
     as_of: dt.datetime,
 ) -> list[str]:
     """Evaluates exits on every currently open position. `current_premium`
     supplies the live mark for one position's symbol (the caller's job to
     wire to a real quote — kept a callable here so this stays testable
-    without a broker/quote feed). Returns the `client_order_id`s of every
-    position closed this cycle. Not gated by the kill switch — exiting a
-    position is risk-REDUCING and should still be able to run during a
-    halt; only new entries (`run_entry_cycle`) are blocked."""
+    without a broker/quote feed), returning `None` when the position cannot
+    be priced this cycle. Returns the `client_order_id`s of every position
+    closed this cycle. Not gated by the kill switch — exiting a position is
+    risk-REDUCING and should still be able to run during a halt; only new
+    entries (`run_entry_cycle`) are blocked."""
     closed: list[str] = []
     # ONE session for the whole loop: the rows `open_positions()` returns are
     # already the live ORM objects to write through, so there is no need to
@@ -574,8 +608,42 @@ def run_exit_cycle(
         rows = open_positions(session)
         for row in rows:
             position = _row_to_position(row)
-            premium = current_premium(row)
-            updated, decision = evaluate_position(position, current_premium=premium, now=as_of)
+            # One bad symbol must not abort exit management for every OTHER
+            # open position: a persistent malformed quote envelope on one
+            # contract would otherwise block stops and targets on all of them.
+            try:
+                premium = current_premium(row)
+            except Exception:  # noqa: BLE001 — deliberately broad, see above
+                logger.exception("pricing an open position raised; treating as unpriceable", symbol=row.symbol)
+                premium = None
+
+            fresh = premium is not None
+            if premium is not None:
+                update_last_mark(session, row, premium, as_of)
+            elif row.last_mark_paise is not None:
+                premium = Paise(row.last_mark_paise)
+
+            if premium is None:
+                # Never priced since it opened, so not even a stale mark
+                # exists. There is nothing honest to act on: acting on the
+                # entry premium is what made stops undetectable in the first
+                # place. Leave it open and make the gap visible.
+                logger.error("open position has never been priced; exits cannot be evaluated", symbol=row.symbol)
+                record_risk_event(
+                    session, kind="position_unpriceable", ts=as_of,
+                    detail=f"{row.symbol}: no quote, no bar and no previous mark — exits not evaluated",
+                )
+                continue
+
+            if fresh:
+                updated, decision = evaluate_position(position, current_premium=premium, now=as_of)
+            else:
+                # Stale mark: the clock-driven exits MUST still fire (a quote
+                # outage cannot be allowed to strand a position past 15:20),
+                # but a stop, target or trail ratchet off a stale price would
+                # be acting on information we do not have.
+                logger.warning("marking position from a stale price", symbol=row.symbol, paise=int(premium))
+                updated, decision = position, time_exit(position, now=as_of, exit_premium=premium)
 
             if decision is None:
                 # Only write when the trailing stop actually ratcheted —

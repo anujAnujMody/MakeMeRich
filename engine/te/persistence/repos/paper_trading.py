@@ -188,6 +188,14 @@ def update_trailing_stop(session: Session, row: OpenPositionRow, new_stop: Paise
     row.current_stop_paise = int(new_stop)
 
 
+def update_last_mark(session: Session, row: OpenPositionRow, premium: Paise, at: dt.datetime) -> None:
+    """Record a SUCCESSFUL live mark. Only ever called with a real observed
+    price — never a fallback — so `last_mark_paise` stays a fact rather than
+    an assumption, and `last_mark_at` measures how stale that fact is."""
+    row.last_mark_paise = int(premium)
+    row.last_mark_at = _utc(at)
+
+
 def mark_position_closed(session: Session, row: OpenPositionRow, *, closed_at: dt.datetime) -> None:
     row.closed_at = _utc(closed_at)
 

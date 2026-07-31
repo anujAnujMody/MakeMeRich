@@ -298,6 +298,21 @@ class OpenPositionRow(Base):
     opened_at: Mapped[dt.datetime] = mapped_column(UtcDateTime, nullable=False)
     closed_at: Mapped[dt.datetime | None] = mapped_column(UtcDateTime, nullable=True)
 
+    #: Last price this position was successfully marked at, and when.
+    #:
+    #: An option contract is chosen dynamically per signal, so it is never in
+    #: the WS recorder's subscription list and has NO recorded bars — the only
+    #: live mark is a per-cycle REST quote. When that quote fails, the engine
+    #: used to fall back to the position's own entry premium, which reads as
+    #: "price unchanged": no stop, target or trail could fire, and any exit
+    #: recorded a fabricated P&L of exactly zero. Persisting the last real
+    #: observation gives the fallback an honest value and makes staleness
+    #: visible (`last_mark_at` vs now) instead of silent.
+    #:
+    #: NULL only between opening a position and its first successful mark.
+    last_mark_paise: Mapped[int | None] = mapped_column(nullable=True)
+    last_mark_at: Mapped[dt.datetime | None] = mapped_column(UtcDateTime, nullable=True)
+
 
 class TradeRow(Base):
     """A closed round-trip trade. NO bare `pnl` column, per the plan's

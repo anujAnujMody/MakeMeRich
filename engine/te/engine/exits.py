@@ -103,6 +103,22 @@ def next_trailing_stop(
     return Paise(max(current_stop, candidate))
 
 
+def time_exit(position: OpenPosition, *, now: dt.datetime, exit_premium: Paise) -> ExitDecision | None:
+    """The two exits that depend only on the CLOCK, never on price.
+
+    Split out of `evaluate_position` so the caller can still enforce them
+    when the position cannot be priced. A quote outage must not be able to
+    strand a position past `hard_exit_by` — but equally, a stop or target
+    must never fire off a stale price, so the two kinds of exit need to be
+    reachable independently. See `te.engine.cycle.run_exit_cycle`."""
+    plan = position.exit_plan
+    if now.astimezone(IST).timetz().replace(tzinfo=None) >= plan.hard_exit_by:
+        return ExitDecision(reason="time", exit_premium=exit_premium)
+    if now - position.opened_at >= plan.max_hold:
+        return ExitDecision(reason="time", exit_premium=exit_premium)
+    return None
+
+
 def evaluate_position(
     position: OpenPosition,
     *,
@@ -114,15 +130,11 @@ def evaluate_position(
     `None` when the position stays open (with its trailing stop possibly
     ratcheted forward); otherwise it names which of stop / trailing_stop /
     target / time fired."""
-    plan = position.exit_plan
-    now_ist = now.astimezone(IST)
+    time_decision = time_exit(position, now=now, exit_premium=current_premium)
+    if time_decision is not None:
+        return position, time_decision
 
-    # Hard exit before close and max-hold fire regardless of stop/target/
-    # trail state — a position must never be left open past session close.
-    if now_ist.timetz().replace(tzinfo=None) >= plan.hard_exit_by:
-        return position, ExitDecision(reason="time", exit_premium=current_premium)
-    if now - position.opened_at >= plan.max_hold:
-        return position, ExitDecision(reason="time", exit_premium=current_premium)
+    plan = position.exit_plan
 
     if current_premium >= plan.target:
         return position, ExitDecision(reason="target", exit_premium=current_premium)
