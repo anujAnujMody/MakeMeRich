@@ -50,17 +50,13 @@ import argparse
 import datetime as dt
 import sys
 from collections import Counter
+from decimal import Decimal
 
-from scripts.label_replay_firings import (
-    ATM_PARAMS,
-    MAX_HOLD,
-    RATES_VERIFIED_FROM,
-    round_trip_cost_in_index_points,
-)
+from scripts.label_replay_firings import MAX_HOLD, RATES_VERIFIED_FROM
 from te.data.barstore import BarStore
 from te.data.charges_loader import load_charge_rate_table
 from te.domain.costs import CostModel, select_rates
-from te.domain.money import Paise
+from te.ml.barriers import ATM_SNAPSHOTS, index_barriers, round_trip_cost_in_index_points
 from te.ml.labeling import label_firings_from_evaluations
 from te.persistence.db import make_engine, make_session_factory
 from te.settings import Settings
@@ -79,26 +75,13 @@ COMBOS: tuple[tuple[float, float], ...] = (
 )
 
 
-def barriers_for(symbol: str, stop_pct: float, target_pct: float) -> tuple[Paise, Paise]:
-    """Premium-percentage barriers as INDEX-point distances, in paise.
-
-    Same delta conversion as `scripts.label_replay_firings.index_barriers`,
-    but parameterised by the percentages under test.
-    """
-    premium, delta, _spot, _dte, _exch = ATM_PARAMS[symbol]
-    return (
-        Paise(int(round((stop_pct / 100 * premium) / delta * 100))),
-        Paise(int(round((target_pct / 100 * premium) / delta * 100))),
-    )
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--instruments", default="NIFTY,SENSEX")
     args = parser.parse_args()
 
     chosen = [s.strip().upper() for s in args.instruments.split(",") if s.strip()]
-    unknown = [s for s in chosen if s not in ATM_PARAMS]
+    unknown = [s for s in chosen if s not in ATM_SNAPSHOTS]
     if unknown:
         print(f"no measured ATM params for: {', '.join(unknown)}", file=sys.stderr)
         return 2
@@ -117,13 +100,15 @@ def main() -> int:
         print(f"{'stop%':>6}{'tgt%':>6}{'R:R':>6}{'n':>7}{'target':>8}{'stop':>7}{'time':>7}"
               f"{'win':>7}{'breakeven':>11}{'expectancy':>12}")
         for stop_pct, target_pct in COMBOS:
-            stop, target = barriers_for(symbol, stop_pct, target_pct)
+            stop, target = index_barriers(
+                symbol, stop_pct=Decimal(str(stop_pct)), target_pct=Decimal(str(target_pct))
+            )
             firings = label_firings_from_evaluations(
                 session_factory,
                 store,
                 cost_model,
                 strategy="orb",
-                exchange=ATM_PARAMS[symbol][4],
+                exchange=ATM_SNAPSHOTS[symbol].exchange,
                 stop_distance=stop,
                 target_distance=target,
                 max_hold=MAX_HOLD,

@@ -43,17 +43,11 @@ from collections import defaultdict
 
 from sqlalchemy import select
 
-# Reuse the measured barriers/costs rather than restating them.
-from scripts.label_replay_firings import (  # noqa: E402
-    ATM_PARAMS,
-    MAX_HOLD,
-    RATES_VERIFIED_FROM,
-    index_barriers,
-    round_trip_cost_in_index_points,
-)
+from scripts.label_replay_firings import MAX_HOLD, RATES_VERIFIED_FROM, barriers
 from te.data.barstore import BarStore
 from te.data.charges_loader import load_charge_rate_table
 from te.domain.costs import CostModel, select_rates
+from te.ml.barriers import ATM_SNAPSHOTS, round_trip_cost_in_index_points
 from te.ml.labeling import label_firings_from_evaluations, parse_breakout
 from te.persistence.db import make_engine, make_session_factory
 from te.persistence.models import EvaluationConditionRow
@@ -81,12 +75,12 @@ def range_width_pct(actual: str) -> float | None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--instruments", default=",".join(ATM_PARAMS))
+    parser.add_argument("--instruments", default=",".join(ATM_SNAPSHOTS))
     parser.add_argument("--buckets", type=int, default=5)
     args = parser.parse_args()
 
     chosen = [s.strip().upper() for s in args.instruments.split(",") if s.strip()]
-    unknown = [s for s in chosen if s not in ATM_PARAMS]
+    unknown = [s for s in chosen if s not in ATM_SNAPSHOTS]
     if unknown:
         print(f"no measured ATM params for: {', '.join(unknown)}", file=sys.stderr)
         return 2
@@ -111,13 +105,13 @@ def main() -> int:
     print(f"breakeven win rate on these 2:1 barriers: {BREAKEVEN_WIN_RATE:.1%}\n")
 
     for symbol in chosen:
-        stop, target, _, _ = index_barriers(symbol)
+        stop, target = barriers(symbol)
         firings = label_firings_from_evaluations(
             session_factory,
             store,
             cost_model,
             strategy="orb",
-            exchange=ATM_PARAMS[symbol][4],
+            exchange=ATM_SNAPSHOTS[symbol].exchange,
             stop_distance=stop,
             target_distance=target,
             max_hold=MAX_HOLD,
