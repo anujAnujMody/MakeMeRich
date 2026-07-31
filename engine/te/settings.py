@@ -96,7 +96,28 @@ class Settings(BaseSettings):
     #: absolute `*_distance_paise` values above, which are index-point-scaled
     #: leftovers and mean different things at different premium levels.
     paper_cycle_stop_pct: Decimal | None = Decimal(20)
-    paper_cycle_target_pct: Decimal | None = Decimal(40)
+    #: 1:1 with the stop. Measured, not chosen: a barrier sweep over 1,192
+    #: labelled firings on NIFTY and SENSEX (2026-04-01 onward) found
+    #: expectancy strictly monotonic in the reward:risk ratio, on BOTH
+    #: instruments independently —
+    #:
+    #:   R:R   1.0     1.5     2.0     3.0
+    #:   NIFTY +0.056R -0.040R -0.148R -0.250R
+    #:   SNSX  +0.052R -0.111R -0.214R -0.273R
+    #:
+    #: The previous 40% target (1:2) was the second-worst configuration
+    #: tested and had nothing behind it — the Zerodha study it came from
+    #: specified only the STOP. A +40% option move inside a 3-hour hold is
+    #: simply too far: 125 of 555 NIFTY firings died on the clock at 1:2
+    #: versus 26 at 1:1.
+    #:
+    #: This change is justified by the ORDERING, which is consistent across
+    #: 4 ratios x 2 instruments with ~0.2R gaps. It is NOT a claim that 1:1
+    #: is profitable: pooled z=1.97 against an expected best-of-6 z of 1.89
+    #: under pure noise, i.e. indistinguishable from having tried six things.
+    #: 1:1 is also the tightest ratio tested, so this is the edge of the
+    #: grid rather than a located optimum.
+    paper_cycle_target_pct: Decimal | None = Decimal(20)
     #: Trailing distance as a % of entry premium. 15% sits between the 20%
     #: stop and the 40% target: it only starts binding once the trade is
     #: meaningfully in profit, rather than clipping winners in the first
@@ -104,7 +125,18 @@ class Settings(BaseSettings):
     #: option premium is several times more volatile in percentage terms,
     #: and ORB's edge is asymmetry (winners must be allowed to run), so an
     #: over-tight trail destroys the strategy rather than protecting it.
-    paper_cycle_trailing_pct: Decimal | None = Decimal(15)
+    #: DISABLED, to match the configuration that was actually measured.
+    #:
+    #: The barrier study simulated three exits only — stop, target and time.
+    #: It never modelled a trailing stop. Running one live while quoting that
+    #: study's expectancy would be reporting a number earned by a different
+    #: strategy. With a 1:1 target the trail is also nearly redundant: it
+    #: would activate at +20% (`entry + trailing_distance`), which is the
+    #: target itself.
+    #:
+    #: Re-enable only after a sweep that includes the trail as a fourth
+    #: barrier, so live and measured behaviour stay the same thing.
+    paper_cycle_trailing_pct: Decimal | None = None
     #: Reject a resolved contract whose bid-ask spread exceeds this % of LTP.
     #: Live NIFTY chain (2026-07-31) runs 0.1-0.4% through OTM5 and widens to
     #: ~1.1% by OTM8, so 1.0% admits the liquid band and excludes the rest.
