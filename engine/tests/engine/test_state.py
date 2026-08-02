@@ -24,14 +24,18 @@ from te.persistence.db import make_engine, make_session_factory
 from te.persistence.models import Base, Instrument
 from te.settings import Settings
 
+# Every value here sits at or below the hard ceilings in `te.engine.state`
+# (added 2026-08-01). It previously carried 40% position size, 2% risk per
+# trade and a daily loss limit of half the capital — all legal under the old
+# `(0, 100]` validation, none of them survivable as a policy.
 _DEFAULTS = AccountGuardrails(
     capital=Paise(2_000_000),
-    max_daily_loss=Paise(1_000_000),
-    max_position_size_pct=Decimal(40),
+    max_daily_loss=Paise(100_000),  # 5% of capital
+    max_position_size_pct=Decimal(25),
     max_drawdown_pct=Decimal(15),
     max_trades_per_day=20,
     max_concurrent_positions=5,
-    risk_per_trade_pct=Decimal(2),
+    risk_per_trade_pct=Decimal(1),
 )
 
 
@@ -92,8 +96,8 @@ def test_guardrails_fall_back_to_defaults_when_no_row_exists(session_factory) ->
 def test_guardrails_round_trip(session_factory) -> None:  # noqa: ANN001
     changed = AccountGuardrails(
         capital=Paise(3_000_000),
-        max_daily_loss=Paise(1_500_000),
-        max_position_size_pct=Decimal("35.5"),
+        max_daily_loss=Paise(150_000),  # 5% of capital
+        max_position_size_pct=Decimal("22.5"),
         max_drawdown_pct=Decimal(20),
         max_trades_per_day=10,
         max_concurrent_positions=2,
@@ -120,7 +124,13 @@ def test_lowering_capital_rebases_the_peak_equity_watermark_instead_of_looking_l
         set_peak_equity_paise(session, Paise(2_000_000))  # peak established at the original capital
         session.commit()
 
-    lowered = dataclasses.replace(_DEFAULTS, capital=Paise(1_400_000))  # capital cut by 600,000p
+    # The daily loss limit moves with capital in the SAME payload: it is
+    # defined as a percentage of capital, so cutting capital without cutting
+    # it would leave a limit above the 5% ceiling — `set_guardrails`
+    # validates the payload as a whole and rejects that, deliberately.
+    lowered = dataclasses.replace(
+        _DEFAULTS, capital=Paise(1_400_000), max_daily_loss=Paise(70_000)
+    )  # capital cut by 600,000p
     with session_factory() as session:
         set_guardrails(session, lowered)
         session.commit()
@@ -169,8 +179,8 @@ def test_guardrails_persist_across_restart(session_factory, tmp_path: Path) -> N
             session,
             AccountGuardrails(
                 capital=Paise(3_000_000),
-                max_daily_loss=Paise(1_500_000),
-                max_position_size_pct=Decimal(35),
+                max_daily_loss=Paise(150_000),  # 5% of capital
+                max_position_size_pct=Decimal(25),
                 max_drawdown_pct=Decimal(20),
                 max_trades_per_day=10,
                 max_concurrent_positions=2,

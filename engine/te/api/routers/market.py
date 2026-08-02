@@ -6,9 +6,11 @@ from te.api.db import session_factory, settings
 from te.api.provenance import set_provenance
 from te.api.schemas.dashboard import DailyPnL, EquityPoint, MarketSession, WatchlistItem
 from te.api.schemas.trading import MarketData
+from te.domain.calendar import TradingCalendar
 from te.domain.clock import DEFAULT_SESSION, IST, is_market_open
 from te.domain.money import Paise, rupees
 from te.engine.state import get_guardrails, guardrails_defaults_from_settings
+from te.engine.trading_calendar import get_calendar
 from te.persistence.repos.paper_trading import daily_pnl as repo_daily_pnl
 from te.persistence.repos.paper_trading import equity_curve as repo_equity_curve
 
@@ -83,33 +85,28 @@ def get_watchlist(response: Response) -> list[WatchlistItem]:
     return []
 
 
-def _next_trading_day(on: dt.date) -> dt.date:
-    """Next weekday after `on` — a calendar approximation, not an NSE
-    holiday calendar (none is wired up yet), so an exchange holiday will
-    still show the following weekday as the next session."""
-    nxt = on + dt.timedelta(days=1)
-    while nxt.weekday() >= 5:
-        nxt += dt.timedelta(days=1)
-    return nxt
+#: NSE decides the session for this engine's purposes — see
+#: `PaperCycleRunner.calendar_exchange` for why it is named, not assumed.
+_CALENDAR_EXCHANGE = "NSE"
 
 
-def _compute_market_session(now_ist: dt.datetime) -> MarketSession:
+def _compute_market_session(now_ist: dt.datetime, calendar: TradingCalendar) -> MarketSession:
     """Pure computation half of `get_market_status`, split out so tests can
-    drive every branch (open/pre-open/closed/weekend) without monkeypatching
-    `dt.datetime.now`."""
+    drive every branch (open/pre-open/closed/holiday/weekend) without
+    monkeypatching `dt.datetime.now`.
+
+    Every branch now consults the real broker-published holiday calendar
+    rather than weekday arithmetic. The old version named the day after a
+    holiday-Friday as "the next trading day" when it was a Saturday, and
+    reported a full open session on Republic Day."""
     today = now_ist.date()
+    window = calendar.session_window(today, exchange=_CALENDAR_EXCHANGE)
 
-    if today.weekday() >= 5:
-        next_open = dt.datetime.combine(_next_trading_day(today), DEFAULT_SESSION.start, tzinfo=IST)
-        return MarketSession(
-            status="closed",
-            label="Market closed — weekend",
-            nextEvent=next_open.isoformat(),
-            currentTime=now_ist.isoformat(),
-        )
+    if window is None:
+        return _closed(now_ist, calendar, label=_closed_label(today, calendar))
 
-    if is_market_open(now_ist):
-        close = dt.datetime.combine(today, DEFAULT_SESSION.end, tzinfo=IST)
+    if is_market_open(now_ist, window):
+        close = dt.datetime.combine(today, window.end, tzinfo=IST)
         return MarketSession(
             status="open",
             label="Market open",
@@ -117,8 +114,8 @@ def _compute_market_session(now_ist: dt.datetime) -> MarketSession:
             currentTime=now_ist.isoformat(),
         )
 
-    if now_ist.timetz().replace(tzinfo=None) < DEFAULT_SESSION.start:
-        open_ = dt.datetime.combine(today, DEFAULT_SESSION.start, tzinfo=IST)
+    if now_ist.timetz().replace(tzinfo=None) < window.start:
+        open_ = dt.datetime.combine(today, window.start, tzinfo=IST)
         return MarketSession(
             status="pre-open",
             label="Market opens soon",
@@ -126,19 +123,47 @@ def _compute_market_session(now_ist: dt.datetime) -> MarketSession:
             currentTime=now_ist.isoformat(),
         )
 
-    next_open = dt.datetime.combine(_next_trading_day(today), DEFAULT_SESSION.start, tzinfo=IST)
+    return _closed(now_ist, calendar, label="Market closed")
+
+
+def _closed_label(today: dt.date, calendar: TradingCalendar) -> str:
+    if not calendar.known:
+        return "Market status unavailable — no exchange calendar loaded"
+    if today.weekday() >= 5:
+        return "Market closed — weekend"
+    return "Market closed — exchange holiday"
+
+
+def _closed(now_ist: dt.datetime, calendar: TradingCalendar, *, label: str) -> MarketSession:
+    """`nextEvent` is the next REAL session open, or `""` when the calendar
+    cannot name one (nothing fetched, or the stored year has run out).
+    Guessing "the next weekday" is what this change exists to stop — it
+    named exchange holidays as trading days.
+
+    Empty string rather than `None` because the dashboard contract types
+    this field as a non-nullable `string` (`dashboard/src/types/index.ts`);
+    `MarketClock.tsx` already renders it behind a falsy guard, so `""`
+    displays nothing instead of a fabricated date."""
+    nxt = calendar.next_trading_day(now_ist.date(), exchange=_CALENDAR_EXCHANGE)
+    if nxt is None:
+        return MarketSession(status="closed", label=label, nextEvent="", currentTime=now_ist.isoformat())
+    window = calendar.session_window(nxt, exchange=_CALENDAR_EXCHANGE) or DEFAULT_SESSION
+    next_open = dt.datetime.combine(nxt, window.start, tzinfo=IST)
     return MarketSession(
-        status="closed",
-        label="Market closed",
-        nextEvent=next_open.isoformat(),
-        currentTime=now_ist.isoformat(),
+        status="closed", label=label, nextEvent=next_open.isoformat(), currentTime=now_ist.isoformat()
     )
 
 
 @router.get("/market-status", response_model=MarketSession)
 def get_market_status(response: Response) -> MarketSession:
-    """Current exchange session state, computed from the real IST session
-    window (`te.domain.clock`) — no broker connection required, since this
-    is exchange-calendar arithmetic, not live market data."""
-    set_provenance(response, not_ready_reason="computed from exchange calendar; no NSE holiday list wired up yet")
-    return _compute_market_session(dt.datetime.now(IST))
+    """Current exchange session state, from the real IST session window
+    (`te.domain.clock`) and the broker-published exchange holiday calendar
+    (`te.engine.trading_calendar`) — no live market-data connection needed,
+    since this is calendar arithmetic, not a quote."""
+    with session_factory() as session:
+        calendar = get_calendar(session)
+    if not calendar.known:
+        set_provenance(response, not_ready_reason="no exchange holiday calendar has been fetched yet")
+    else:
+        set_provenance(response, provenance="paper", sample_size=1)
+    return _compute_market_session(dt.datetime.now(IST), calendar)

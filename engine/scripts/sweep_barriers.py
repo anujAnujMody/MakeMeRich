@@ -47,17 +47,19 @@ the target comes in? — not for a winner to copy.
 from __future__ import annotations
 
 import argparse
-import datetime as dt
 import sys
 from collections import Counter
 from decimal import Decimal
+from functools import partial
 
 from scripts.label_replay_firings import MAX_HOLD, RATES_VERIFIED_FROM
 from te.data.barstore import BarStore
 from te.data.charges_loader import load_charge_rate_table
-from te.domain.costs import CostModel, select_rates
+from te.data.lot_size_history import UnknownLotSizeError, load_lot_size_history, lot_size_on
+from te.data.option_history import OptionContractIndex
+from te.domain.costs import CostModel
 from te.ml.barriers import ATM_SNAPSHOTS, index_barriers, round_trip_cost_in_index_points
-from te.ml.labeling import label_firings_from_evaluations
+from te.ml.labeling import RealPremiumConfig, label_firings_from_evaluations
 from te.persistence.db import make_engine, make_session_factory
 from te.settings import Settings
 
@@ -78,6 +80,16 @@ COMBOS: tuple[tuple[float, float], ...] = (
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--instruments", default="NIFTY,SENSEX")
+    parser.add_argument("--strategy", default="orb", help="firing set to label, e.g. orb60")
+    parser.add_argument(
+        "--real-premiums",
+        action="store_true",
+        help=(
+            "walk each firing's REAL option contract instead of converting index points through "
+            "te.ml.barriers' single delta snapshot. Without this the sweep is measuring a "
+            "premium path with no theta in it, which is what made the 1:1 row look break-even."
+        ),
+    )
     args = parser.parse_args()
 
     chosen = [s.strip().upper() for s in args.instruments.split(",") if s.strip()]
@@ -89,7 +101,20 @@ def main() -> int:
     settings = Settings()
     store = BarStore(settings.bar_store_path)
     session_factory = make_session_factory(make_engine(settings.database_url))
-    cost_model = CostModel(select_rates(load_charge_rate_table(settings.charges_path), dt.date.today()))
+    # The WHOLE table: this sweep spans years and each firing must be priced
+    # at the rates in force on its own date.
+    cost_model = CostModel(load_charge_rate_table(settings.charges_path))
+
+    real_premiums: dict[str, object] = {}
+    if args.real_premiums:
+        lot_history = load_lot_size_history(settings.charges_path.parent / "lot_sizes.yaml")
+        for symbol in chosen:
+            try:
+                lot_size_on(lot_history, symbol, RATES_VERIFIED_FROM)  # fail fast if unknown
+            except UnknownLotSizeError as exc:
+                print(f"{symbol}: {exc}", file=sys.stderr)
+                return 2
+            real_premiums[symbol] = OptionContractIndex(store, symbol)
 
     print("IN-SAMPLE barrier sweep — read for SHAPE, not for a winner to copy.")
     print("expectancy in R (stop units), time exits counted as 0 (optimistic for a decaying option).\n")
@@ -98,16 +123,27 @@ def main() -> int:
         cost = round_trip_cost_in_index_points(symbol, cost_model, RATES_VERIFIED_FROM)
         print(f"=== {symbol} ===")
         print(f"{'stop%':>6}{'tgt%':>6}{'R:R':>6}{'n':>7}{'target':>8}{'stop':>7}{'time':>7}"
-              f"{'win':>7}{'breakeven':>11}{'expectancy':>12}")
+              f"{'win':>7}{'breakeven':>11}{'expectancy':>12}{'real':>8}")
         for stop_pct, target_pct in COMBOS:
             stop, target = index_barriers(
                 symbol, stop_pct=Decimal(str(stop_pct)), target_pct=Decimal(str(target_pct))
+            )
+            contracts = real_premiums.get(symbol)
+            config = (
+                RealPremiumConfig(
+                    contracts=contracts,  # type: ignore[arg-type]
+                    stop_pct=Decimal(str(stop_pct)),
+                    target_pct=Decimal(str(target_pct)),
+                    lot_size_for=partial(lot_size_on, lot_history, symbol),
+                )
+                if contracts is not None
+                else None
             )
             firings = label_firings_from_evaluations(
                 session_factory,
                 store,
                 cost_model,
-                strategy="orb",
+                strategy=args.strategy,
                 exchange=ATM_SNAPSHOTS[symbol].exchange,
                 stop_distance=stop,
                 target_distance=target,
@@ -115,8 +151,10 @@ def main() -> int:
                 instrument=symbol,
                 since=RATES_VERIFIED_FROM,
                 cost_per_unit=cost,
+                real_premiums=config,
             )
             counts = Counter(f.barrier for f in firings)
+            sources = Counter(f.source for f in firings)
             n = len(firings)
             if not n:
                 continue
@@ -127,10 +165,16 @@ def main() -> int:
             expectancy = (counts["target"] / n) * rr - (counts["stop"] / n)
             marker = "  <--" if expectancy > 0 else ""
             current = " (current)" if (stop_pct, target_pct) == (20.0, 40.0) else ""
+            # Provenance on EVERY row, not once at the bottom. A row whose
+            # contracts are thinly covered can silently be mostly index
+            # approximation while the run as a whole looks real, and an
+            # approximated row is optimistically biased against a real one
+            # sitting directly above it in the same table.
+            real_pct = sources.get("real_option", 0) / n
             print(
                 f"{stop_pct:>6.1f}{target_pct:>6.1f}{rr:>6.2f}{n:>7,}{counts['target']:>8,}"
                 f"{counts['stop']:>7,}{counts['time']:>7,}{win:>6.1%}{breakeven:>10.1%}"
-                f"{expectancy:>+11.3f}R{marker}{current}"
+                f"{expectancy:>+11.3f}R{real_pct:>8.0%}{marker}{current}"
             )
         print()
 

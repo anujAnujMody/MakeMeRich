@@ -107,8 +107,13 @@ def main() -> int:
                 start=start,
                 end=end,
                 strategy_name=strategy,
-                strategy_factory=lambda m=minutes: OrbStrategy(  # type: ignore[misc]
-                    OrbParams(opening_range_minutes=m, min_opening_bars=3)
+                # `name=` is load-bearing, not cosmetic: it is what makes
+                # `evaluation_id` distinct per length. Passing only a distinct
+                # `strategy_name` to `replay_orb` chooses a registry factory
+                # and nothing more — the RECORDED name comes from the
+                # strategy object.
+                strategy_factory=lambda m=minutes, n=strategy: OrbStrategy(  # type: ignore[misc]
+                    OrbParams(opening_range_minutes=m, min_opening_bars=3), name=n
                 ),
                 opening_range_minutes=minutes,
             )

@@ -97,8 +97,29 @@ class CostModel:
     charged to the option holder on intrinsic value at expiry). Stamp duty is
     BUY-side only."""
 
-    def __init__(self, rates: ChargeRates) -> None:
-        self._rates = rates
+    def __init__(self, rates: ChargeRates | ChargeRateTable) -> None:
+        """Accepts EITHER one rate row or the whole versioned table.
+
+        Both forms exist because they answer different questions. A live
+        cycle knows today's date and wants one row — passing the table there
+        would hide a stale-rate bug behind an automatic lookup. A BACKTEST
+        walks years and must price each trade at the rates that were really
+        in force on its own date; before 2026-08-01 that was impossible,
+        because the model held a single row and refused anything earlier,
+        which is exactly what blocked labelling the option archive's first
+        two years.
+
+        Every public method here already takes `on: date` and routes through
+        `_rates_for`, so accepting a table makes all of them regime-aware at
+        once rather than adding a parallel set of date-taking variants."""
+        self._table: ChargeRateTable | None = None
+        self._rates: ChargeRates | None = None
+        if isinstance(rates, list):
+            if not rates:
+                raise ValueError("CostModel needs at least one ChargeRates row")
+            self._table = sorted(rates, key=lambda r: r.effective_from)
+        else:
+            self._rates = rates
 
     def leg(self, *, side: Side, premium: Paise, qty: int, exchange: str, on: date) -> CostBreakdown:
         """Cost of a single order execution (one side, one fill)."""
@@ -165,10 +186,16 @@ class CostModel:
         return _round_paise(taxable * rates.gst_pct / Decimal(100))
 
     def _rates_for(self, on: date) -> ChargeRates:
+        if self._table is not None:
+            # Raises on a date before the earliest row rather than reusing
+            # the oldest known rates — pricing a trade at rates nobody
+            # verified is how a backtest invents profit.
+            return select_rates(self._table, on)
+        assert self._rates is not None  # noqa: S101 — one of the two is always set by __init__
         if on < self._rates.effective_from:
             raise ValueError(
                 f"trade date {on!r} is before this CostModel's rates became effective "
                 f"({self._rates.effective_from!r}) — construct the model with the rate row that "
-                "was actually in force on that date"
+                "was actually in force on that date, or hand it the whole ChargeRateTable"
             )
         return self._rates

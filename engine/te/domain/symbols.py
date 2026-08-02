@@ -57,6 +57,18 @@ _OPTION_SYMBOL_RE = re.compile(
     r"^(?P<base>[A-Z]+)(?P<day>\d{2})(?P<mon>[A-Z]{3})(?P<yy>\d{2})(?P<strike>\d+(?:\.\d+)?)(?P<type>CE|PE)$"
 )
 
+_EXPIRY_RE = re.compile(r"^(?P<dd>\d{2})(?P<mon>[A-Z]{3})(?P<yy>\d{2})$")
+
+# Shoonya (the historical option archive in `data/raw/shoonya/`) writes the
+# option type BEFORE the strike, and in two different widths: `CE`/`PE` up to
+# expiry 2026-03-02, single-letter `C`/`P` from 2026-03-10 onward (both forms
+# verified by reading the archive, not assumed). The alternation is ordered
+# longest-first so `PE20100` never matches as `P` + a strike beginning `E`.
+_SHOONYA_OPTION_SYMBOL_RE = re.compile(
+    r"^(?P<base>[A-Z]+?)(?P<day>\d{2})(?P<mon>[A-Z]{3})(?P<yy>\d{2})"
+    r"(?P<type>CE|PE|C|P)(?P<strike>\d+(?:\.\d+)?)$"
+)
+
 # Weekly-expiry-eligible indices and their exchange's single weekly expiry
 # weekday (post Sep-2025 regime: NIFTY -> Tuesday on NSE, SENSEX -> Thursday
 # on BSE; `date.weekday()` convention, Monday=0).
@@ -71,6 +83,23 @@ _MONTHLY_ONLY_EXPIRY_WEEKDAY = {"BANKNIFTY": 1, "FINNIFTY": 1, "MIDCPNIFTY": 1, 
 def fmt_expiry(expiry: dt.date) -> str:
     """`date(2026, 6, 30) -> "30JUN26"`."""
     return f"{expiry.day:02d}{_MONTH_ABBR[expiry.month]}{expiry.year % 100:02d}"
+
+
+def parse_expiry(text: str) -> dt.date:
+    """`"30JUN26" -> date(2026, 6, 30)` — the inverse of `fmt_expiry`, and
+    the form `OpenAlgoRestClient.expiry_dates` returns.
+
+    Raises rather than guessing: an unparseable expiry from the broker means
+    the chain is not what we think it is, and silently dropping it would
+    turn "is today an expiry?" into a quiet "no".
+    """
+    match = _EXPIRY_RE.match(text.strip().upper())
+    if match is None:
+        raise ValueError(f"{text!r} is not a DDMMMYY expiry")
+    month = _ABBR_TO_MONTH.get(match["mon"])
+    if month is None:
+        raise ValueError(f"{text!r} has an unrecognised month abbreviation: {match['mon']!r}")
+    return dt.date(2000 + int(match["yy"]), month, int(match["dd"]))
 
 
 def _fmt_strike(strike: Decimal | int | float) -> str:
@@ -118,6 +147,42 @@ def parse_option_symbol(symbol: str) -> ParsedOptionSymbol:
     option_type: OptionType = "CE" if match["type"] == "CE" else "PE"
     return ParsedOptionSymbol(
         base=match["base"], expiry=expiry, strike=Decimal(match["strike"]), option_type=option_type, symbol=symbol
+    )
+
+
+def build_shoonya_option_symbol(
+    base: str, expiry: dt.date, strike: Decimal | int | float, option_type: OptionType, *, short_type: bool = False
+) -> str:
+    """The archive's own grammar: `<BASE><DD><MMM><YY><TYPE><STRIKE>`.
+
+    Exists so the conversion can be proven to round-trip in both directions
+    — a one-way converter can be wrong in a way no test catches, because
+    nothing else in the codebase ever produces this form to compare against.
+    """
+    type_token = option_type[0] if short_type else option_type
+    return f"{base}{fmt_expiry(expiry)}{type_token}{_fmt_strike(strike)}"
+
+
+def parse_shoonya_option_symbol(symbol: str) -> ParsedOptionSymbol:
+    """Parses an archive symbol (e.g. `NIFTY04JAN24CE18300`,
+    `NIFTY05MAY26P24500`). `ParsedOptionSymbol.symbol` keeps the INPUT
+    string; feed the parsed fields to `build_option_symbol` for the
+    canonical key the `BarStore` is partitioned by."""
+    match = _SHOONYA_OPTION_SYMBOL_RE.match(symbol)
+    if match is None:
+        raise ValueError(
+            f"{symbol!r} is not a recognised Shoonya option symbol (expected <BASE><DD><MMM><YY><CE|PE|C|P><STRIKE>)"
+        )
+    month = _ABBR_TO_MONTH.get(match["mon"])
+    if month is None:
+        raise ValueError(f"{symbol!r} has an unrecognised month abbreviation: {match['mon']!r}")
+    option_type: OptionType = "CE" if match["type"].startswith("C") else "PE"
+    return ParsedOptionSymbol(
+        base=match["base"],
+        expiry=dt.date(2000 + int(match["yy"]), month, int(match["day"])),
+        strike=Decimal(match["strike"]),
+        option_type=option_type,
+        symbol=symbol,
     )
 
 

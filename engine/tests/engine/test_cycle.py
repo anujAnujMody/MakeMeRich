@@ -115,7 +115,7 @@ def _breakout_store(tmp_path: Path) -> BarStore:
         _bar(_open(0), o=30, h=32, low=28, c=30, v=1_000),
         _bar(_open(1), o=30, h=31, low=29, c=30.2, v=1_000),
         _bar(_open(2), o=30, h=31, low=29, c=30.1, v=1_000),
-        _bar(_open(15), o=30, h=38, low=30, c=36, v=2_000),  # confirmed upside breakout, close=36 -> premium 3600p
+        _bar(_open(60), o=30, h=38, low=30, c=36, v=2_000),  # confirmed upside breakout, close=36 -> premium 3600p
     ]
     store.append(pd.DataFrame(rows, columns=list(BAR_COLUMNS)))
     return store
@@ -134,7 +134,7 @@ def test_entry_cycle_opens_a_position_with_an_exit_plan_on_confirmed_breakout(
 ) -> None:
     store = _breakout_store(tmp_path)
     config = _config()
-    as_of = _open(16)
+    as_of = _open(61)
 
     run_entry_cycle(
         session_factory=session_factory,
@@ -168,7 +168,7 @@ def test_entry_cycle_records_real_pipeline_timing_when_a_trade_fires(
     real order."""
     store = _breakout_store(tmp_path)
     config = _config()
-    as_of = _open(16)
+    as_of = _open(61)
 
     cycle_id = run_entry_cycle(
         session_factory=session_factory,
@@ -200,7 +200,7 @@ def test_entry_cycle_leaves_decide_and_act_unreached_when_every_instrument_skips
     so honestly rather than mark every stage `done`."""
     store = _no_signal_store(tmp_path)
     config = _config()
-    as_of = _open(16)
+    as_of = _open(61)
 
     run_entry_cycle(
         session_factory=session_factory,
@@ -232,7 +232,7 @@ def test_entry_cycle_pipeline_shows_only_risk_reached_when_portfolio_halted(
     never ran this cycle at all, only the portfolio risk check did."""
     store = _breakout_store(tmp_path)
     config = _config()
-    as_of = _open(16)
+    as_of = _open(61)
 
     try:
         with session_factory() as session:
@@ -284,7 +284,7 @@ def test_entry_cycle_sizes_two_instruments_independently_across_exchanges(
         _bar(_open(0), o=30, h=32, low=28, c=30, v=1_000),
         _bar(_open(1), o=30, h=31, low=29, c=30.2, v=1_000),
         _bar(_open(2), o=30, h=31, low=29, c=30.1, v=1_000),
-        _bar(_open(15), o=30, h=38, low=30, c=36, v=2_000),
+        _bar(_open(60), o=30, h=38, low=30, c=36, v=2_000),
     ]
     for row in rows:
         row = dict(row)
@@ -299,7 +299,7 @@ def test_entry_cycle_sizes_two_instruments_independently_across_exchanges(
             InstrumentConfig(symbol=second_instrument, exchange=second_exchange, lot_size=30),
         ),
     )
-    as_of = _open(16)
+    as_of = _open(61)
 
     run_entry_cycle(
         session_factory=session_factory,
@@ -422,7 +422,7 @@ def test_skipped_signal_persisted_when_sizing_rejects_zero_lots(
     store = _breakout_store(tmp_path)
     # min_edge_multiple absurdly high -> guaranteed cost-vs-edge rejection.
     config = _config(min_edge_multiple=Decimal(1000))
-    as_of = _open(16)
+    as_of = _open(61)
 
     run_entry_cycle(
         session_factory=session_factory,
@@ -451,7 +451,7 @@ def test_paper_trade_pnl_is_net(
     CostModel, and no exposed field anywhere is a bare gross `pnl`."""
     store = _breakout_store(tmp_path)
     config = _config()
-    entry_at = _open(16)
+    entry_at = _open(61)
 
     run_entry_cycle(
         session_factory=session_factory,
@@ -522,7 +522,7 @@ def test_square_off_closes_position_immediately_regardless_of_exit_conditions(
 
     store = _breakout_store(tmp_path)
     config = _config()
-    entry_at = _open(16)
+    entry_at = _open(61)
 
     run_entry_cycle(
         session_factory=session_factory,
@@ -594,7 +594,7 @@ def test_throttle_multiplier_reaches_sizing(
     # comes out to more than 1 lot, so a 0.5x throttle multiplier is a real,
     # observable reduction rather than a reject-to-zero.
     config = _config(capital=Paise(10_000_000))
-    as_of = _open(16)
+    as_of = _open(61)
 
     run_entry_cycle(
         session_factory=session_factory,
@@ -648,7 +648,7 @@ def test_exit_cycle_skips_the_db_write_when_the_trailing_stop_did_not_ratchet(
     import te.engine.cycle as cycle_module
 
     store = _breakout_store(tmp_path)
-    entry_at = _open(16)
+    entry_at = _open(61)
     run_entry_cycle(
         session_factory=session_factory,
         store=store,
@@ -754,7 +754,7 @@ def test_entry_is_allowed_with_enough_runway(
     """The runway rule must not block a normal mid-session entry — the same
     signal, far enough from the close, still trades."""
     store = _breakout_store(tmp_path)
-    as_of = _open(16)  # ~09:31 IST, hours of runway
+    as_of = _open(61)  # ~10:16 IST, hours of runway
     config = _config(hard_exit_by=dt.time(15, 20), min_minutes_before_hard_exit=30)
 
     run_entry_cycle(
@@ -796,7 +796,7 @@ def test_disabling_the_percentage_trail_does_not_fall_back_to_the_absolute_one(
         execution=execution,
         cost_model=cost_model,
         config=config,
-        as_of=_open(16),
+        as_of=_open(61),
     )
 
     with session_factory() as session:
@@ -828,7 +828,7 @@ def test_absolute_trailing_distance_still_applies_without_percentage_exits(
         execution=execution,
         cost_model=cost_model,
         config=config,
-        as_of=_open(16),
+        as_of=_open(61),
     )
 
     with session_factory() as session:

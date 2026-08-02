@@ -53,6 +53,7 @@ from te.data.bhavcopy_bse import ingest_bhavcopy_bse
 from te.data.bhavcopy_nse import ingest_bhavcopy_nse
 from te.data.charges_loader import load_charge_rate_table
 from te.data.recorder import BarRecorder
+from te.domain.calendar import TradingCalendar
 from te.domain.clock import DEFAULT_SESSION, IST, SessionWindow, is_market_open
 from te.domain.costs import ChargeRateTable
 from te.domain.geometry import AbsolutePointGeometry, ExitGeometry, PremiumPercentGeometry
@@ -68,6 +69,7 @@ from te.engine.state import (
     guardrails_defaults_from_settings,
     instrument_selections_defaults_from_settings,
 )
+from te.engine.trading_calendar import get_calendar, refresh_calendar
 from te.execution.manager import build_paper_execution_stack
 from te.persistence.db import make_session_factory
 from te.persistence.models import OpenPositionRow
@@ -200,7 +202,7 @@ class WSRecorderSupervisor:
 _RECORDER_WINDOW = SessionWindow(start=dt.time(9, 10), end=dt.time(15, 35))
 
 
-def should_start_recorder_now(now: dt.datetime) -> bool:
+def should_start_recorder_now(now: dt.datetime, calendar: TradingCalendar | None = None) -> bool:
     """True when `now` falls inside today's WS-recording window on a trading
     weekday — the catch-up check the FastAPI lifespan runs right after
     `scheduler.start()`, so a mid-session engine restart doesn't silently
@@ -211,9 +213,28 @@ def should_start_recorder_now(now: dt.datetime) -> bool:
     same-day engine redeploy silently stopped bar recording for the rest of
     the session with no error anywhere."""
     ist_now = now.astimezone(IST)
-    if ist_now.weekday() >= 5:  # Saturday/Sunday — no session, no recording.
+    if calendar is not None:
+        # `calendar` is optional so the pure weekday form stays available to
+        # tests and to any caller with no DB — but the live lifespan passes
+        # one, because a weekday check alone restarts the recorder on every
+        # exchange holiday to subscribe to a feed that never ticks.
+        if not calendar.is_trading_day(ist_now.date(), exchange="NSE"):
+            return False
+    elif ist_now.weekday() >= 5:  # Saturday/Sunday — no session, no recording.
         return False
     return is_market_open(ist_now, _RECORDER_WINDOW)
+
+
+def _run_calendar_refresh(session_factory: sessionmaker[Session], rest_client: OpenAlgoRestClient) -> None:
+    """Refreshes the stored exchange holiday calendar. Also pulls NEXT year
+    once December starts, so a running engine crossing 1 January does not
+    spend the first week of the year unable to classify a date — the failure
+    mode there is a full stand-down (`TradingCalendar.unknown()`), which is
+    safe but useless."""
+    now = dt.datetime.now(IST)
+    refresh_calendar(session_factory, rest_client, year=now.year)
+    if now.month == 12:
+        refresh_calendar(session_factory, rest_client, year=now.year + 1)
 
 
 def _run_bhavcopy_ingest(engine: Engine, trade_date: dt.date | None = None) -> None:
@@ -417,6 +438,7 @@ def _default_cycle_config(settings: Settings) -> CycleConfig:
             max_daily_loss_paise=Paise(settings.paper_cycle_max_daily_loss_paise),
             max_concurrent_positions=settings.paper_cycle_max_concurrent_positions,
             max_trades_per_day=settings.paper_cycle_max_trades_per_day,
+            max_consecutive_losses=settings.paper_cycle_max_consecutive_losses,
         ),
         max_entries_per_underlying_per_day=settings.paper_cycle_max_entries_per_underlying_per_day,
     )
@@ -510,7 +532,15 @@ class PaperCycleRunner:
     config: CycleConfig
     max_orders_per_second: int
     settings: Settings
+    #: Fallback only. The session window actually used comes from the
+    #: stored `TradingCalendar` (see `run_once`), so a special session gets
+    #: its real hours; this stays as the shape tests construct.
     session_window: SessionWindow = DEFAULT_SESSION
+    #: Which exchange's holiday list decides whether today is a session.
+    #: NSE and BSE share every holiday in the 2026 calendar, so one is
+    #: enough — but it is named rather than assumed, because they have
+    #: diverged before (BSE observes some Maharashtra dates NSE does not).
+    calendar_exchange: str = "NSE"
     clock: Callable[[], dt.datetime] = _now_ist
     #: Turns the rule's index breakout into a real option contract. `None`
     #: trades the raw configured symbol at the rule's own price — correct
@@ -527,7 +557,26 @@ class PaperCycleRunner:
     def run_once(self) -> None:
         as_of = self.clock()
         local = as_of.astimezone(IST)
-        if not is_market_open(local, self.session_window):
+
+        # Calendar gate FIRST, before the time-of-day window. A holiday is
+        # not "outside the session" — it has no session — and the two were
+        # indistinguishable while the engine only knew weekday arithmetic:
+        # every exchange holiday ran a full day of cycles against a feed
+        # that would never produce a bar, logging ordinary-looking skips.
+        #
+        # The window itself comes from the calendar too, not from
+        # `self.session_window`, because Diwali Muhurat trading is a real
+        # ~1-hour EVENING session on a date the exchange is otherwise shut.
+        # Hardcoding 09:15-15:30 would idle through all of it.
+        with self.session_factory() as session:
+            calendar = get_calendar(session)
+        window = calendar.session_window(local.date(), exchange=self.calendar_exchange)
+        if window is None:
+            reason = "skipped_not_a_trading_day" if calendar.known else "skipped_calendar_unknown"
+            self.status = PaperCycleStatus(last_run_at=as_of, last_result=reason)
+            logger.info("paper cycle skipped", reason=reason, as_of=as_of.isoformat())
+            return
+        if not is_market_open(local, window):
             self.status = PaperCycleStatus(last_run_at=as_of, last_result="skipped_outside_session")
             logger.debug("paper cycle skipped: outside session window", as_of=as_of.isoformat())
             return
@@ -588,6 +637,11 @@ class PaperCycleRunner:
                 max_concurrent_positions=guardrails.max_concurrent_positions,
                 max_trades_per_day=guardrails.max_trades_per_day,
                 max_drawdown_pct=guardrails.max_drawdown_pct,
+                # Not an `AccountGuardrails` field: it is a behavioural
+                # stand-down, not an account limit, and is deliberately not
+                # dashboard-editable. Comes from the startup config template
+                # so it survives a guardrails edit.
+                max_consecutive_losses=self.config.risk_limits.max_consecutive_losses,
             ),
             instrument_configs=instrument_configs,
         )
@@ -653,7 +707,11 @@ def build_scheduler(
     `runner.status` directly. Caller (typically the FastAPI lifespan) is
     responsible for `.start()`/`.shutdown()`."""
     bar_store = bar_store or BarStore(settings.bar_store_path)
-    rest_client = OpenAlgoRestClient(host=settings.openalgo_host, api_key=settings.openalgo_api_key.get_secret_value())
+    rest_client = OpenAlgoRestClient(
+        host=settings.openalgo_host,
+        api_key=settings.openalgo_api_key.get_secret_value(),
+        quotes_per_second=settings.max_quotes_per_second,
+    )
     # Used verbatim — see `Settings.openalgo_ws_host` for why this is a
     # separate, explicitly-configured endpoint and never derived from
     # `openalgo_host`.
@@ -716,6 +774,19 @@ def build_scheduler(
         args=[rest_client, engine],
         trigger=CronTrigger(hour=8, minute=45, day_of_week="mon-fri", timezone=IST),
         id="instrument_sync",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        _run_calendar_refresh,
+        args=[session_factory, rest_client],
+        # Weekly, not daily: the list changes a handful of times a year, and
+        # every trading-day decision falls back to the STORED calendar
+        # anyway. Sunday 08:00 so a revision published over the weekend is
+        # in place before Monday's open. Runs on Sunday deliberately — the
+        # one job here that must NOT be `mon-fri`, since it is what tells
+        # the rest of the engine which of those days are real.
+        trigger=CronTrigger(day_of_week="sun", hour=8, minute=0, timezone=IST),
+        id="trading_calendar_refresh",
         replace_existing=True,
     )
     if settings.paper_cycle_enabled:

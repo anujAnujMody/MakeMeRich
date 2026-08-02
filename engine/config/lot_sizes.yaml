@@ -1,0 +1,80 @@
+# HISTORICAL lot sizes, versioned by `effective_from` — the same pattern as
+# `charges.yaml`, and for the same reason: a backtest spanning a lot-size
+# change must use the size that was actually in force on each trade date.
+#
+# ### This is for BACKTESTS ONLY. Live trading must never read it.
+#
+# The live engine resolves lot size from the SYNCED `instruments` table
+# (`te.persistence.repos.instruments.latest_lot_size`, refreshed from the
+# broker at 08:45 IST daily) and from the broker's own `optionsymbol`
+# response. That is deliberate — the plan's R7 records that lot sizes change
+# roughly every six months and must never be literals in code. This file
+# does not change that rule; it exists because a HISTORICAL bar from 2024
+# has no broker to ask, and pricing a 2024 round trip on today's 65 would
+# overstate cost per unit by 15%.
+#
+# ### Why lot size matters to a label at all
+#
+# `te.ml.labeling` converts a round-trip cost into a cost PER UNIT of
+# premium by dividing by the lot size. Get it wrong and every cost-adjusted
+# barrier moves — invisibly, since nothing in the resulting win rate reveals
+# which lot size produced it.
+#
+# ADDING A CHANGE: append a row. The loader sorts, and a date before the
+# earliest row raises rather than falling back to the oldest known size.
+#
+# ---------------------------------------------------------------------------
+# NIFTY history, verified 2026-08-01.
+#
+# Cross-checked against SEBI's own minimum-contract-value bands rather than
+# taken from one source, because the secondary reporting disagreed on dates:
+#
+#   2024-01  spot ~21,700 x 25 = Rs  5.4 L  -> inside the pre-Nov-2024
+#                                              Rs 5-10 L band. (50 would be
+#                                              Rs 10.9 L, outside it.)
+#   2024-11  spot ~23,500 x 75 = Rs 17.6 L  -> the raised Rs 15 L floor
+#   2026-01  spot ~24,300 x 65 = Rs 15.8 L  -> still above the Rs 15 L floor
+#
+# Sources:
+#   https://fyers.in/notice-board/sebis-revised-lot-sizes-for-index-derivatives-effective-november-20-2024/
+#   https://stocko.in/bulletins/nse-revises-market-lot-sizes-for-major-index-derivatives-effective-january-2026/
+# ---------------------------------------------------------------------------
+
+NIFTY:
+  - effective_from: 2024-01-01
+    lot_size: 25
+    verified_at: 2026-08-01
+    note: >
+      SEBI minimum contract value was Rs 5-10 lakh in this regime. This row
+      is dated to the start of the option archive, not to the date 25 itself
+      took effect (which predates any data this project holds).
+
+  - effective_from: 2024-11-20
+    lot_size: 75
+    verified_at: 2026-08-01
+    note: >
+      SEBI raised the minimum contract value to Rs 15 lakh. NSE applied the
+      new size to index futures and options from 20 Nov 2024; weekly
+      contracts already open carried the old size until 2 Jan 2025, so
+      labels in that six-week window may be priced on the wrong size by up
+      to 15% of cost-per-unit. Not corrected here because the archive does
+      not record which series a contract belonged to — flagged rather than
+      papered over.
+
+  - effective_from: 2026-01-01
+    lot_size: 65
+    verified_at: 2026-08-01
+    note: >
+      NSE's periodic review under SEBI's Dec 2024 circular, applied from the
+      January 2026 series after the December 2025 expiry. This is the size
+      the live engine trades today, and it matches what the broker's
+      `optionsymbol` service returns.
+
+# BANKNIFTY, SENSEX and BANKEX are DELIBERATELY ABSENT.
+#
+# The archive holds only four BANKNIFTY expiries and no BSE data at all, so
+# no historical labelling needs them — and the secondary sources disagreed
+# on BANKNIFTY's pre-2026 sizes (35 vs 30) in a way I could not resolve
+# against a primary circular. An absent row raises; an invented one would
+# silently misprice every label. Add them when there is data that needs
+# them AND a primary source that settles the dates.

@@ -36,7 +36,7 @@ from te.domain.money import Paise
 from te.domain.orders import OrderRequest
 from te.domain.pnl import GrossPnl, mark_to_market_pnl, net_pnl
 from te.domain.signal import ExitPlan, Signal
-from te.engine.contract import ContractResolver
+from te.engine.contract import ContractResolver, OptionContractResolver
 from te.engine.exits import OpenPosition, evaluate_position, time_exit
 from te.engine.state import PIPELINE_STAGE_KEYS, PipelineStageTiming, set_last_cycle_pipeline
 from te.execution.manager import ExecutionManager
@@ -63,6 +63,7 @@ from te.risk.killswitch import check as check_killswitch
 from te.risk.limits import (
     LimitBreachError,
     RiskLimitsConfig,
+    check_consecutive_losses,
     check_daily_loss_limit,
     check_max_concurrent_positions,
     check_max_drawdown,
@@ -359,7 +360,22 @@ def run_entry_cycle(
 
         strategy = get_strategy(config.strategy_name)
         _t0 = time.perf_counter()
-        ctx = StrategyContext(store=store, instrument=instrument, exchange=exchange, as_of=as_of)
+        # The broker's real expiry chain, when a resolver can supply it. A
+        # calendar-gated rule (`expiry_day_only`) must not fall back to
+        # guessing the weekday — see its docstring for the 83-of-125
+        # mismatch that guess produced.
+        expiry_dates = (
+            contract_resolver.expiry_dates(instrument, as_of)
+            if isinstance(contract_resolver, OptionContractResolver)
+            else None
+        )
+        ctx = StrategyContext(
+            store=store,
+            instrument=instrument,
+            exchange=exchange,
+            as_of=as_of,
+            expiry_dates=expiry_dates,
+        )
         _t1 = time.perf_counter()
         stage_ms["fetch"] += (_t1 - _t0) * 1000
         stage_reached["fetch"] = True
@@ -423,6 +439,10 @@ def run_entry_cycle(
                 check_killswitch(session)
                 check_max_concurrent_positions(session, config.risk_limits)
                 check_max_trades_per_day(session, config.risk_limits, on=as_of.date())
+                # Also per-instrument rather than portfolio-level above: a
+                # position opened earlier in THIS cycle can close and lose
+                # before a later instrument is evaluated.
+                check_consecutive_losses(session, config.risk_limits, on=as_of.date())
             except (KillSwitchTrippedError, LimitBreachError) as exc:
                 # Recorded AFTER this session closes (via `_skip`) rather
                 # than on this session, so the skip write never nests one
@@ -441,6 +461,10 @@ def run_entry_cycle(
         trade_symbol = instrument
         trade_exchange = exchange
         entry_premium = signal.entry_premium
+        #: 0 = the broker reported no freeze quantity for this contract (or
+        #: there is no contract resolver at all, i.e. the symbol is already
+        #: an option). Nothing is capped in that case — see the guard below.
+        freeze_qty = 0
         if contract_resolver is not None:
             _tc = time.perf_counter()
             contract = contract_resolver(instrument, signal.direction, as_of)
@@ -459,6 +483,7 @@ def run_entry_cycle(
             # round trip. `ask` is already fetched for the spread guard and
             # is guaranteed non-zero by it.
             entry_premium = contract.ask
+            freeze_qty = contract.freeze_qty
 
         levels = config.exit_geometry.levels(entry_premium)
         stop_premium, target_premium = levels.stop, levels.target
@@ -515,6 +540,45 @@ def run_entry_cycle(
                 f"ml_multiplier={influence.size_multiplier})",
             )
             continue
+
+        # Exchange freeze quantity: the largest quantity permitted in ONE
+        # order. Above it the exchange rejects outright — a live failure that
+        # arrives as an opaque broker error, at the exact moment a position
+        # was meant to open.
+        #
+        # Capped rather than chunked, deliberately. Chunking one signal into
+        # several orders means several `client_order_id`s folding into one
+        # position, which the execution store does not model, and there is
+        # no live order adapter to test it against (`openalgo_rest.py` has no
+        # order endpoints at all — `SimulatedBroker` is the only venue). A
+        # capped order is correct and small; a chunking path validated
+        # against nothing is neither.
+        #
+        # `freeze_qty` is the BROKER's per-contract value from
+        # `optionsymbol`, never a hardcoded table: the published figures
+        # disagree across sources (BANKNIFTY is quoted as both 600 and 900)
+        # and they change. `0` means the broker did not report one, and
+        # nothing is capped — inventing a limit is worse than not having it.
+        if freeze_qty > 0 and lot_size * lots > freeze_qty:
+            capped = freeze_qty // lot_size
+            if capped < 1:
+                _skip(
+                    instrument,
+                    f"one lot ({lot_size}) exceeds the exchange freeze quantity ({freeze_qty}) for "
+                    f"{trade_symbol} — this contract cannot be traded in any size",
+                )
+                continue
+            with session_scope(session_factory) as session:
+                record_risk_event(
+                    session,
+                    ts=as_of,
+                    kind="freeze_qty_cap",
+                    detail=(
+                        f"{trade_symbol}: sized {lots} lot(s) = {lot_size * lots} qty, above the exchange "
+                        f"freeze quantity {freeze_qty}; capped to {capped} lot(s)"
+                    ),
+                )
+            lots = capped
 
         _t4 = time.perf_counter()
         request = OrderRequest(

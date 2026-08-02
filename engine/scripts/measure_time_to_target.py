@@ -52,6 +52,10 @@ PERCENTILES = (10, 25, 50, 75, 90)
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--instruments", default="NIFTY,SENSEX")
+    # Defaults to the 60-minute opening-range replay set, because 60m is what
+    # `OrbParams.opening_range_minutes` now is — measuring runway on the old
+    # 15m firings would describe a rule the engine no longer runs.
+    parser.add_argument("--strategy", default="orb-or60")
     args = parser.parse_args()
 
     chosen = [s.strip().upper() for s in args.instruments.split(",") if s.strip()]
@@ -75,7 +79,7 @@ def main() -> int:
             session_factory,
             store,
             cost_model,
-            strategy="orb",
+            strategy=args.strategy,
             exchange=ATM_SNAPSHOTS[symbol].exchange,
             stop_distance=stop,
             target_distance=target,

@@ -79,7 +79,12 @@ function normalizeStrategyCard(c: RawStrategyCard, defaults: { active: boolean; 
     name: c.name ?? '',
     description: c.description ?? '',
     active: c.active ?? defaults.active,
-    winRate: c.winRate ?? derivedPct,
+    // NOT `?? derivedPct`. Win rate and confidence are different quantities:
+    // one is the share of past trades that made money, the other is a model's
+    // self-reported certainty. Falling back to confidence printed a number
+    // under a "Win Rate" label that no trade had ever earned. 0 with
+    // `totalTrades: 0` beside it is the honest zero-state.
+    winRate: c.winRate ?? 0,
     weeklyPnl: c.weeklyPnl ?? 0,
     confidence: derivedPct,
     confidenceTrend: c.confidenceTrend ?? 'stable',

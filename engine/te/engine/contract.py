@@ -30,6 +30,7 @@ from te.broker.openalgo_rest import OpenAlgoRestClient, OpenAlgoRestError
 from te.domain.clock import IST
 from te.domain.money import Paise
 from te.domain.signal import Direction
+from te.domain.symbols import parse_expiry
 
 logger = structlog.get_logger(__name__)
 
@@ -56,6 +57,14 @@ class ResolvedContract:
     bid: Paise
     ask: Paise
     underlying_ltp: float
+    #: Largest quantity the exchange permits in a SINGLE order for this
+    #: contract, straight from the broker's `optionsymbol` response. `0`
+    #: means the broker did not report one — treated as "no cap known"
+    #: rather than "no cap exists", because published freeze quantities
+    #: disagree between sources and change every few months (R7's problem,
+    #: same shape as lot size). See `te.engine.cycle`'s freeze-quantity
+    #: guard for why it caps rather than chunks.
+    freeze_qty: int = 0
 
     @property
     def spread_pct(self) -> Decimal:
@@ -102,6 +111,47 @@ class OptionContractResolver:
         # serve yesterday's chain.
         self._expiries: dict[tuple[str, dt.date], list[str]] = {}
 
+    def _chain(self, underlying: str, index_exchange: str, as_of: dt.datetime) -> list[str]:
+        """The broker's listed expiry chain, nearest first, cached per
+        `(underlying, IST date)`."""
+        cache_key = (underlying, as_of.astimezone(IST).date())
+        expiries = self._expiries.get(cache_key)
+        if expiries is None:
+            expiries = self._client.expiry_dates(underlying, _placement_exchange(index_exchange))
+            if expiries:
+                self._expiries[cache_key] = expiries
+        return expiries
+
+    def expiry_dates(self, underlying: str, as_of: dt.datetime) -> frozenset[dt.date]:
+        """Every listed expiry for `underlying`, as real dates.
+
+        Exists so the LIVE path can answer "is today an expiry day?" from the
+        broker's own calendar. `ExpiryDayOnly` previously had to guess from
+        the weekday live, while its backtest read the real contract archive —
+        so the two measured different strategies under one name. NIFTY's
+        weekly expiry moved Thursday -> Tuesday inside the recorded data, and
+        the weekday guess mismatched 83 of 125 real expiries.
+
+        Returns an EMPTY set rather than raising when the broker is
+        unreachable or returns something unparseable: an unknown calendar
+        must make a calendar-gated rule stand down, not crash the cycle.
+        """
+        index_exchange = UNDERLYING_INDEX_EXCHANGES.get(underlying)
+        if index_exchange is None:
+            return frozenset()
+        try:
+            raw = self._chain(underlying, index_exchange, as_of)
+        except OpenAlgoRestError:
+            logger.exception("expiry chain unavailable", underlying=underlying)
+            return frozenset()
+        dates = set()
+        for text in raw:
+            try:
+                dates.add(parse_expiry(text))
+            except ValueError:
+                logger.warning("unparseable expiry from broker", underlying=underlying, expiry=text)
+        return frozenset(dates)
+
     def __call__(self, underlying: str, direction: Direction, as_of: dt.datetime) -> ResolvedContract | None:
         index_exchange = UNDERLYING_INDEX_EXCHANGES.get(underlying)
         if index_exchange is None:
@@ -112,12 +162,7 @@ class OptionContractResolver:
         try:
             # `expiry_dates` is nearest-first and broker-confirmed, so [0] is
             # the current weekly WITHOUT any holiday arithmetic on our side.
-            cache_key = (underlying, as_of.astimezone(IST).date())
-            expiries = self._expiries.get(cache_key)
-            if expiries is None:
-                expiries = self._client.expiry_dates(underlying, _placement_exchange(index_exchange))
-                if expiries:
-                    self._expiries[cache_key] = expiries
+            expiries = self._chain(underlying, index_exchange, as_of)
             if not expiries:
                 logger.warning("broker returned no expiries", underlying=underlying)
                 return None
@@ -134,6 +179,7 @@ class OptionContractResolver:
             symbol=contract.symbol,
             exchange=contract.exchange,
             lot_size=contract.lot_size,
+            freeze_qty=contract.freeze_qty,
             premium=Paise(int(round(quote.ltp * 100))),
             bid=Paise(int(round(quote.bid * 100))),
             ask=Paise(int(round(quote.ask * 100))),

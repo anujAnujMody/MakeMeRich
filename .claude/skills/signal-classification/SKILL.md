@@ -1,15 +1,44 @@
 ---
 name: signal-classification
-description: ML trading signal classifiers using XGBoost and LightGBM with walk-forward validation, SHAP feature importance, and threshold optimization
+description: ML trading signal classifiers using XGBoost, CatBoost and Random Forest with walk-forward validation, SHAP feature importance, and threshold optimization
 ---
 
 # Signal Classification
 
 Predict whether an asset's price will move up or down over a forward horizon using supervised machine learning classifiers. This skill covers the full pipeline: label creation, model training, walk-forward validation, feature importance analysis, and threshold optimization for trading applications.
 
+## Model choice in THIS project (read before any example below)
+
+The generic guidance further down names LightGBM alongside XGBoost. **In this
+repository LightGBM is banned and is not installed.** Its leaf-wise growth
+overfits badly at the few-hundred-to-few-thousand labelled rows this project
+actually has, which is exactly our regime — see `pyproject.toml`, where it is
+deliberately absent, and the plan's "Small-n model choice" note.
+
+Use, in this order of preference:
+
+| Model | When | Notes |
+|---|---|---|
+| **CatBoost** | Default for small tabular data | Ordered boosting is the most overfit-resistant of the three at n < ~5,000 |
+| **XGBoost** | Comparator, and today's wired default | Pin `xgboost>=3.3,<4` |
+| **Random Forest** | Second comparator | What Lopez de Prado's own meta-labeling work used; a useful sanity baseline |
+
+**TabPFN is NOT an option here** despite topping small-tabular benchmarks
+(TabPFN-3 scores ~1673 Elo vs tuned XGBoost's ~1375 on TabArena). Its licence
+forbids commercial and production use, explicitly including "internal
+commercial decision-making" — trading real money is precisely that. Verified
+2026-08-01 against Prior Labs' model card.
+
+**Every additional model you try is another trial.** It must be recorded in
+`TrialLedger`, and it raises the bar the Deflated Sharpe Ratio has to clear —
+see the `honest-metrics` skill. Comparing three models and reporting the best
+one's score without deflating for having tried three is the single most
+common way to fabricate an edge. Do not add a fourth model casually.
+
 ## Why Tree-Based Models Dominate Trading ML
 
-XGBoost and LightGBM are the workhorses of quantitative trading ML for good reason:
+Gradient-boosted trees are the workhorses of quantitative trading ML for good
+reason:
 
 - **Non-linear relationships**: Financial features interact in complex, non-linear ways that trees capture naturally
 - **Robust to feature scale**: No need to normalize or standardize inputs — trees split on rank order
@@ -67,7 +96,7 @@ Multi-class reduces per-class sample size. Use only with large datasets (1000+ s
 
 ### Probability Calibration
 
-Raw model probabilities from XGBoost/LightGBM are not well-calibrated. A predicted 0.7 probability does not mean 70% chance of being correct. Use calibration to fix this:
+Raw model probabilities from XGBoost/CatBoost/Random Forest are not well-calibrated. A predicted 0.7 probability does not mean 70% chance of being correct. Use calibration to fix this:
 
 ```python
 from sklearn.calibration import CalibratedClassifierCV
@@ -172,7 +201,7 @@ See `references/validation_methods.md` for purged CV, CPCV, and evaluation metri
 1. **Feature engineering** — compute technical indicators, on-chain metrics, volume features (see `feature-engineering` skill)
 2. **Label creation** — forward returns with threshold, drop neutral zone
 3. **Walk-forward split** — time-ordered train/test windows with gap
-4. **Train model** — XGBoost or LightGBM on each training window
+4. **Train model** — CatBoost, XGBoost or Random Forest on each training window
 5. **Predict on test** — generate out-of-sample probability predictions
 6. **Aggregate predictions** — concatenate all out-of-sample results
 7. **Evaluate** — accuracy, precision, recall, F1, AUC, profit factor
@@ -322,7 +351,7 @@ Features lose predictive power over time as more participants discover and trade
 ## Files
 
 ### References
-- `references/model_guide.md` — XGBoost and LightGBM parameter guide, tuning, and ensembling
+- `references/model_guide.md` — parameter guide, tuning, and ensembling (its LightGBM sections do NOT apply here — see "Model choice in THIS project" above)
 - `references/validation_methods.md` — Walk-forward, purged CV, CPCV, and evaluation metrics
 
 ### Scripts
@@ -336,7 +365,7 @@ Features lose predictive power over time as more participants discover and trade
 uv pip install pandas numpy scikit-learn
 
 # Optional (recommended)
-uv pip install xgboost lightgbm shap
+uv pip install xgboost catboost scikit-learn shap  # NOT lightgbm — see above
 ```
 
 ## Key Takeaways

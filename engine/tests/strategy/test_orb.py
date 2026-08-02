@@ -261,7 +261,7 @@ def _breakout_rows(*, breakout_volume: int, range_volume: int) -> list[dict[str,
         _bar(_open(0), o=100, h=105, low=95, c=100, v=range_volume),
         _bar(_open(1), o=100, h=101, low=99, c=100.5, v=range_volume),
         _bar(_open(2), o=100, h=101, low=99, c=100.2, v=range_volume),
-        _bar(_open(15), o=100, h=110, low=100, c=109, v=breakout_volume),
+        _bar(_open(60), o=100, h=110, low=100, c=109, v=breakout_volume),
     ]
 
 
@@ -277,7 +277,7 @@ def test_volume_confirmation_is_not_reported_as_passed_when_there_is_no_volume(s
     but the dashboard can no longer show a tick for a check that never ran.
     """
     _write(store, _breakout_rows(breakout_volume=0, range_volume=0))
-    ctx = StrategyContext(store=store, instrument=INSTRUMENT, exchange=EXCHANGE, as_of=_open(16))
+    ctx = StrategyContext(store=store, instrument=INSTRUMENT, exchange=EXCHANGE, as_of=_open(61))
 
     evaluation = OrbStrategy().evaluate(ctx)
 
@@ -291,7 +291,7 @@ def test_volume_confirmation_still_applies_when_volume_is_present(store: BarStor
     """The fix must not disable the filter on an instrument that DOES carry
     volume — only stop faking it on one that does not."""
     _write(store, _breakout_rows(breakout_volume=1, range_volume=1_000))
-    ctx = StrategyContext(store=store, instrument=INSTRUMENT, exchange=EXCHANGE, as_of=_open(16))
+    ctx = StrategyContext(store=store, instrument=INSTRUMENT, exchange=EXCHANGE, as_of=_open(61))
 
     evaluation = OrbStrategy().evaluate(ctx)
 
@@ -299,3 +299,38 @@ def test_volume_confirmation_still_applies_when_volume_is_present(store: BarStor
     assert volume_cond.evaluated is True
     assert volume_cond.passed is False
     assert evaluation.verdict == "skipped"
+
+
+def test_a_named_variant_records_its_own_strategy_name(store: BarStore) -> None:
+    """The recorded name is what identifies a firing downstream:
+    `evaluation_id` is `f"{name}-{instrument}-{as_of}"` and is UNIQUE, and
+    the labeller selects on `strategy`. So a parameter variant MUST be able
+    to record a distinct name, or two replays of the same instrument and
+    minute collide.
+
+    Found on 2026-07-31: a range-length sweep passed distinct names to
+    `replay_orb`, but the recorded name came from the class attribute, so
+    every length wrote as "orb" — merging 5m and 30m firings into the 15m
+    dataset and silently skipping later runs as already-replayed.
+    """
+    _write(store, _breakout_rows(breakout_volume=2_000, range_volume=1_000))
+    ctx = StrategyContext(store=store, instrument=INSTRUMENT, exchange=EXCHANGE, as_of=_open(61))
+
+    variant = OrbStrategy(OrbParams(opening_range_minutes=5), name="orb-or5")
+    evaluation = variant.evaluate(ctx)
+
+    assert variant.name == "orb-or5"
+    assert evaluation.strategy == "orb-or5"
+    assert evaluation.id.startswith("orb-or5-")
+
+
+def test_the_default_name_is_unchanged(store: BarStore) -> None:
+    """Live trading must keep recording plain `orb` — the override is only
+    for parameter variants in a sweep."""
+    _write(store, _breakout_rows(breakout_volume=2_000, range_volume=1_000))
+    ctx = StrategyContext(store=store, instrument=INSTRUMENT, exchange=EXCHANGE, as_of=_open(61))
+
+    evaluation = OrbStrategy().evaluate(ctx)
+
+    assert OrbStrategy.name == "orb"
+    assert evaluation.strategy == "orb"

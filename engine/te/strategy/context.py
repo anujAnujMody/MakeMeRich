@@ -28,6 +28,15 @@ class StrategyContext:
     as_of: dt.datetime
     interval: str = "1m"
     state: dict[str, object] = field(default_factory=dict)
+    #: Real expiry dates for `instrument`, when the caller can supply them —
+    #: from the broker's listed chain live, from the contract archive in a
+    #: backtest. `None` means "no calendar available", which a calendar-gated
+    #: rule must treat as a reason to stand down rather than to guess.
+    #:
+    #: It lives on the context rather than as a derived frame column so both
+    #: paths get it the same way; the previous backtest-only column meant a
+    #: rule silently changed behaviour depending on who built its frame.
+    expiry_dates: frozenset[dt.date] | None = None
 
     def bars(self, lookback: dt.timedelta) -> pd.DataFrame:
         """Point-in-time bar read for `self.instrument`, delegating entirely

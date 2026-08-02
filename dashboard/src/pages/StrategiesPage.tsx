@@ -3,7 +3,6 @@ import { useToggleStrategyPause } from '@/hooks/useAgentData'
 import { StrategyCardView } from '@/components/StrategyCardView'
 import { StrategyRuleList } from '@/components/StrategyRuleList'
 import { ProvenanceBadge } from '@/components/ProvenanceBadge'
-import { EmptyState } from '@/components/EmptyState'
 import { PageHeader } from '@/components/PageHeader'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
@@ -62,7 +61,7 @@ export function StrategiesPage() {
 
   return (
     <div>
-      <PageHeader title="Strategies" subtitle="AI-discovered strategies" />
+      <PageHeader title="Strategies" subtitle="Every strategy, tested on real prices" />
 
       <div className="flex flex-col gap-6 p-5">
         <button onClick={() => refetch()} className="self-start text-xs text-muted-foreground flex items-center gap-1 hover:text-foreground transition-colors">
@@ -87,7 +86,7 @@ export function StrategiesPage() {
 
             <div className="space-y-2">
               {active.length === 0 && inactive.length === 0 ? (
-                <p className="text-sm text-muted-foreground text-center py-8">No strategies found. Discovery agent is scanning market...</p>
+                <p className="text-sm text-muted-foreground text-center py-8">No strategies registered.</p>
               ) : (
                 <>
                   {active.map((s) => (
@@ -101,11 +100,34 @@ export function StrategiesPage() {
               )}
             </div>
 
-            <EmptyState
-              title="Backtest results"
-              what="A full history of simulated trades on real historical data, with costs charged and a deflated Sharpe ratio."
-              needs="the backtest engine (Phase 5)"
-            />
+            {/* The "Backtest results — not available yet" placeholder that
+                used to sit here was removed on 2026-08-01: the backtest
+                engine now exists, and every card above carries its real
+                result. Telling the reader the numbers do not exist while
+                displaying them is the exact failure this page is meant to
+                avoid. */}
+            <Card>
+              <CardHeader className="pb-3">
+                <CardTitle className="text-sm font-medium">How to read these</CardTitle>
+              </CardHeader>
+              <CardContent className="text-xs text-muted-foreground space-y-2">
+                <p>
+                  Every strategy above was tested on real option prices from January 2024 to July 2026, with
+                  real brokerage, taxes and charges taken off each trade.
+                </p>
+                <p>
+                  <strong>&ldquo;Beats Luck?&rdquo;</strong> is the number that matters. Test enough strategies and one
+                  will look brilliant by pure chance &mdash; so this score already subtracts how much of the
+                  result could be luck, given how many have been tried. It needs to be above 95% to mean
+                  anything.
+                </p>
+                <p>
+                  <strong>Random Entry</strong> is not a strategy. It enters at random and exists as a yardstick:
+                  any strategy that cannot beat a coin flip is not doing anything useful, whatever its win
+                  rate says.
+                </p>
+              </CardContent>
+            </Card>
 
             {queue.length > 0 && (
               <Card>

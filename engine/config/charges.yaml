@@ -4,11 +4,98 @@
 # reads this file, sorts by `effective_from`, and picks the latest row with
 # `effective_from <= trade_date`.
 #
-# verify_charges.py (later phase) prints this table's age; past 90 days the
-# engine should log loudly and set a `staleRates` flag on `/api/engine/health`.
+# ADDING A FUTURE RATE CHANGE: append a row with the new `effective_from`
+# and a `source` URL. Nothing else changes — no code, no migration, no
+# redeploy of anything but this file. Rows may be added out of order; the
+# loader sorts. A trade dated before the EARLIEST row is refused rather than
+# priced at a guessed rate, which is why the 2024-01-01 row exists at all.
+#
+# `verify_charges.py` prints this table's age; past 90 days the engine logs
+# loudly and sets a `staleRates` flag on `/api/engine/health`.
+#
+# UNITS: `*_bps` are basis points of premium (1 bps = 0.01%). So 0.15% = 15.0.
+# `Rs 10 per crore` = 0.0001% = 0.01 bps.
+#
+# ---------------------------------------------------------------------------
+# Rate history, all verified 2026-08-01 against the sources on each row.
+#
+#   date         STT sell   STT exercise   NSE      BSE
+#   2024-01-01   0.0625%    0.125%         0.0495%  0.0495%
+#   2024-10-01   0.10%      0.125%         0.03503% 0.0325%
+#   2026-03-01   0.10%      0.125%         0.03553% 0.0325%
+#   2026-04-01   0.15%      0.15%          0.03553% 0.0325%
+#
+# Unchanged across the whole window, so not repeated in prose below:
+# brokerage Rs 20/executed order, SEBI Rs 10/crore, GST 18% on
+# (brokerage + SEBI + exchange txn), stamp 0.003% buy side only.
+# ---------------------------------------------------------------------------
+
+- effective_from: 2024-01-01
+  verified_at: 2026-08-01
+  # The regime in force when the Shoonya option archive begins (2024-01-04).
+  # Both exchanges charged 0.0495% on options premium before the SEBI-mandated
+  # uniform fee structure of 1 Oct 2024.
+  #
+  # CAVEAT, stated rather than hidden: before 1 Oct 2024 NSE's transaction
+  # charge was SLAB-BASED on a member's monthly volume (roughly Rs 29.50 to
+  # Rs 49.50 per lakh). 0.0495% is the top of that band — the retail rate a
+  # small account actually paid, and the most expensive plausible value. Erring
+  # high understates profit, which is the only safe direction to err in.
+  source: "https://zerodha.com/z-connect/business-updates/revision-in-exchange-transaction-charges-and-securities-transaction-tax-from-october-1-2024"
+  brokerage_per_executed_order_paise: 2000
+  stt_sell_bps: 6.25
+  stt_exercise_intrinsic_bps: 12.5
+  exchange_txn_bps:
+    NFO: 4.95
+    BFO: 4.95
+  sebi_bps: 0.01
+  gst_pct: 18.0
+  stamp_buy_bps: 0.3
+
+- effective_from: 2024-10-01
+  verified_at: 2026-08-01
+  # Two changes landed the same day. Finance (No. 2) Act 2024 raised options
+  # STT from 0.0625% to 0.10% of premium on the sell side; separately, SEBI's
+  # 1 Jul 2024 circular forced a uniform (no longer slab-based) exchange fee,
+  # cutting NSE to Rs 35.03/lakh and BSE to Rs 32.50/lakh.
+  #
+  # Net effect on a seller was still an INCREASE of ~0.023% on NSE — the STT
+  # rise outweighed the fee cut. Worth knowing when reading any backtest that
+  # straddles this date.
+  source: "https://zerodha.com/z-connect/business-updates/revision-in-exchange-transaction-charges-and-securities-transaction-tax-from-october-1-2024"
+  brokerage_per_executed_order_paise: 2000
+  stt_sell_bps: 10.0
+  stt_exercise_intrinsic_bps: 12.5
+  exchange_txn_bps:
+    NFO: 3.503
+    BFO: 3.25
+  sebi_bps: 0.01
+  gst_pct: 18.0
+  stamp_buy_bps: 0.3
+
+- effective_from: 2026-03-01
+  verified_at: 2026-08-01
+  # NSE circular of 27 Feb 2026. The IPFT (investor protection fund) levy was
+  # cut to Rs 0.01/crore and the transaction charge raised to absorb it, so a
+  # member's TOTAL outflow is unchanged — but the split between the two lines
+  # moved, and this table only models the transaction-charge line. BSE
+  # unaffected.
+  source: "https://www.teamleaseregtech.com/updates/article/53156/nse-issued-a-circular-regarding-the-revision-in-transaction-charges/"
+  brokerage_per_executed_order_paise: 2000
+  stt_sell_bps: 10.0
+  stt_exercise_intrinsic_bps: 12.5
+  exchange_txn_bps:
+    NFO: 3.553
+    BFO: 3.25
+  sebi_bps: 0.01
+  gst_pct: 18.0
+  stamp_buy_bps: 0.3
 
 - effective_from: 2026-04-01
-  verified_at: 2026-07-29
+  verified_at: 2026-08-01
+  # Budget 2026: options STT raised 0.10% -> 0.15% on premium (sell side), and
+  # the exercise rate 0.125% -> 0.15% of intrinsic. This is the regime the
+  # engine trades in today.
   source: "https://zerodha.com/charges"
   brokerage_per_executed_order_paise: 2000
   stt_sell_bps: 15.0

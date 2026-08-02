@@ -56,6 +56,52 @@ class AccountGuardrails:
     risk_per_trade_pct: Decimal
 
 
+# --- Hard ceilings on the dashboard-editable risk fields ---------------
+#
+# These are the ONLY guardrail bounds that are not operator-editable. The
+# Settings page validates nothing meaningful on its own (a `(0, 100]` range
+# check accepts 100% drawdown, which is the same as no limit at all), and
+# the values actually in the live DB on 2026-07-31 were 5% risk per trade,
+# a Rs 45,000 daily loss limit on Rs 3,00,000 capital (15%), and both the
+# drawdown and position-notional caps set to 100% — i.e. disabled.
+#
+# Why these numbers: risk-of-ruin. At 5% risked per trade, a 10-loss streak
+# — which is an ordinary occurrence inside ~250 trades at a ~50% win rate —
+# is a ~40% account drawdown. At 1.5% the same streak costs under 15%. The
+# ceilings below are the conventional prop-desk band, not a preference.
+#
+# Enforced in BOTH directions on purpose:
+#   * `set_guardrails` REJECTS a save above a ceiling, with the ceiling named
+#     in the error, so an operator is told rather than silently overruled.
+#   * `get_guardrails` CLAMPS on read, so values already stored above a
+#     ceiling (all four of the ones above were) stop being honoured
+#     immediately, without needing a migration or a manual re-save. Clamping
+#     is the safe direction: the failure mode is trading smaller than asked,
+#     never larger. The clamped values are what `GET /api/engine/guardrails`
+#     returns, so the dashboard shows what is genuinely in force.
+MAX_RISK_PER_TRADE_PCT = Decimal("1.5")
+MAX_DAILY_LOSS_PCT_OF_CAPITAL = Decimal(5)
+MAX_DRAWDOWN_PCT_CEILING = Decimal(20)
+MAX_POSITION_SIZE_PCT_CEILING = Decimal(25)
+
+
+def _daily_loss_ceiling(capital: Paise) -> Paise:
+    return Paise(int(Decimal(int(capital)) * MAX_DAILY_LOSS_PCT_OF_CAPITAL / Decimal(100)))
+
+
+def clamp_guardrails(guardrails: AccountGuardrails) -> AccountGuardrails:
+    """Lower any field that sits above its hard ceiling. Pure — no session,
+    no I/O — so it is equally usable on a value read from the DB, one parsed
+    off an API request, or one built from `Settings` defaults."""
+    return replace(
+        guardrails,
+        max_daily_loss=Paise(min(int(guardrails.max_daily_loss), int(_daily_loss_ceiling(guardrails.capital)))),
+        max_position_size_pct=min(guardrails.max_position_size_pct, MAX_POSITION_SIZE_PCT_CEILING),
+        max_drawdown_pct=min(guardrails.max_drawdown_pct, MAX_DRAWDOWN_PCT_CEILING),
+        risk_per_trade_pct=min(guardrails.risk_per_trade_pct, MAX_RISK_PER_TRADE_PCT),
+    )
+
+
 def upsert_engine_state(session: Session, key: str, value: str) -> None:
     """The ONE writer for the `engine_state` key/value table — shared with
     `te.execution.halt`, which stores its halt/throttle flags as keys in this
@@ -165,19 +211,25 @@ def get_guardrails(session: Session, *, defaults: AccountGuardrails) -> AccountG
     it. `defaults` is normally `Settings.paper_cycle_*`-derived (see
     `te.engine.scheduler._default_cycle_config`), so an operator who never
     touches the Settings page gets exactly today's env-var behaviour,
-    unchanged."""
-    return AccountGuardrails(
-        capital=Paise(_read_int(session, _CAPITAL_PAISE_KEY, int(defaults.capital))),
-        max_daily_loss=Paise(_read_int(session, _MAX_DAILY_LOSS_PAISE_KEY, int(defaults.max_daily_loss))),
-        max_position_size_pct=_read_decimal(
-            session, _MAX_POSITION_SIZE_PCT_KEY, defaults.max_position_size_pct
-        ),
-        max_drawdown_pct=_read_decimal(session, _MAX_DRAWDOWN_PCT_KEY, defaults.max_drawdown_pct),
-        max_trades_per_day=_read_int(session, _MAX_TRADES_PER_DAY_KEY, defaults.max_trades_per_day),
-        max_concurrent_positions=_read_int(
-            session, _MAX_CONCURRENT_POSITIONS_KEY, defaults.max_concurrent_positions
-        ),
-        risk_per_trade_pct=_read_decimal(session, _RISK_PER_TRADE_PCT_KEY, defaults.risk_per_trade_pct),
+    unchanged.
+
+    The result is passed through `clamp_guardrails` before being returned,
+    so a stored value above a hard ceiling cannot be honoured by anything
+    downstream — including rows written before those ceilings existed."""
+    return clamp_guardrails(
+        AccountGuardrails(
+            capital=Paise(_read_int(session, _CAPITAL_PAISE_KEY, int(defaults.capital))),
+            max_daily_loss=Paise(_read_int(session, _MAX_DAILY_LOSS_PAISE_KEY, int(defaults.max_daily_loss))),
+            max_position_size_pct=_read_decimal(
+                session, _MAX_POSITION_SIZE_PCT_KEY, defaults.max_position_size_pct
+            ),
+            max_drawdown_pct=_read_decimal(session, _MAX_DRAWDOWN_PCT_KEY, defaults.max_drawdown_pct),
+            max_trades_per_day=_read_int(session, _MAX_TRADES_PER_DAY_KEY, defaults.max_trades_per_day),
+            max_concurrent_positions=_read_int(
+                session, _MAX_CONCURRENT_POSITIONS_KEY, defaults.max_concurrent_positions
+            ),
+            risk_per_trade_pct=_read_decimal(session, _RISK_PER_TRADE_PCT_KEY, defaults.risk_per_trade_pct),
+        )
     )
 
 
@@ -201,6 +253,31 @@ def set_guardrails(session: Session, guardrails: AccountGuardrails) -> None:
         raise ValueError(f"max_concurrent_positions must be positive, got {guardrails.max_concurrent_positions}")
     if not (Decimal(0) < guardrails.risk_per_trade_pct <= Decimal(100)):
         raise ValueError(f"risk_per_trade_pct must be in (0, 100], got {guardrails.risk_per_trade_pct}")
+
+    # Hard ceilings — see the constants' comment. Rejected rather than
+    # silently clamped on the WRITE path so the operator is told the limit
+    # exists instead of watching a saved value change under them.
+    if guardrails.risk_per_trade_pct > MAX_RISK_PER_TRADE_PCT:
+        raise ValueError(
+            f"risk_per_trade_pct {guardrails.risk_per_trade_pct}% exceeds the hard ceiling of "
+            f"{MAX_RISK_PER_TRADE_PCT}% — at 5% a 10-loss streak is a ~40% drawdown"
+        )
+    if guardrails.max_position_size_pct > MAX_POSITION_SIZE_PCT_CEILING:
+        raise ValueError(
+            f"max_position_size_pct {guardrails.max_position_size_pct}% exceeds the hard ceiling of "
+            f"{MAX_POSITION_SIZE_PCT_CEILING}%"
+        )
+    if guardrails.max_drawdown_pct > MAX_DRAWDOWN_PCT_CEILING:
+        raise ValueError(
+            f"max_drawdown_pct {guardrails.max_drawdown_pct}% exceeds the hard ceiling of "
+            f"{MAX_DRAWDOWN_PCT_CEILING}% — 100% means the breaker never trips"
+        )
+    ceiling = _daily_loss_ceiling(guardrails.capital)
+    if guardrails.max_daily_loss > ceiling:
+        raise ValueError(
+            f"max_daily_loss {guardrails.max_daily_loss}p exceeds {MAX_DAILY_LOSS_PCT_OF_CAPITAL}% of "
+            f"capital ({ceiling}p)"
+        )
 
     # `te.risk.limits.check_max_drawdown`'s peak-equity watermark tracks
     # capital + P&L — so an editable `capital` field is itself an input to
@@ -348,8 +425,13 @@ def guardrails_defaults_from_settings(settings: Settings) -> AccountGuardrails:
     return AccountGuardrails(
         capital=Paise(settings.paper_cycle_capital_paise),
         max_daily_loss=Paise(settings.paper_cycle_max_daily_loss_paise),
-        max_position_size_pct=Decimal(100),  # no env-var equivalent existed before tonight
-        max_drawdown_pct=Decimal(100),  # ditto — was never enforced pre-Tier-1, see the plan's note
+        # These two have no env-var equivalent, so the default IS the
+        # policy. `Decimal(100)` meant "disabled" for both — a drawdown
+        # breaker that never trips and a position cap that permits the whole
+        # account in one contract. The ceilings are the sane default here,
+        # not merely the upper bound.
+        max_position_size_pct=MAX_POSITION_SIZE_PCT_CEILING,
+        max_drawdown_pct=MAX_DRAWDOWN_PCT_CEILING,
         max_trades_per_day=settings.paper_cycle_max_trades_per_day,
         max_concurrent_positions=settings.paper_cycle_max_concurrent_positions,
         risk_per_trade_pct=settings.paper_cycle_risk_budget_pct,

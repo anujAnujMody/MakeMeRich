@@ -18,6 +18,7 @@ from te.broker.openalgo_login import LoginResult
 from te.broker.openalgo_ws import Instrument, OpenAlgoWSClient
 from te.data.barstore import BarStore
 from te.data.recorder import BarRecorder
+from te.domain.calendar import from_holiday_rows
 from te.domain.clock import IST
 from te.domain.geometry import AbsolutePointGeometry
 from te.domain.money import Paise
@@ -30,6 +31,7 @@ from te.engine.scheduler import (
     should_start_recorder_now,
 )
 from te.engine.state import AccountGuardrails, set_guardrails, set_mode, set_run_state
+from te.engine.trading_calendar import set_calendar
 from te.persistence.db import make_engine, make_session_factory
 from te.persistence.models import Base
 from te.risk import killswitch
@@ -138,7 +140,7 @@ def test_run_openalgo_relogin_calls_login_openalgo_with_settings_credentials(
     assert captured["angel_totp_secret"] == "JBSWY3DPEHPK3PXP"
 
 
-def test_build_scheduler_registers_all_five_jobs(tmp_path: Path) -> None:
+def test_build_scheduler_registers_every_job(tmp_path: Path) -> None:
     engine = create_engine("sqlite:///:memory:")
     scheduler, supervisor, runner = build_scheduler(_settings(), engine=engine, bar_store=BarStore(tmp_path))
 
@@ -149,8 +151,14 @@ def test_build_scheduler_registers_all_five_jobs(tmp_path: Path) -> None:
         "ws_recorder_stop",
         "bhavcopy_ingest",
         "instrument_sync",
+        "trading_calendar_refresh",
         "paper_cycle",
     }
+
+    # The one job that must NOT be mon-fri: it is what tells the rest of the
+    # engine which weekdays are real sessions, so it runs on a Sunday.
+    calendar_job = scheduler.get_job("trading_calendar_refresh")
+    assert "sun" in str(calendar_job.trigger.fields[4]).lower()
 
     ws_start = scheduler.get_job("ws_recorder_start")
     assert "9" in str(ws_start.trigger.fields[5])  # hour field
@@ -315,6 +323,30 @@ def _cycle_config() -> object:
     )
 
 
+#: Two real rows from OpenAlgo's 2026 calendar: one ordinary trading
+#: holiday, and the Diwali Muhurat special session (epoch-ms bounds are the
+#: broker's own, 18:00-19:15 IST).
+_HOLIDAY_ROWS: list[dict[str, object]] = [
+    {
+        "date": "2026-10-02",
+        "description": "Mahatma Gandhi Jayanti",
+        "holiday_type": "TRADING_HOLIDAY",
+        "closed_exchanges": ["NSE", "BSE", "NFO", "BFO"],
+        "open_exchanges": [],
+    },
+    {
+        "date": "2026-11-08",
+        "description": "Diwali Laxmi Pujan (Muhurat Trading)",
+        "holiday_type": "SPECIAL_SESSION",
+        "closed_exchanges": [],
+        "open_exchanges": [
+            {"exchange": "NSE", "start_time": 1794141000000, "end_time": 1794145500000},
+            {"exchange": "NFO", "start_time": 1794141000000, "end_time": 1794145500000},
+        ],
+    },
+]
+
+
 def _runner(tmp_path: Path, *, clock: object) -> PaperCycleRunner:
     from te.data.charges_loader import load_charge_rate_table
 
@@ -327,6 +359,12 @@ def _runner(tmp_path: Path, *, clock: object) -> PaperCycleRunner:
     # "running" here; `test_paper_cycle_skips_when_paused` overrides it back.
     with session_factory() as session:
         set_run_state(session, "running")
+        # The calendar gate (added 2026-08-01) stands the cycle down on any
+        # date it cannot classify — including every date, when nothing has
+        # been fetched. Seed a real calendar so these tests exercise the
+        # gates they are actually about; `test_paper_cycle_skips_on_an
+        # _exchange_holiday` covers the calendar gate itself.
+        set_calendar(session, from_holiday_rows(_HOLIDAY_ROWS), years=[2026])
         session.commit()
     # `te.risk.killswitch`'s in-process flag (layer 1) is a MODULE-LEVEL
     # global, not per-DB state — a prior test in this file calling
@@ -511,8 +549,8 @@ def test_paper_cycle_reads_live_guardrails_without_restart(
             session,
             AccountGuardrails(
                 capital=Paise(9_999_900),
-                max_daily_loss=Paise(500_000),
-                max_position_size_pct=Decimal(30),
+                max_daily_loss=Paise(499_995),  # 5% of 9,999,900p — the hard ceiling
+                max_position_size_pct=Decimal(25),
                 max_drawdown_pct=Decimal(10),
                 max_trades_per_day=3,
                 max_concurrent_positions=1,
@@ -529,7 +567,7 @@ def test_paper_cycle_reads_live_guardrails_without_restart(
     assert second_config.risk_budget_pct == Decimal("1.5")  # type: ignore[attr-defined]
     assert second_config.risk_limits.max_trades_per_day == 3  # type: ignore[attr-defined]
     assert second_config.risk_limits.max_concurrent_positions == 1  # type: ignore[attr-defined]
-    assert second_config.risk_limits.max_daily_loss_paise == Paise(500_000)  # type: ignore[attr-defined]
+    assert second_config.risk_limits.max_daily_loss_paise == Paise(499_995)  # type: ignore[attr-defined]
 
 
 def test_paper_cycle_reads_live_instrument_selections_without_restart(

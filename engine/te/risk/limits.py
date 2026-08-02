@@ -25,6 +25,7 @@ from te.persistence.repos.paper_trading import (
     open_positions_count,
     record_risk_event,
     trades_count_today,
+    trades_today,
 )
 
 
@@ -37,6 +38,11 @@ class RiskLimitsConfig:
     #: call site/test that predates this guardrail keeps behaving exactly as
     #: before. See `check_max_drawdown`.
     max_drawdown_pct: Decimal = Decimal(100)
+    #: Stop taking NEW entries for the rest of the day after this many
+    #: consecutive losing trades. `0` disables it, so every call site and
+    #: test predating this field behaves exactly as before.
+    #: See `check_consecutive_losses`.
+    max_consecutive_losses: int = 0
 
 
 class LimitBreachError(Exception):
@@ -124,6 +130,38 @@ def check_max_concurrent_positions(session: Session, config: RiskLimitsConfig) -
             "max_positions",
             f"{count} position(s) already open, at or above the limit of {config.max_concurrent_positions}",
         )
+
+
+def check_consecutive_losses(session: Session, config: RiskLimitsConfig, *, on: dt.date) -> None:
+    """Stop entering after N straight losers TODAY.
+
+    Deliberately NOT a halt. `check_daily_loss_limit`/`check_max_drawdown`
+    call `set_halt`, which persists across a restart and blocks orders until
+    a human clears it; this one is a soft, self-clearing stand-down that
+    expires with the trading day, because a losing streak is evidence about
+    today's conditions, not a safety failure. It raises `LimitBreachError`
+    like the other two per-entry gates, so `run_entry_cycle` records it as a
+    skip with a real reason and keeps managing OPEN positions normally — a
+    streak must never strand an existing position without its exits.
+
+    Counts backwards from the most recently closed trade and stops at the
+    first non-loss, so a single winner resets the streak. Breakeven (`net ==
+    0`) counts as a reset, not a loss. Reads closed `trades` straight from
+    the DB rather than an in-memory counter, so it survives a restart the
+    same way every other check in this module does."""
+    if config.max_consecutive_losses <= 0:
+        return
+    streak = 0
+    for row in sorted(trades_today(session, on), key=lambda r: r.closed_at, reverse=True):
+        if row.net_pnl_paise >= 0:
+            break
+        streak += 1
+    if streak >= config.max_consecutive_losses:
+        reason = (
+            f"{streak} consecutive losing trade(s) today, at or above the limit of "
+            f"{config.max_consecutive_losses} — no new entries for the rest of the session"
+        )
+        raise LimitBreachError("consecutive_losses", reason)
 
 
 def check_max_trades_per_day(session: Session, config: RiskLimitsConfig, *, on: dt.date) -> None:

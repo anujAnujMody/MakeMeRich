@@ -76,6 +76,22 @@ def expected_max_sharpe_under_null(*, mean_sharpe: float, var_sharpe: float, n_t
     return mean_sharpe + math.sqrt(var_sharpe) * (term_a + term_b)
 
 
+def expected_max_z(n_trials: int) -> float:
+    """Blom's approximation to E[max of `n_trials` standard normals] — the
+    |t| a result must clear before it is more interesting than the best of
+    that many coin flips.
+
+    Distinct from `expected_max_sharpe_under_null`, which needs the observed
+    mean/variance across trials: this one assumes nothing but the trial
+    COUNT, which is what a sweep can report beside its table while it runs.
+    Below two trials there is no multiple-testing problem to correct, so the
+    ordinary two-sided 5% threshold is returned.
+    """
+    if n_trials <= 1:
+        return 1.96
+    return float(norm.ppf((n_trials - 0.375) / (n_trials + 0.25)))
+
+
 def deflated_sharpe_ratio(
     *,
     sr_hat: float,

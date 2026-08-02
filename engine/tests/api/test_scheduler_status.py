@@ -24,6 +24,7 @@ def test_scheduler_status_reports_all_jobs_including_paper_cycle() -> None:
         "ws_recorder_stop",
         "bhavcopy_ingest",
         "instrument_sync",
+        "trading_calendar_refresh",
         "paper_cycle",
     }
 

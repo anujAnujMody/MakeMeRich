@@ -60,9 +60,9 @@ def breakout_store(tmp_path: Path) -> BarStore:
     crossing — the minimal shape that must produce exactly one firing."""
     store = BarStore(tmp_path / "bars")
     day = dt.date(2026, 6, 2)
-    rows = [_bar(_open(day, m), o=100, h=101, low=99, c=100) for m in range(15)]
-    rows.append(_bar(_open(day, 15), o=100, h=105, low=100, c=104))  # crosses out
-    rows.append(_bar(_open(day, 16), o=104, h=106, low=103, c=105))  # stays out
+    rows = [_bar(_open(day, m), o=100, h=101, low=99, c=100) for m in range(60)]
+    rows.append(_bar(_open(day, 60), o=100, h=105, low=100, c=104))  # crosses out
+    rows.append(_bar(_open(day, 61), o=104, h=106, low=103, c=105))  # stays out
     store.append(pd.DataFrame(rows, columns=list(BAR_COLUMNS)))
     return store
 
@@ -224,9 +224,9 @@ def test_replay_does_not_enter_after_the_hard_exit_time(tmp_path: Path, session_
     must not become a training row."""
     store = BarStore(tmp_path / "bars")
     day = dt.date(2026, 6, 2)
-    rows = [_bar(_open(day, m), o=100, h=101, low=99, c=100) for m in range(15)]
+    rows = [_bar(_open(day, m), o=100, h=101, low=99, c=100) for m in range(60)]
     # Flat until after 15:20 IST (minute 365), then a late crossing.
-    rows += [_bar(_open(day, m), o=100, h=101, low=99, c=100) for m in range(15, 368)]
+    rows += [_bar(_open(day, m), o=100, h=101, low=99, c=100) for m in range(60, 368)]
     rows.append(_bar(_open(day, 368), o=100, h=110, low=100, c=109))  # 15:23 IST
     store.append(pd.DataFrame(rows, columns=list(BAR_COLUMNS)))
 
@@ -272,4 +272,30 @@ def test_the_opening_range_length_actually_reaches_the_rule(tmp_path: Path, sess
 
     assert short_range != long_range, (
         f"both range lengths produced {short_range} firings — the swept value never reached the rule"
+    )
+
+
+def test_the_replay_entry_cutoff_matches_what_the_live_engine_would_accept() -> None:
+    """`DEFAULT_LAST_ENTRY` must equal the live engine's last tradeable
+    minute, or the training set contains firings the engine would refuse.
+
+    That divergence is silent and self-reinforcing: the model learns from
+    late-day trades it will never be offered, and every win rate derived
+    from those labels describes a strategy nobody runs. It went unnoticed
+    once already — the constant stayed at 15:20 after `hard_exit_by` moved
+    to 15:15 and the runway rule went from 0 to 40 minutes on 2026-08-01.
+    """
+    import datetime as dt
+
+    from te.backtest.replay import DEFAULT_LAST_ENTRY
+    from te.settings import Settings
+
+    settings = Settings()
+    hard_exit = dt.datetime.combine(dt.date(2026, 8, 3), settings.paper_cycle_hard_exit_by)
+    last_entry = hard_exit - dt.timedelta(minutes=settings.paper_cycle_min_minutes_before_hard_exit)
+
+    assert DEFAULT_LAST_ENTRY == last_entry.time(), (
+        f"replay accepts entries until {DEFAULT_LAST_ENTRY}, but the live engine stops at "
+        f"{last_entry.time()} (hard exit {settings.paper_cycle_hard_exit_by} minus "
+        f"{settings.paper_cycle_min_minutes_before_hard_exit}m runway)"
     )

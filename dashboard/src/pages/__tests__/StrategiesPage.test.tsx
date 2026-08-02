@@ -11,7 +11,10 @@ describe('StrategiesPage', () => {
 
   it('shows subtitle', () => {
     renderWithProviders(<StrategiesPage />)
-    expect(screen.getByText(/AI-discovered strategies/)).toBeInTheDocument()
+    // Was "AI-discovered strategies", which was never true — nothing in this
+    // project discovers strategies on its own. They are a hand-written
+    // library, measured against real prices.
+    expect(screen.getByText(/tested on real prices/i)).toBeInTheDocument()
   })
 
   it('shows loading state initially', () => {
@@ -54,10 +57,19 @@ describe('StrategiesPage', () => {
     expect(await screen.findByText('Nifty Call Selling')).toBeInTheDocument()
   })
 
-  it('shows the backtest panel as not-available-yet rather than fabricating numbers', async () => {
+  it('explains that the score already subtracts luck, and names the coin-flip control', async () => {
     renderWithProviders(<StrategiesPage />)
-    expect(await screen.findByText(/backtest results/i)).toBeInTheDocument()
-    expect(await screen.findByText(/not available yet/i)).toBeInTheDocument()
+    // Replaces a "Backtest results — not available yet" placeholder. The
+    // backtest engine now exists and every card carries a real result, so
+    // that copy had become the page's own lie.
+    //
+    // What matters instead is that the reader is told WHY the headline
+    // number is not the win rate: with 32 strategies on one page, the best
+    // win rate is very likely luck, and nothing on the page says so unless
+    // this panel does.
+    expect(await screen.findByText(/how to read these/i)).toBeInTheDocument()
+    expect(await screen.findByText(/subtracts how much of the/i)).toBeInTheDocument()
+    expect(await screen.findByText(/cannot beat a coin flip/i)).toBeInTheDocument()
   })
 
   it('pausing a strategy persists — it stays paused after the list refetches, not just local UI state', async () => {

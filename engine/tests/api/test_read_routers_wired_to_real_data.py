@@ -159,11 +159,11 @@ def test_dashboard_snapshot_limits_reflect_real_guardrails_not_hardcoded_zero(is
     payload = {
         "capitalRupees": 20000,
         "maxDailyLossRupees": 700,
-        "maxPositionSizePct": 100,
-        "maxDrawdownPct": 100,
+        "maxPositionSizePct": 25,
+        "maxDrawdownPct": 20,
         "maxTradesPerDay": 10,
         "maxConcurrentPositions": 5,
-        "riskPerTradePct": 2,
+        "riskPerTradePct": 1.5,
     }
     put_response = client.put("/api/engine/guardrails", json=payload)
     assert put_response.status_code == 200
@@ -325,11 +325,11 @@ def test_equity_curve_reflects_capital_plus_real_realized_pnl(isolated_client) -
         json={
             "capitalRupees": 20000,
             "maxDailyLossRupees": 700,
-            "maxPositionSizePct": 100,
-            "maxDrawdownPct": 100,
+            "maxPositionSizePct": 25,
+            "maxDrawdownPct": 20,
             "maxTradesPerDay": 10,
             "maxConcurrentPositions": 5,
-            "riskPerTradePct": 2,
+            "riskPerTradePct": 1.5,
         },
     )
     assert put_response.status_code == 200

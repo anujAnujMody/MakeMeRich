@@ -39,6 +39,7 @@ from te.data.history_backfill import backfill_index_bars, month_windows
 from te.engine.contract import UNDERLYING_INDEX_EXCHANGES
 from te.persistence.db import make_engine, make_session_factory
 from te.settings import Settings
+from te.strategy.orb import OrbStrategy
 
 #: Symbol -> the exchange its SPOT quote lives on, straight from
 #: `te.engine.contract` rather than restated here — the engine already owns
@@ -62,6 +63,18 @@ def main() -> int:
     parser.add_argument("--start", required=True, help="YYYY-MM-DD")
     parser.add_argument("--end", required=True, help="YYYY-MM-DD")
     parser.add_argument("--backfill-only", action="store_true")
+    parser.add_argument(
+        "--strategy",
+        default="orb",
+        help=(
+            "name the firings are RECORDED under. `orb` is the live engine's own name, so a "
+            "replay run under it lands in the same bucket as real paper decisions AND as every "
+            "earlier replay — including ones made under different rule parameters. "
+            "`evaluation_id` is (name, instrument, minute) and is UNIQUE, so on any overlapping "
+            "date the OLDER row wins and the new one is silently skipped, leaving one dataset "
+            "holding two different strategies. Pass a distinct name for any parameter variant."
+        ),
+    )
     parser.add_argument("--replay-only", action="store_true")
     parser.add_argument(
         "--instruments",
@@ -123,7 +136,18 @@ def main() -> int:
     engine = make_engine(settings.database_url)
     session_factory = make_session_factory(engine)
     result = replay_orb(
-        store=store, session_factory=session_factory, instruments=instruments, start=start, end=end
+        store=store,
+        session_factory=session_factory,
+        instruments=instruments,
+        start=start,
+        end=end,
+        strategy_name=args.strategy,
+        # Load-bearing, not cosmetic: `strategy_name` alone only picks a
+        # registry factory. The name actually RECORDED comes from the
+        # strategy object, so without this the rows land under "orb"
+        # regardless. Found the hard way on 2026-07-31 by a range-length
+        # sweep whose every length wrote as "orb".
+        strategy_factory=lambda: OrbStrategy(name=args.strategy),
     )
 
     print(f"\nreplay over {result.days} instrument-days")

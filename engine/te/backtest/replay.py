@@ -59,11 +59,22 @@ from te.strategy.registry import get as get_strategy
 
 logger = structlog.get_logger(__name__)
 
-#: Replay stops entering at the same wall-clock time the live engine does
-#: (`Settings.paper_cycle_hard_exit_by`), so the replayed firing
-#: distribution matches the tradeable one. A firing at 15:25 would be
-#: force-closed on the same cycle live and must not become a training row.
-DEFAULT_LAST_ENTRY = dt.time(15, 20)
+#: Replay stops entering when the LIVE engine stops entering, so the
+#: replayed firing distribution matches the tradeable one. A firing the
+#: engine would refuse must not become a training row: the model would learn
+#: from trades it will never be offered, and every win rate derived from
+#: those labels would describe a strategy nobody runs.
+#:
+#: 14:35 = `paper_cycle_hard_exit_by` (15:15) minus
+#: `paper_cycle_min_minutes_before_hard_exit` (40). Both moved on
+#: 2026-08-01 — the hard exit off 15:20 to clear Angel's own RMS square-off,
+#: and the runway rule up from 0 to the measured median time-to-target — and
+#: this constant did not follow them until now.
+#:
+#: Kept a literal rather than imported from `Settings` because `te.backtest`
+#: must stay runnable without the engine's env-var configuration; the two
+#: are pinned together by `tests/backtest/test_replay.py` instead.
+DEFAULT_LAST_ENTRY = dt.time(14, 35)
 
 
 @dataclass

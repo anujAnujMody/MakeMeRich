@@ -28,8 +28,9 @@ from te.api.routers import (
 )
 from te.domain.clock import IST
 from te.engine.scheduler import build_scheduler, should_start_recorder_now
+from te.engine.trading_calendar import get_calendar
 from te.ops.logging import configure_logging
-from te.persistence.db import engine_from_settings
+from te.persistence.db import engine_from_settings, make_session_factory
 from te.settings import Settings
 
 
@@ -68,7 +69,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # `BackgroundScheduler` has no memory of a missed fire — a same-day
         # restart after 09:10 would otherwise silently lose the rest of the
         # session's bars until tomorrow. See `should_start_recorder_now`.
-        if should_start_recorder_now(dt.datetime.now(IST)):
+        with make_session_factory(db_engine)() as session:
+            calendar = get_calendar(session)
+        if should_start_recorder_now(dt.datetime.now(IST), calendar):
             supervisor.start()
         try:
             yield

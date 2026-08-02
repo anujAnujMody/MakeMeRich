@@ -55,9 +55,14 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     for module in (decisions_router, execution_router, trades_router):
         monkeypatch.setattr(module, "session_factory", factory)
 
-    # 12:40:00 IST on a real trading day == 07:10:00 UTC — the exact pair of
-    # wall-clock readings from the screenshot that exposed this.
-    ist_now = dt.datetime(2026, 7, 31, 12, 40, tzinfo=IST)
+    # 12:40:00 IST == 07:10:00 UTC — the exact pair of wall-clock readings
+    # from the screenshot that exposed this. The TIME is the fixture; the
+    # DATE must be today's, because `/api/decisions/today` filters to the
+    # current IST date. Pinned to a literal 2026-07-31 originally, this
+    # whole file started failing the moment the clock passed midnight into
+    # 2026-08-01 — a fixture that expires is indistinguishable from a
+    # regression at the moment you most want to trust the suite.
+    ist_now = dt.datetime.combine(dt.datetime.now(IST).date(), dt.time(12, 40), tzinfo=IST)
     with factory() as session:
         record_skipped_signal(session, ts=ist_now, strategy="orb", instrument="NIFTY", reason="no breakout")
         session.add(

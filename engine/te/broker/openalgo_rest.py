@@ -20,6 +20,8 @@ from typing import Any
 
 import httpx
 
+from te.broker.ratelimit import TokenBucket
+
 
 class OpenAlgoRestError(RuntimeError):
     """Raised when OpenAlgo responds with `status != "success"` or the HTTP
@@ -104,10 +106,34 @@ class OpenAlgoRestClient:
     `te/broker/openalgo_rest.py` spec ("apikey in JSON body; typed
     responses")."""
 
-    def __init__(self, host: str, api_key: str, *, timeout: float = 10.0) -> None:
+    def __init__(
+        self,
+        host: str,
+        api_key: str,
+        *,
+        timeout: float = 10.0,
+        quotes_per_second: float | None = None,
+    ) -> None:
+        """`quotes_per_second` throttles `quotes()` only — `None` disables
+        throttling entirely, which is what every test and offline caller
+        wants.
+
+        Deliberately scoped to `quotes()` rather than to `_post`: Angel
+        rate-limits the quote endpoint far more tightly than the rest
+        (published 1/sec), and applying that ceiling to expiry/optionsymbol
+        lookups would add a full second to opening a position for no reason.
+        Order placement has its own, separate budget in
+        `te.execution.manager` (`te.broker.ratelimit.TokenBucket` at
+        `Settings.max_orders_per_second`) — the two must not share a bucket,
+        since a burst of marks must never delay an exit order."""
         self._host = host.rstrip("/")
         self._api_key = api_key
         self._timeout = timeout
+        self._quote_limiter = (
+            TokenBucket(rate=quotes_per_second, capacity=max(1, int(quotes_per_second)))
+            if quotes_per_second is not None and quotes_per_second > 0
+            else None
+        )
 
     def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         """POSTs `payload` (plus the apikey) and returns the decoded
@@ -151,6 +177,12 @@ class OpenAlgoRestClient:
         return data
 
     def quotes(self, symbol: str, exchange: str) -> Quote:
+        """Throttled to `quotes_per_second` when one was configured — see
+        `__init__`. Blocks rather than failing: a mark arriving a second
+        late is fine; a mark that silently fails leaves an open position
+        priced at a stale value with no stop able to fire."""
+        if self._quote_limiter is not None:
+            self._quote_limiter.acquire()
         data = self._post("/api/v1/quotes", {"symbol": symbol, "exchange": exchange})["data"]
         return Quote(
             symbol=symbol,
@@ -196,6 +228,22 @@ class OpenAlgoRestClient:
             )
             for row in data
         ]
+
+    def holiday_rows(self, year: int) -> list[dict[str, Any]]:
+        """The exchange holiday calendar for `year`, straight from the
+        broker — the raw rows, parsed into a `TradingCalendar` by
+        `te.domain.calendar.from_holiday_rows` (kept separate so the parsing
+        is pure and unit-testable without a broker).
+
+        Note the path is `market/holidays`, not `holidays`: verified against
+        the running OpenAlgo instance on 2026-08-01, where the un-prefixed
+        path returns the SPA's HTML shell with a 200, which a naive caller
+        would happily try to parse as JSON.
+
+        This is the only authoritative source available. Deriving the
+        calendar from weekday arithmetic misses ~17 dates a year in one
+        direction and Diwali Muhurat trading in the other."""
+        return [dict(row) for row in self._post("/api/v1/market/holidays", {"year": year})["data"]]
 
     def expiry_dates(self, symbol: str, exchange: str, instrument_type: str = "options") -> list[str]:
         """Broker-confirmed expiry dates for an underlying, nearest first, in

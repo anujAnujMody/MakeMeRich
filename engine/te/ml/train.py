@@ -21,20 +21,36 @@ they require. AUC appears in this module for ONE purpose only — ranking
 hyperparameter configs inside the inner loop — and is never written to the
 ledger's `sharpe` column.
 
-**Model choice: XGBoost, not CatBoost.** The plan allows either ("CatBoost
-first if straightforward... XGBoost as fallback/comparator if CatBoost adds
-meaningful complexity/risk — your call"). XGBoost was chosen because (a) it
-is already an installed, working dependency in this environment (verified
-`xgboost==3.3.0` importable with no setup), matching the plan's own tooling
-list which pins `xgboost>=3.3,<4` as available "per earlier phases"; (b)
-CatBoost's own pip install pulls ~120MB of transitive dependencies
-(`matplotlib`, `plotly`, `graphviz`, `pillow`, ...) purely for its bundled
-visualisation tooling, none of which this headless engine uses — meaningful
-added complexity/risk for zero functional benefit at this project's small-n
-sample size, where CatBoost's main advantages (native categorical handling,
-Bayesian bootstrap) don't materially matter for a 7-feature, mostly-numeric
-spec. `lightgbm` is never imported anywhere in this module — explicitly
-banned by the plan (leaf-wise growth overfits at a few thousand rows).
+**Model choice: three backends behind one switch.** `ModelBackend` selects
+XGBoost (the default, and what every existing caller keeps getting),
+CatBoost or a scikit-learn Random Forest. The nested-CV machinery around
+them is identical, so all three are compared on identical data and identical
+splits — the only honest way to compare them at all.
+
+- **XGBoost** stays the default: it is the wired, installed incumbent
+  (`xgboost>=3.3,<4`) and every recorded number to date came from it.
+- **CatBoost** is here because its ORDERED boosting is the most
+  overfit-resistant of the three below ~5,000 samples, which is squarely our
+  regime (~1,200 labelled firings). Its pip install does drag in ~120MB of
+  visualisation dependencies this headless engine never uses; that cost is
+  accepted for the small-n robustness, not for any plotting.
+- **Random Forest** is the baseline Lopez de Prado's own meta-labeling work
+  used — a sanity comparator, not a candidate for sophistication.
+
+`lightgbm` is never imported anywhere in this module — explicitly banned by
+the plan (leaf-wise growth overfits at a few thousand rows) and not
+installed. TabPFN is likewise excluded: its licence forbids commercial and
+production use including internal commercial decision-making, which trading
+real money is.
+
+**Three models is three times the search, and the ledger must say so.**
+Every backend's every inner-CV trial is recorded under the SAME
+`f"{run_id}:inner"` scope, so `deflated_sharpe_ratio()` deflates against the
+true total across backends rather than each model's own third of it.
+Reporting a winner's DSR deflated for one backend's trials after searching
+three is the exact way an edge gets fabricated. The recorded `config_hash`
+includes the backend, so an identical config dict under two libraries counts
+as the two distinct things it is.
 
 **Simplification, flagged clearly:** turning classifier outputs into a
 Sharpe-ratio-shaped return series for DSR/PBO requires an economic P&L
@@ -55,12 +71,16 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from enum import StrEnum
+from typing import Any, Protocol
 
 import numpy as np
 import pandas as pd
+from catboost import CatBoostClassifier
 from scipy.stats import kurtosis, skew
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import roc_auc_score
 from xgboost import XGBClassifier
 
@@ -117,6 +137,142 @@ FIXED_XGB_PARAMS: dict[str, Any] = {
     "importance_type": "gain",
 }
 
+
+class ModelBackend(StrEnum):
+    """Which library fits the classifier. The nested CV, purging, ledger
+    recording, calibration and metrics are identical for all three — this
+    switch changes ONLY the estimator and its hyperparameter grid, which is
+    what makes a comparison between them meaningful."""
+
+    XGBOOST = "xgboost"
+    CATBOOST = "catboost"
+    RANDOM_FOREST = "random_forest"
+    #: A pretrained tabular foundation model, not a learner fitted from
+    #: scratch. It is in this enum because it must be COMPARED on identical
+    #: terms — same purged folds, same ledger, same calibration — but see
+    #: `_make_tabicl` for the two ways it is genuinely different.
+    TABICL = "tabicl"
+
+
+#: CatBoost constructor arguments held FIXED across every fit — same
+#: contract as `FIXED_XGB_PARAMS`: never swept, so they never inflate the
+#: trial count `deflated_sharpe_ratio()` deflates against.
+#:
+#: - `boosting_type="Ordered"` is the whole reason CatBoost is here. Its
+#:   ordered target statistics are what makes it the most overfit-resistant
+#:   of the three below ~5,000 rows; the faster "Plain" mode would throw
+#:   that away and leave a slower XGBoost.
+#: - `random_seed=42` — reproducibility, mirroring XGBoost's `random_state`.
+#: - `verbose=False` — this runs in a script, not a notebook.
+#: - `allow_writing_files=False` — CatBoost otherwise scatters a
+#:   `catboost_info/` directory wherever the process happens to be cwd'd.
+#: - `min_data_in_leaf=5`, `l2_leaf_reg=3.0` — the same "a leaf may not form
+#:   on a handful of rows" discipline as XGBoost's `min_child_weight=5`.
+FIXED_CATBOOST_PARAMS: dict[str, Any] = {
+    "random_seed": 42,
+    "thread_count": -1,
+    "verbose": False,
+    "allow_writing_files": False,
+    "boosting_type": "Ordered",
+    "min_data_in_leaf": 5,
+    "l2_leaf_reg": 3.0,
+}
+
+#: Random Forest constructor arguments held FIXED across every fit.
+#:
+#: - `class_weight="balanced"` is sklearn's equivalent of
+#:   `scale_pos_weight`, and it is derived from the `y` handed to `fit()` —
+#:   i.e. the FOLD's own labels, never the full dataset, which is the same
+#:   no-leakage property `_scale_pos_weight` is careful about.
+#: - `min_samples_leaf=5` — sklearn's default of 1 lets a leaf be a single
+#:   row, far too permissive at a few hundred training rows.
+#: - `max_features="sqrt"` — the column subsampling that makes a forest a
+#:   forest rather than a bag of identical trees.
+FIXED_RANDOM_FOREST_PARAMS: dict[str, Any] = {
+    "random_state": 42,
+    "n_jobs": -1,
+    "class_weight": "balanced",
+    "min_samples_leaf": 5,
+    "max_features": "sqrt",
+}
+
+#: Each backend's grid is deliberately the SAME SIZE (3 configurations) so
+#: no backend gets a wider search than another — a wider search finds a
+#: better-looking number for free, and comparing an 8-config sweep against a
+#: 3-config one would reward search breadth, not model quality.
+CATBOOST_PARAM_GRID: tuple[dict[str, Any], ...] = (
+    {"iterations": 50, "depth": 2, "learning_rate": 0.1},
+    {"iterations": 100, "depth": 3, "learning_rate": 0.05},
+    {"iterations": 50, "depth": 3, "learning_rate": 0.1},
+)
+
+#: Forests need many more trees than a boosted ensemble needs rounds (they
+#: average rather than correct), and depth is the only real capacity knob
+#: once `min_samples_leaf` is pinned.
+RANDOM_FOREST_PARAM_GRID: tuple[dict[str, Any], ...] = (
+    {"n_estimators": 200, "max_depth": 2},
+    {"n_estimators": 400, "max_depth": 3},
+    {"n_estimators": 200, "max_depth": 3},
+)
+
+#: TabICL constructor arguments held FIXED across every fit.
+#:
+#: - `random_state=42` — same reproducibility contract as the other three.
+#: - `device=None` lets TabICL pick CUDA when present and fall back to CPU.
+#:   This project runs CPU-only in Docker; the authors report a 50,000-row
+#:   fit in under 10s on an H100, and CPU is materially slower but entirely
+#:   workable at our ~2,600 rows.
+#: - `allow_auto_download=True` — the pretrained checkpoint is fetched from
+#:   HuggingFace on first use. Stated explicitly because it means the first
+#:   run needs network access, unlike every other backend here.
+FIXED_TABICL_PARAMS: dict[str, Any] = {
+    "random_state": 42,
+    "device": None,
+    "allow_auto_download": True,
+}
+
+#: TabICL is PRETRAINED — there is no learning rate or tree depth to sweep,
+#: because nothing is fitted. What these three vary is INFERENCE-time
+#: ensembling: how many permuted views of the data get averaged, and how
+#: sharply the resulting logits are turned into probabilities.
+#:
+#: Kept at three configurations like every other grid so no backend gets a
+#: wider search than another (see `CATBOOST_PARAM_GRID`'s note). The
+#: comparison is only meaningful if search breadth is held equal.
+TABICL_PARAM_GRID: tuple[dict[str, Any], ...] = (
+    {"n_estimators": 8, "softmax_temperature": 0.9},
+    {"n_estimators": 16, "softmax_temperature": 0.9},
+    {"n_estimators": 8, "softmax_temperature": 1.0},
+)
+
+#: Below this many training rows `_make_tabicl` REFUSES rather than returning
+#: a number. The authors state TabICL is pretrained on datasets of 300-48,000
+#: samples and that they "have not tested if TabICL generalizes to datasets
+#: smaller than 300 samples" (soda-inria/tabicl). Independent benchmarking
+#: additionally found fine-tuning it on small data collapses accuracy
+#: (0.873 -> 0.567 on TabZilla), which is why this project uses it zero-shot
+#: only and never fine-tunes it.
+#:
+#: A silent prediction from outside a model's documented range is exactly the
+#: kind of unearned number this project exists to refuse — and it would be
+#: invisible downstream, because an out-of-range TabICL still returns
+#: well-formed probabilities.
+MIN_TABICL_TRAINING_ROWS = 300
+
+BACKEND_PARAM_GRIDS: dict[ModelBackend, tuple[dict[str, Any], ...]] = {
+    ModelBackend.XGBOOST: DEFAULT_PARAM_GRID,
+    ModelBackend.CATBOOST: CATBOOST_PARAM_GRID,
+    ModelBackend.RANDOM_FOREST: RANDOM_FOREST_PARAM_GRID,
+    ModelBackend.TABICL: TABICL_PARAM_GRID,
+}
+
+BACKEND_FIXED_PARAMS: dict[ModelBackend, dict[str, Any]] = {
+    ModelBackend.XGBOOST: FIXED_XGB_PARAMS,
+    ModelBackend.CATBOOST: FIXED_CATBOOST_PARAMS,
+    ModelBackend.RANDOM_FOREST: FIXED_RANDOM_FOREST_PARAMS,
+    ModelBackend.TABICL: FIXED_TABICL_PARAMS,
+}
+
 #: Preflight thresholds for `validate_training_set`.
 MAX_ABS_FEATURE_LABEL_CORRELATION = 0.5
 MIN_MINORITY_CLASS_FRACTION = 0.02
@@ -138,12 +294,34 @@ class TrainResult:
     feature_importances_per_outer_fold: tuple[dict[str, float], ...] = ()
 
 
-def _config_hash(config: dict[str, Any]) -> str:
-    return hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
+class _Estimator(Protocol):
+    """The only surface `train_meta_model` needs from a backend: fit it with
+    optional sample weights, get probabilities out, and read per-feature
+    importances (so `TrainResult.feature_importances_per_outer_fold` keeps
+    working for all three). `get_params` is what
+    `sklearn.calibration.CalibratedClassifierCV` needs to clone it."""
+
+    feature_importances_: FloatArray
+
+    def fit(self, x: FloatArray, y: IntArray, sample_weight: FloatArray | None = ...) -> object: ...
+
+    def predict_proba(self, x: FloatArray) -> FloatArray: ...
+
+    def get_params(self, deep: bool = ...) -> dict[str, Any]: ...
+
+
+def _config_hash(config: dict[str, Any], backend: ModelBackend) -> str:
+    """The backend is part of a trial's identity: `{"n_estimators": 20,
+    "max_depth": 2}` describes a different model under XGBoost than under a
+    Random Forest, and hashing them the same would make two genuinely
+    distinct searches look like one config re-run."""
+    return hashlib.sha256(json.dumps({"_backend": backend.value, **config}, sort_keys=True).encode()).hexdigest()
 
 
 def _scale_pos_weight(y: IntArray) -> float:
-    """`n_negative / n_positive` — XGBoost's class-imbalance correction.
+    """`n_negative / n_positive` — the `scale_pos_weight` XGBoost and
+    CatBoost both take (sklearn's forest uses `class_weight="balanced"`
+    instead, which derives the same correction from the `y` it is fitted on).
 
     **Always computed on the FOLD's own training labels, never on the full
     dataset.** The full-dataset ratio summarises the test block's class
@@ -157,22 +335,141 @@ def _scale_pos_weight(y: IntArray) -> float:
     return n_neg / n_pos
 
 
-def _make_xgb(config: dict[str, Any], y_train: IntArray) -> XGBClassifier:
+def _make_xgb(config: dict[str, Any], y_train: IntArray) -> _Estimator:
     """An UNFITTED classifier for `config`, carrying `FIXED_XGB_PARAMS` and a
     `scale_pos_weight` derived from `y_train` alone."""
-    return XGBClassifier(
+    estimator: _Estimator = XGBClassifier(
         objective="binary:logistic",
         eval_metric="logloss",
         scale_pos_weight=_scale_pos_weight(y_train),
         **FIXED_XGB_PARAMS,
         **config,
     )
+    return estimator
 
 
-def _fit_xgb(
-    config: dict[str, Any], x: FloatArray, y: IntArray, sample_weight: FloatArray | None = None
-) -> XGBClassifier:
-    model = _make_xgb(config, y)
+def _make_catboost(config: dict[str, Any], y_train: IntArray) -> _Estimator:
+    """CatBoost spells the imbalance correction exactly as XGBoost does, so
+    `_scale_pos_weight` is reused verbatim — same fold-local computation,
+    same no-leakage guarantee."""
+    estimator: _Estimator = CatBoostClassifier(
+        loss_function="Logloss",
+        scale_pos_weight=_scale_pos_weight(y_train),
+        **FIXED_CATBOOST_PARAMS,
+        **config,
+    )
+    return estimator
+
+
+def _make_random_forest(config: dict[str, Any], y_train: IntArray) -> _Estimator:
+    """`y_train` is unused here on purpose: sklearn has no `scale_pos_weight`
+    knob, and `class_weight="balanced"` (in `FIXED_RANDOM_FOREST_PARAMS`)
+    already derives the same `n_neg/n_pos`-shaped correction from whatever
+    `y` reaches `fit()` — which is this fold's training labels and nothing
+    else. The parameter stays in the signature so all three constructors
+    share one shape."""
+    del y_train
+    estimator: _Estimator = RandomForestClassifier(**FIXED_RANDOM_FOREST_PARAMS, **config)
+    return estimator
+
+
+class TabIclUnavailableError(RuntimeError):
+    """`tabicl` is not installed. Its own name so a caller can tell "the
+    optional dependency is missing" apart from "the model refused"."""
+
+
+class TabIclDatasetTooSmallError(ValueError):
+    """Fewer training rows than TabICL's authors have tested it on."""
+
+
+def _make_tabicl(config: dict[str, Any], y_train: IntArray) -> _Estimator:
+    """An UNFITTED `TabICLClassifier`, or a refusal.
+
+    Two things make this backend genuinely different from the other three,
+    and both are enforced here rather than left to the caller:
+
+    1. **It is never fine-tuned.** `fit()` on a TabICL classifier stores the
+       training rows as in-context examples; the transformer weights are the
+       pretrained ones and stay frozen. That is deliberate — independent
+       benchmarking found fine-tuning it on small data collapses accuracy
+       (0.873 -> 0.567). There is consequently no fine-tuning switch exposed
+       anywhere in this module.
+    2. **It refuses small datasets** (`MIN_TABICL_TRAINING_ROWS`) instead of
+       extrapolating outside its documented range. Note this is checked
+       against the FOLD's training rows, not the whole dataset, because a
+       dataset comfortably above the floor can still produce inner folds
+       below it — and it is the fold that actually gets predicted from.
+
+    `tabicl` is an OPTIONAL dependency (it pulls in `torch`, ~2GB installed),
+    so the import is local: the engine's live path must not pay for a
+    research-time model, and `import te.ml.train` has to keep working on an
+    install that never asked for it.
+    """
+    try:
+        from tabicl import TabICLClassifier
+    except ImportError as exc:  # pragma: no cover — exercised by its own test via monkeypatch
+        raise TabIclUnavailableError(
+            "the 'tabicl' backend needs the optional dependency: pip install 'trading-engine[foundation]' "
+            "(pulls in torch — see pyproject.toml for the CPU-wheel note)"
+        ) from exc
+
+    if len(y_train) < MIN_TABICL_TRAINING_ROWS:
+        raise TabIclDatasetTooSmallError(
+            f"TabICL refused a training fold of {len(y_train)} rows: its authors state it is pretrained on "
+            f"300-48,000 samples and untested below {MIN_TABICL_TRAINING_ROWS}. Predicting from outside a "
+            "model's documented range still returns well-formed probabilities, which is precisely why this "
+            "refuses instead of warning."
+        )
+
+    estimator: _Estimator = TabICLClassifier(**FIXED_TABICL_PARAMS, **config)
+    return estimator
+
+
+_BACKEND_CONSTRUCTORS: dict[ModelBackend, Callable[[dict[str, Any], IntArray], _Estimator]] = {
+    ModelBackend.XGBOOST: _make_xgb,
+    ModelBackend.CATBOOST: _make_catboost,
+    ModelBackend.RANDOM_FOREST: _make_random_forest,
+    ModelBackend.TABICL: _make_tabicl,
+}
+
+
+def _make_estimator(backend: ModelBackend, config: dict[str, Any], y_train: IntArray) -> _Estimator:
+    """An UNFITTED estimator of `backend` for `config`. `backend` is
+    validated once at `train_meta_model`'s door (see `_resolve_backend`), so
+    an unknown one never reaches this hot loop."""
+    return _BACKEND_CONSTRUCTORS[backend](config, y_train)
+
+
+def _resolve_backend(backend: ModelBackend | str) -> ModelBackend:
+    """Raises on an unknown backend rather than silently falling back to
+    XGBoost — a typo'd backend that quietly trained a different model than
+    the caller asked for would mislabel every number it produced."""
+    try:
+        return ModelBackend(backend)
+    except ValueError as exc:
+        raise ValueError(
+            f"unknown model backend {backend!r} — expected one of {[b.value for b in ModelBackend]}"
+        ) from exc
+
+
+def _config_key(config: dict[str, Any], backend: ModelBackend) -> str:
+    """Stable identity for one hyperparameter configuration — sorted so two
+    dicts with the same contents in a different insertion order are the same
+    row of the CSCV matrix, not two. Carries the backend for the same reason
+    `_config_hash` does; a single `train_meta_model` call only ever runs one
+    backend, so this is documentation of that invariant rather than a
+    behaviour change."""
+    return json.dumps({"_backend": backend.value, **config}, sort_keys=True)
+
+
+def _fit_estimator(
+    backend: ModelBackend,
+    config: dict[str, Any],
+    x: FloatArray,
+    y: IntArray,
+    sample_weight: FloatArray | None = None,
+) -> _Estimator:
+    model = _make_estimator(backend, config, y)
     model.fit(x, y, sample_weight=sample_weight)
     return model
 
@@ -363,6 +660,7 @@ def _run_inner_cv(
     inner_splits: int,
     trial_ledger: TrialLedger,
     run_id: str,
+    backend: ModelBackend,
 ) -> dict[str, Any]:
     """Runs `PurgedKFold` inner CV over `x_train`/`y_train` for every config
     in `param_grid`, recording EVERY (config, split) trial to
@@ -395,7 +693,8 @@ def _run_inner_cv(
                 continue
             if not _is_trainable(y_train[train_idx]):
                 continue
-            model = _fit_xgb(
+            model = _fit_estimator(
+                backend,
                 config,
                 x_train[train_idx],
                 y_train[train_idx],
@@ -408,9 +707,12 @@ def _run_inner_cv(
             # AUC ranks configs (above); a real return-based Sharpe goes in
             # the ledger (see this function's docstring).
             trial_returns = _agreement_returns(y_train[val_idx], (preds >= 0.5).astype(int))
+            # Same `kind` for every backend, deliberately: a second model run
+            # against this `run_id` ADDS to the N that DSR deflates against,
+            # never starts a fresh count. See the module docstring.
             trial_ledger.record(
                 kind=f"{run_id}:inner",
-                config_hash=_config_hash(config),
+                config_hash=_config_hash(config, backend),
                 sharpe=_per_observation_sharpe(trial_returns),
                 run_id=run_id,
             )
@@ -435,7 +737,8 @@ def train_meta_model(
     sample_weights: pd.Series | None = None,
     outer_splits: int = DEFAULT_OUTER_SPLITS,
     inner_splits: int = 3,
-    param_grid: tuple[dict[str, Any], ...] = DEFAULT_PARAM_GRID,
+    param_grid: tuple[dict[str, Any], ...] | None = None,
+    backend: ModelBackend = ModelBackend.XGBOOST,
 ) -> TrainResult:
     """Nested-CV trains a `MetaModel` for `spec`. `features`/`labels`/
     `prediction_times`/`evaluation_times` must share the same index, sorted
@@ -446,12 +749,23 @@ def train_meta_model(
 
     `sample_weights`, when given, must share `features`' index — these are
     `te.ml.labeling`'s Lopez de Prado uniqueness weights
-    (`LabeledFiring.weight`), and they are threaded into BOTH the XGBoost
-    fits and the Platt calibrator's fit. Overlapping triple-barrier labels
+    (`LabeledFiring.weight`), and they are threaded into BOTH the model fits
+    (whichever `backend`) and the Platt calibrator's fit. Overlapping triple-barrier labels
     are not independent observations; without these weights, periods with
     many concurrent labels are silently over-counted.
 
+    `backend` picks the estimator (`ModelBackend.XGBOOST` by default, which
+    is what every pre-existing caller gets and what every number recorded to
+    date came from). `param_grid` defaults to THAT backend's own grid —
+    passing XGBoost's `n_estimators`/`max_depth` keywords to CatBoost would
+    simply raise — and every backend's grid is the same size so none gets a
+    wider search than another. All three record into the same
+    `f"{run_id}:inner"` ledger scope, so comparing them raises the DSR bar
+    for all of them, which is the point.
+
     `validate_training_set` runs first, before any CV or fitting."""
+    backend = _resolve_backend(backend)
+    grid = param_grid if param_grid is not None else BACKEND_PARAM_GRIDS[backend]
     if not list(features.columns) == list(spec.columns):
         raise ValueError(
             f"features columns {list(features.columns)!r} must exactly match spec.columns {spec.columns!r}"
@@ -494,6 +808,10 @@ def train_meta_model(
     best_params_per_fold: list[dict[str, Any]] = []
     importances_per_fold: list[dict[str, float]] = []
     outer_returns: list[list[float]] = []
+    #: config key -> its OOS return series, concatenated across outer folds
+    #: in fold order. Every config sees the SAME test blocks in the same
+    #: order, which is exactly the shared period grid CSCV requires.
+    per_config_returns: dict[str, list[float]] = {}
     final_model: MetaModel | None = None
 
     for train_idx, test_idx in outer_splits_idx:
@@ -512,14 +830,15 @@ def train_meta_model(
             w_train=w_fold,
             prediction_times=fold_pred_times,
             evaluation_times=fold_eval_times,
-            param_grid=param_grid,
+            param_grid=grid,
             inner_splits=inner_splits,
             trial_ledger=trial_ledger,
             run_id=run_id,
+            backend=backend,
         )
         best_params_per_fold.append(best_config)
 
-        raw_model = _fit_xgb(best_config, x_all[train_idx], y_all[train_idx], w_fold)
+        raw_model = _fit_estimator(backend, best_config, x_all[train_idx], y_all[train_idx], w_fold)
         importances_per_fold.append(
             {name: float(value) for name, value in zip(spec.columns, raw_model.feature_importances_, strict=True)}
         )
@@ -527,7 +846,7 @@ def train_meta_model(
         calibration_splits = min(inner_splits, len(train_idx))
         if calibration_splits >= 2:
             calibrated = fit_platt_calibrator(
-                _make_xgb(best_config, y_all[train_idx]),
+                _make_estimator(backend, best_config, y_all[train_idx]),
                 x_all[train_idx],
                 y_all[train_idx],
                 sample_weight=w_fold,
@@ -545,6 +864,27 @@ def train_meta_model(
         test_preds = calibrated.predict_proba(x_all[test_idx])[:, 1]
         test_calls = (test_preds >= 0.5).astype(int)
         outer_returns.append(_agreement_returns(y_all[test_idx], test_calls).tolist())
+
+        # Every CONFIG's OOS series on this same test block, not just the
+        # winner's. This is what makes the PBO below a real one: CSCV is
+        # defined over COMPETING CONFIGURATIONS ranked in-sample against
+        # out-of-sample, and feeding it per-fold series of a single config
+        # (as this did until 2026-08-01) answers a different question
+        # entirely — which is why the number had to be printed as "NOT
+        # EVALUATED". Costs |grid| extra fits per outer fold.
+        #
+        # One call runs ONE backend, so this matrix's competing rows are
+        # always same-backend configurations and the resulting PBO answers
+        # "was this backend's chosen config curve-fit?". Stacking two
+        # backends' series into one matrix would answer a different question
+        # (is the MODEL CHOICE curve-fit?) and must not be done silently.
+        for config in grid:
+            key = _config_key(config, backend)
+            model = _fit_estimator(backend, config, x_all[train_idx], y_all[train_idx], w_fold)
+            calls = (model.predict_proba(x_all[test_idx])[:, 1] >= 0.5).astype(int)
+            per_config_returns.setdefault(key, []).extend(
+                _agreement_returns(y_all[test_idx], calls).tolist()
+            )
 
         final_model = MetaModel(calibrated=calibrated, feature_spec=spec)
 
@@ -575,15 +915,27 @@ def train_meta_model(
         n_trials=max(n_trials, 1),
     )
 
-    # PBO's CSCV matrix needs >=2 "trials" over a shared period grid; reuse
-    # the per-outer-fold pseudo-return series (padded to equal length) as
-    # that matrix — a structural exercise of the PBO machinery over genuine
-    # nested-CV outputs, not (yet) a full multi-strategy backtest grid.
-    min_len = min(len(r) for r in outer_returns)
-    if len(outer_returns) >= 2 and min_len >= 2:
-        returns_matrix = np.array([r[:min_len] for r in outer_returns])
-        pbo = probability_of_backtest_overfitting(returns_matrix, s_groups=min(4, min_len - (min_len % 2) or 2))
+    # A REAL CSCV matrix: one row per competing CONFIGURATION, all over the
+    # same OOS period grid (see `per_config_returns`). Every row has
+    # identical length by construction — each config is scored on every
+    # outer test block — so no padding or truncation is needed, and the
+    # ranking CSCV performs compares things that are genuinely comparable.
+    #
+    # Previously this stacked the per-outer-FOLD series of a single config,
+    # which ranks time periods against each other rather than strategies.
+    # That number was correctly refused as a gate by
+    # `scripts/train_meta_model.py`; this one can be gated on.
+    series = [r for r in per_config_returns.values() if len(r) >= 2]
+    lengths = {len(r) for r in series}
+    if len(series) >= 2 and len(lengths) == 1:
+        n_periods = next(iter(lengths))
+        returns_matrix = np.array(series)
+        pbo = probability_of_backtest_overfitting(
+            returns_matrix, s_groups=min(8, n_periods - (n_periods % 2) or 2)
+        )
     else:
+        # Fewer than 2 usable configs, or (defensively) ragged series —
+        # NaN, never a fabricated 0.0, which would read as "no overfitting".
         pbo = PboResult(pbo=float("nan"), n_combinations=0)
 
     return TrainResult(

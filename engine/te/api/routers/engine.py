@@ -2,8 +2,9 @@ import datetime as dt
 from decimal import Decimal
 
 from fastapi import APIRouter, Request, Response
+from sqlalchemy.orm import Session
 
-from te.api.db import session_factory, settings
+from te.api.db import bar_store, charge_rate_table, session_factory, settings
 from te.api.provenance import set_provenance
 from te.api.schemas.ops import EngineHealthStatus, SchedulerJobStatus, SchedulerStatus
 from te.api.schemas.settings import (
@@ -12,13 +13,17 @@ from te.api.schemas.settings import (
     InstrumentSelectionsPayload,
     ReloginResponse,
 )
+from te.domain.clock import IST
+from te.domain.costs import CostModel, select_rates
 from te.domain.money import Paise, rupees
+from te.engine.cycle import unrealized_pnl_paise
 from te.engine.scheduler import run_openalgo_relogin
 from te.engine.state import (
     AccountGuardrails,
     InstrumentSelection,
     get_guardrails,
     get_instrument_selections,
+    get_peak_equity_paise,
     get_run_state,
     guardrails_defaults_from_settings,
     instrument_selections_defaults_from_settings,
@@ -29,6 +34,7 @@ from te.engine.state import (
 from te.execution.halt import clear_halt, halt_reason, is_halted
 from te.persistence.db import session_scope
 from te.persistence.models import AuditLog
+from te.persistence.repos.paper_trading import total_net_pnl_paise
 from te.risk import killswitch
 
 router = APIRouter(prefix="/api/engine", tags=["engine"])
@@ -61,6 +67,42 @@ def get_scheduler_status(request: Request) -> SchedulerStatus:
     )
 
 
+def _current_drawdown_pct(session: Session, *, capital: Paise, as_of: dt.datetime) -> float:
+    """The SAME quantity `te.risk.limits.check_max_drawdown` breaches on:
+    how far current equity has fallen below its ratcheting peak-equity
+    watermark, in percent.
+
+    Equity is built exactly as `te.engine.cycle.run_entry_cycle` builds it —
+    `capital + lifetime realized net P&L + unrealized P&L on open positions`
+    — because a displayed drawdown that disagreed with the one that trips
+    the breaker would be worse than the `0.0` this replaces.
+
+    Reads the watermark, never writes it: ratcheting is the trading loop's
+    job, and a dashboard poll must not move a risk threshold. `0.0` when no
+    watermark exists yet (nothing has traded) or equity is at a new high —
+    both genuinely mean zero drawdown, unlike the hardcoded `0.0` before."""
+    peak = get_peak_equity_paise(session)
+    if peak is None or int(peak) <= 0:
+        return 0.0
+    unrealized = unrealized_pnl_paise(
+        session,
+        store=bar_store,
+        cost_model=CostModel(select_rates(charge_rate_table, as_of.date())),
+        as_of=as_of,
+        # An option contract has no recorded bars (only the four index spot
+        # symbols are subscribed), so the `store` fallback would resolve
+        # every mark to the entry premium and report zero unrealized loss no
+        # matter how far underwater the book was. `last_mark_paise` is the
+        # most recent price the trading loop actually observed — the same
+        # value its own exit checks fall back to.
+        current_premium=lambda row: Paise(row.last_mark_paise) if row.last_mark_paise is not None else None,
+    )
+    equity = int(capital) + int(total_net_pnl_paise(session)) + int(unrealized)
+    if equity >= int(peak):
+        return 0.0
+    return float(Decimal(int(peak) - equity) / Decimal(int(peak)) * Decimal(100))
+
+
 def _current_health(request: Request) -> EngineHealthStatus:
     """Reads the REAL persisted state — `run_state` (`te.engine.state`), the
     real kill-switch halt flag (`te.execution.halt`, the same flag
@@ -79,11 +121,13 @@ def _current_health(request: Request) -> EngineHealthStatus:
     live paper cycle every minute for ~2h49m) — the dashboard would have
     shown a permanently-healthy engine throughout. Stays `None` only when
     the runner genuinely hasn't run yet (no cycle since process start)."""
+    now_ist = dt.datetime.now(IST)
     with session_factory() as session:
         run_state = get_run_state(session)
         halted = is_halted(session)
         reason = (halt_reason(session) or "").lower()
         guardrails = get_guardrails(session, defaults=guardrails_defaults_from_settings(settings))
+        drawdown_pct = _current_drawdown_pct(session, capital=guardrails.capital, as_of=now_ist)
 
     daily_loss_state = "normal"
     if halted and "daily loss limit" in reason:
@@ -101,11 +145,7 @@ def _current_health(request: Request) -> EngineHealthStatus:
         runState=run_state,
         dailyLossState=daily_loss_state,
         drawdownBreakerTripped=halted,
-        # No live drawdown-percentage computation is wired into this display
-        # endpoint yet (te.risk.monitors.DrawdownEnvelope tracks it
-        # internally, not surfaced here) — stays 0 honestly rather than
-        # fabricated, same discipline as `sharpe`/`dayPnlPercent` elsewhere.
-        currentDrawdownPct=0.0,
+        currentDrawdownPct=drawdown_pct,
         maxDrawdownLimitPct=float(guardrails.max_drawdown_pct),
         lastSuccessfulPollSecondsAgo=seconds_ago,
     )

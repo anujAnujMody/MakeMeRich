@@ -114,7 +114,7 @@ def index_store(tmp_path: Path) -> BarStore:
                 _index_bar(_open(0), o=24_300, h=24_320, low=24_290, c=24_300, v=1_000),
                 _index_bar(_open(1), o=24_300, h=24_310, low=24_295, c=24_305, v=1_000),
                 _index_bar(_open(2), o=24_305, h=24_315, low=24_300, c=24_310, v=1_000),
-                _index_bar(_open(15), o=24_310, h=24_400, low=24_310, c=24_390, v=2_000),
+                _index_bar(_open(60), o=24_310, h=24_400, low=24_310, c=24_390, v=2_000),
             ],
             columns=list(BAR_COLUMNS),
         )
@@ -177,7 +177,7 @@ def test_index_breakout_opens_a_position_on_a_real_option_contract(
         execution=execution,
         cost_model=cost_model,
         config=_config(),
-        as_of=_open(16),
+        as_of=_open(61),
         contract_resolver=_resolver,
     )
 
@@ -216,7 +216,7 @@ def test_stop_and_target_are_percentages_of_the_option_premium(
         execution=execution,
         cost_model=cost_model,
         config=_config(),  # stop_pct/target_pct come from _config's defaults
-        as_of=_open(16),
+        as_of=_open(61),
         contract_resolver=_resolver,
     )
 
@@ -251,7 +251,7 @@ def test_trailing_distance_scales_with_the_option_premium(
                 stop_pct=Decimal(20), target_pct=Decimal(40), trailing_pct=Decimal(15)
             )
         ),
-        as_of=_open(16),
+        as_of=_open(61),
         contract_resolver=_resolver,
     )
 
@@ -278,7 +278,7 @@ def test_cost_gate_passes_once_the_premium_is_real(
         execution=execution,
         cost_model=cost_model,
         config=_config(),
-        as_of=_open(16),
+        as_of=_open(61),
         contract_resolver=_resolver,
     )
 
@@ -307,7 +307,7 @@ def test_risk_budget_blocks_a_nifty_lot_at_20k_capital_and_says_so(
         execution=execution,
         cost_model=cost_model,
         config=_config(capital=Paise(2_000_000)),  # ₹20,000
-        as_of=_open(16),
+        as_of=_open(61),
         contract_resolver=_resolver,
     )
 
@@ -332,7 +332,7 @@ def test_a_stopped_out_position_does_not_reenter_the_same_underlying_same_day(
         execution=execution,
         cost_model=cost_model,
         config=config,
-        as_of=_open(16),
+        as_of=_open(61),
         contract_resolver=_resolver,
     )
     with session_factory() as session:
@@ -342,7 +342,7 @@ def test_a_stopped_out_position_does_not_reenter_the_same_underlying_same_day(
         # open one (an open one is already covered by
         # `check_max_concurrent_positions`). Mirrors `_close_position`: both
         # the position row AND a `TradeRow` are required for a real close.
-        closed_at = _open(17).astimezone(dt.UTC)
+        closed_at = _open(62).astimezone(dt.UTC)
         row.closed_at = closed_at
         session.add(
             TradeRow(
@@ -372,7 +372,7 @@ def test_a_stopped_out_position_does_not_reenter_the_same_underlying_same_day(
         execution=execution,
         cost_model=cost_model,
         config=config,
-        as_of=_open(18),
+        as_of=_open(63),
         contract_resolver=_resolver,
     )
     assert cycle_id_2 != cycle_id_1
@@ -397,7 +397,7 @@ def test_unresolvable_contract_skips_with_a_real_reason_instead_of_trading_the_i
         execution=execution,
         cost_model=cost_model,
         config=_config(),
-        as_of=_open(16),
+        as_of=_open(61),
         contract_resolver=_rejecting_resolver,
     )
 

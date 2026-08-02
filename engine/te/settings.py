@@ -52,6 +52,18 @@ class Settings(BaseSettings):
 
     charges_path: Path = Path("config/charges.yaml")
     max_orders_per_second: int = 5
+    #: Quote requests/sec. A SEPARATE budget from orders: Angel SmartAPI
+    #: rate-limits its quote endpoint far more tightly than order placement
+    #: (published as 1 request/sec, with a 50-symbol bulk form), and forum
+    #: reports say enforcement is inconsistent — so exceeding it produces
+    #: intermittent failures rather than a clean, obvious error.
+    #:
+    #: This engine polls one quote per OPEN POSITION per cycle to mark it
+    #: (see `_current_premium_from_quotes`), which at a handful of positions
+    #: a minute sits far below the limit. The limiter exists so that stays
+    #: true when position count or cycle frequency changes, rather than
+    #: being rediscovered as flaky marks during a live session.
+    max_quotes_per_second: int = 1
 
     # Paper-trading cycle job (te.engine.scheduler) — an intraday ORB
     # strategy, so the default interval is short. `paper_cycle_instruments`
@@ -64,25 +76,63 @@ class Settings(BaseSettings):
     paper_cycle_strategy: str = "orb"
     paper_cycle_lot_size: int = 65
     paper_cycle_capital_paise: int = 2_000_000
-    paper_cycle_risk_budget_pct: Decimal = Decimal(2)
+    #: Capped by `te.engine.state.MAX_RISK_PER_TRADE_PCT` — see the ceilings
+    #: comment there for the risk-of-ruin arithmetic. Shipping a default
+    #: above the ceiling would mean the very first read clamped it, which
+    #: reads as the engine ignoring its own configuration.
+    paper_cycle_risk_budget_pct: Decimal = Decimal("1.5")
     paper_cycle_min_edge_multiple: Decimal = Decimal("1.2")
     paper_cycle_stop_distance_paise: int = 700
     paper_cycle_target_distance_paise: int = 1_500
     paper_cycle_trailing_distance_paise: int | None = 300
     paper_cycle_max_hold_minutes: int = 180
-    paper_cycle_hard_exit_by: dt.time = dt.time(15, 20)
+    #: 15:15, not 15:20. Angel One's published Risk Management Policy squares
+    #: off intraday F&O at 15:20 — the same minute this engine used to plan
+    #: its own exit. A tie there means the BROKER closes the position: their
+    #: fill, at their price, plus a call-and-trade/auto-square-off charge, and
+    #: an exit this engine would record as its own. Five minutes of clearance
+    #: keeps the exit ours. Verified 2026-08-01:
+    #: https://www.angelone.in/support/your-orders/square-off
+    paper_cycle_hard_exit_by: dt.time = dt.time(15, 15)
     #: Minutes of runway a new entry must have before `hard_exit_by`.
     #:
-    #: `0` preserves the historic behaviour (only the guaranteed-zero-exposure
-    #: case is blocked). A positive value must come from the MEASURED
-    #: time-to-target distribution over labelled firings — see
-    #: `scripts/measure_time_to_target.py`. It is deliberately left at 0
-    #: until that measurement exists, because the failure it prevents (a
-    #: 15:05 entry force-closed at 15:20 for -Rs 6,672 on 2026-07-31)
-    #: does not justify inventing a threshold to replace it.
-    paper_cycle_min_minutes_before_hard_exit: int = 0
-    paper_cycle_max_daily_loss_paise: int = 1_000_000
+    #: 40 = the MEDIAN minutes a winning firing took to reach its target,
+    #: measured 2026-08-01 by `scripts/measure_time_to_target.py` over 438
+    #: labelled winners on the 60-minute opening-range replay set
+    #: (2026-04-01..2026-07-30, 1:1 barriers):
+    #:
+    #:                 n     p10   p25   p50   p75   p90
+    #:   NIFTY       241       7    15    35    71    99
+    #:   SENSEX      197      12    23    47    87   118
+    #:   COMBINED    438       9    18    40    78   110
+    #:
+    #: The median is the floor, not a preference: below it, more than half of
+    #: all historical winners could not have finished before the clock closed
+    #: them. p75 (78m) would protect three quarters but refuses many more late
+    #: entries; that trade-off has not been optimised (doing so honestly needs
+    #: purged CV), so the descriptive midpoint is what ships.
+    #:
+    #: With `hard_exit_by` at 15:15 this stops new entries after 14:35. The
+    #: failure it prevents is concrete: a NIFTY position opened 15:05 on
+    #: 2026-07-31 and force-closed 15:20 for -Rs 6,672 — 82% of that day's
+    #: entire loss. Its stop never fired; the clock closed it. It carried full
+    #: downside while its upside was arithmetically unreachable.
+    paper_cycle_min_minutes_before_hard_exit: int = 40
+    #: Rs 1,000 = 5% of the Rs 20,000 default capital, the ceiling in
+    #: `te.engine.state.MAX_DAILY_LOSS_PCT_OF_CAPITAL`. Was Rs 10,000 — half
+    #: the default capital, which is not a loss limit so much as a
+    #: formality. Kept in step with `paper_cycle_capital_paise`: if that
+    #: changes, this must change with it or the first read will clamp it.
+    paper_cycle_max_daily_loss_paise: int = 100_000
     paper_cycle_max_concurrent_positions: int = 5
+    #: Stand down from NEW entries for the rest of the day after this many
+    #: consecutive losing trades (`0` disables). Three is the conventional
+    #: prop-desk figure — it is a behavioural circuit breaker against
+    #: revenge-trading a bad session, not a measured edge, and is documented
+    #: as such rather than dressed up as one. Open positions keep their
+    #: exits; only new entries stop. See `te.risk.limits.
+    #: check_consecutive_losses`.
+    paper_cycle_max_consecutive_losses: int = 3
     paper_cycle_max_trades_per_day: int = 20
 
     # --- Option contract resolution (see te/engine/contract.py) ---

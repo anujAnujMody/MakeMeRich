@@ -94,7 +94,7 @@ def test_guardrails_put_then_get_round_trips(isolated_client) -> None:  # noqa: 
     client, _sf = isolated_client
     payload = {
         "capitalRupees": 30000,
-        "maxDailyLossRupees": 5000,
+        "maxDailyLossRupees": 1500,  # 5% of Rs 30,000 — the hard ceiling
         "maxPositionSizePct": 25,
         "maxDrawdownPct": 10,
         "maxTradesPerDay": 5,
@@ -156,7 +156,7 @@ def test_guardrails_put_rejects_zero_capital(isolated_client) -> None:  # noqa: 
     client, _sf = isolated_client
     payload = {
         "capitalRupees": 0,
-        "maxDailyLossRupees": 5000,
+        "maxDailyLossRupees": 1500,  # 5% of Rs 30,000 — the hard ceiling
         "maxPositionSizePct": 25,
         "maxDrawdownPct": 10,
         "maxTradesPerDay": 5,

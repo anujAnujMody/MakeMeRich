@@ -46,17 +46,58 @@ def _not_reached(label: str) -> ConditionResult:
 
 @dataclass(frozen=True)
 class OrbParams:
-    opening_range_minutes: int = 15
+    #: 60, not the conventional 15. Measured on 2026-04-01..2026-07-30 by
+    #: `scripts/sweep_range_length.py` over six lengths on two indices
+    #: independently, labelled at the live 1:1 barriers:
+    #:
+    #:            5m     15m    30m    60m    90m   120m
+    #:   NIFTY   52.7%  53.4%  53.3%  56.4%  53.8%  44.7%
+    #:   SENSEX  51.0%  52.1%  52.6%  55.0%  47.4%  50.2%
+    #:
+    #: Both indices peak at 60 and fall away on either side. A maximum in the
+    #: INTERIOR of the swept grid is much harder to explain as luck than one
+    #: at its edge, and the two indices were measured separately. Pooled
+    #: z=3.25 (p=0.0006) against an expected best-of-19 noise z of 2.43 — the
+    #: only in-sample result in that day's search to clear its own
+    #: multiple-comparison floor.
+    #:
+    #: STILL IN-SAMPLE, and measured through the index-move premium proxy in
+    #: `te.ml.barriers` (one delta snapshot, no theta, no IV dynamics), which
+    #: biases every barrier outcome optimistic. Treat as the best available
+    #: hypothesis, not a validated edge; re-derive it once real expired-option
+    #: premiums land (see `docs/FableImprovements.md` Phase 1).
+    opening_range_minutes: int = 60
     min_opening_bars: int = 3
     volume_confirmation_multiple: Decimal = Decimal("1.0")
     lot_size: int = 65
 
 
 class OrbStrategy:
+    #: Class-level default, so `OrbStrategy()` is still `"orb"` everywhere.
     name = "orb"
 
-    def __init__(self, params: OrbParams | None = None) -> None:
+    def __init__(self, params: OrbParams | None = None, *, name: str | None = None) -> None:
+        """`name` overrides the recorded strategy name for a PARAMETER
+        VARIANT of this rule.
+
+        It exists because the name is what identifies a firing downstream:
+        `record_evaluation` stores `evaluation.strategy`, `evaluation_id` is
+        `f"{name}-{instrument}-{as_of}"` and is UNIQUE, and
+        `label_firings_from_evaluations` selects on it. So two replays of the
+        same instrument and minute under different parameters produce the
+        SAME `evaluation_id` unless the name differs.
+
+        Found the hard way on 2026-07-31: a range-length sweep passed a
+        distinct name to `replay_orb`, but that only chose a registry
+        factory — the recorded name still came from this class attribute, so
+        every length wrote as `"orb"`. The 5-minute and 30-minute firings
+        merged into the 15-minute dataset (8,973 rows where there should
+        have been 6,172), later runs were silently skipped as
+        already-replayed, and labelling by the variant name matched nothing.
+        """
         self.params = params or OrbParams()
+        if name is not None:
+            self.name = name
         self.last_signal: Signal | None = None
 
     def evaluate(self, ctx: StrategyContext) -> Evaluation:

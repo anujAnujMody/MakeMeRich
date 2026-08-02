@@ -19,6 +19,7 @@ from te.engine.state import (
     get_run_state,
     guardrails_defaults_from_settings,
 )
+from te.ml.gates import MaturityGate
 from te.persistence.repos.paper_trading import (
     daily_net_pnl_paise,
     open_positions,
@@ -70,6 +71,25 @@ def _build_pipeline(session: Session) -> list[PipelineStageInfo]:
         for key in PIPELINE_STAGE_KEYS
         if key in last.stages
     ]
+
+
+def _next_check_in_seconds(session: Session, *, now: dt.datetime, run_state: str) -> int:
+    """Seconds until the paper cycle is next due — `last cycle's as_of +
+    interval - now`, floored at 0.
+
+    `0` is honest here and means "nothing is scheduled or it is already
+    due": the engine is paused, or no cycle has ever run. It is NOT a
+    countdown that happens to have reached zero on a running engine, because
+    a running engine always has a stored last-cycle timestamp within one
+    interval. Previously hardcoded `0`, which rendered as a permanently
+    stalled countdown regardless of what the scheduler was doing."""
+    if run_state != "running":
+        return 0
+    last = get_last_cycle_pipeline(session)
+    if last is None:
+        return 0
+    due = last.as_of + dt.timedelta(minutes=settings.paper_cycle_interval_minutes)
+    return max(0, int((due - now).total_seconds()))
 
 
 @router.get("", response_model=DashboardData)
@@ -126,6 +146,7 @@ def get_dashboard_snapshot(response: Response) -> DashboardSnapshot:
         positions = open_positions(session)
         guardrails = get_guardrails(session, defaults=guardrails_defaults_from_settings(settings))
         pipeline = _build_pipeline(session)
+        next_check_in_seconds = _next_check_in_seconds(session, now=as_of, run_state=run_state)
 
         session_dates = recent_session_dates(session, limit=_TRAILING_SESSIONS)
         week_rows = trades_closed_since(session, min(session_dates)) if session_dates else []
@@ -140,7 +161,6 @@ def get_dashboard_snapshot(response: Response) -> DashboardSnapshot:
         mode=mode,
         status="live" if run_state == "running" else "paused",
         asOf=as_of.astimezone(dt.UTC).isoformat(),
-        nextCheckInSeconds=0,
         todayPnl=float(rupees(today_pnl)),
         dailyLossLimit=float(rupees(guardrails.max_daily_loss)),
         openPositionsCount=len(positions),
@@ -166,5 +186,12 @@ def get_dashboard_snapshot(response: Response) -> DashboardSnapshot:
         weekWinRatePct=week_summary.win_rate,
         weekTrades=week_summary.total_trades,
         weekNetPnl=week_summary.total_pnl,
-        mlStage="shadow",
+        # The REAL ladder position, read from `ml_maturity_state` — not the
+        # literal `"shadow"` this used to send. Those agreed only because
+        # nothing has been promoted yet; the moment a promotion happened the
+        # dashboard would have kept reporting `shadow` while the model was
+        # actually influencing decisions, which is the single most
+        # safety-relevant number on this page.
+        mlStage=MaturityGate(session_factory).current_stage().value,
+        nextCheckInSeconds=next_check_in_seconds,
     )
