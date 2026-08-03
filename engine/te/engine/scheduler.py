@@ -36,6 +36,7 @@ import datetime as dt
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
+from functools import partial
 
 import structlog
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -90,6 +91,36 @@ logger = structlog.get_logger(__name__)
 NSE_UNDERLYINGS = (("NIFTY", "NSE_INDEX"), ("BANKNIFTY", "NSE_INDEX"))
 BSE_UNDERLYINGS = (("SENSEX", "BSE_INDEX"), ("BANKEX", "BSE_INDEX"))
 
+
+def _option_instruments(resolver: OptionContractResolver, settings: Settings) -> list[Instrument]:
+    """The option contracts to RECORD, resolved fresh at recorder start.
+
+    Every backtest in this engine scores strategies on option premiums, but
+    until 2026-08-03 the recorder subscribed to the four index symbols and
+    nothing else — so no premium was ever captured live, and the only source
+    was the exchange's once-a-day bhavcopy. A day's trading could not be
+    measured until the following morning.
+
+    Recording a strike band per underlying (see
+    `OptionContractResolver.strike_band`) closes that: the premiums the
+    strategies are scored on are archived minute by minute, from the same
+    feed the live cycle trades against.
+
+    `band=0` switches option recording off entirely and restores the
+    index-only behaviour.
+    """
+    band = settings.recorder_strike_band
+    if band <= 0:
+        logger.info("option recording disabled (recorder_strike_band=0)")
+        return []
+    as_of = dt.datetime.now(IST)
+    instruments: list[Instrument] = []
+    for underlying, _ in (*NSE_UNDERLYINGS, *BSE_UNDERLYINGS):
+        for symbol, exchange in resolver.strike_band(underlying, as_of, band=band):
+            instruments.append(Instrument(exchange=exchange, symbol=symbol))
+    return instruments
+
+
 def _fno_lot_size_contracts(reference: dt.date) -> list[tuple[str, str]]:
     """The real, always-listed FUTURES contract per underlying, as of
     `reference` — the instrument-sync contract list. Querying an index's
@@ -120,12 +151,61 @@ class WSRecorderSupervisor:
     thread, so APScheduler's synchronous cron jobs can `start()`/`stop()`
     it without blocking the scheduler's own thread pool."""
 
-    def __init__(self, ws_client: OpenAlgoWSClient, recorder: BarRecorder) -> None:
+    def __init__(
+        self,
+        ws_client: OpenAlgoWSClient,
+        recorder: BarRecorder,
+        *,
+        late_instruments: Callable[[], list[Instrument]] | None = None,
+    ) -> None:
         self._ws_client = ws_client
         self._recorder = recorder
+        #: Resolved on every `start()` rather than once at build time — see
+        #: `_subscribe_late_instruments`.
+        self._late_instruments = late_instruments
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._task: asyncio.Task[None] | None = None
+
+    def _subscribe_late_instruments(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Resolves the subscriptions that can only be known at START time
+        and joins them to the running feed, all on a throwaway thread.
+
+        Option strikes are the reason this exists, and also the reason it is
+        not inline. Which contract is at-the-money depends on where the
+        index is trading and which expiry is nearest, so resolving in
+        `build_scheduler` (once, at process start — possibly overnight,
+        possibly days earlier) would subscribe to yesterday's strikes on a
+        stale expiry. But resolving a band costs one rate-limited broker
+        call per strike, and `start()` is called from the FastAPI lifespan:
+        doing it inline would hold the whole API down for over a minute on
+        every restart, and delay the index bars by the same amount.
+
+        So the feed comes up on the indices immediately and the strikes join
+        it via `add_subscriptions` once resolved. Every failure is swallowed:
+        this is additive coverage, and neither a broker hiccup nor a slow
+        chain may cost us the index recording.
+        """
+        if self._late_instruments is None:
+            return
+
+        def _resolve_and_subscribe() -> None:
+            try:
+                instruments = self._late_instruments() if self._late_instruments else []
+            except Exception:
+                logger.exception("could not resolve late instruments — recording indices only")
+                return
+            if not instruments:
+                return
+            try:
+                future = asyncio.run_coroutine_threadsafe(self._ws_client.add_subscriptions(instruments), loop)
+                future.result(timeout=60)
+            except Exception:
+                logger.exception("could not subscribe late instruments — recording indices only")
+                return
+            logger.info("subscribed late instruments", count=len(instruments))
+
+        threading.Thread(target=_resolve_and_subscribe, name="ws-late-subscribe", daemon=True).start()
 
     def is_running(self) -> bool:
         """`True` only when the background thread is alive AND its WS task
@@ -163,6 +243,9 @@ class WSRecorderSupervisor:
 
         self._thread = threading.Thread(target=_run_loop, name="ws-recorder-supervisor", daemon=True)
         self._thread.start()
+        # After the loop thread exists, so the resolver has somewhere to
+        # hand its instruments back to.
+        self._subscribe_late_instruments(loop)
         logger.info("WS recorder supervisor started")
 
     def stop(self) -> None:
@@ -623,9 +706,7 @@ class PaperCycleRunner:
                 session, defaults=instrument_selections_defaults_from_settings(self.settings)
             )
         instrument_configs = tuple(
-            InstrumentConfig(symbol=s.symbol, exchange=s.exchange, lot_size=s.lot_size)
-            for s in selections
-            if s.active
+            InstrumentConfig(symbol=s.symbol, exchange=s.exchange, lot_size=s.lot_size) for s in selections if s.active
         )
         config = replace(
             self.config,
@@ -715,14 +796,24 @@ def build_scheduler(
     # Used verbatim — see `Settings.openalgo_ws_host` for why this is a
     # separate, explicitly-configured endpoint and never derived from
     # `openalgo_host`.
-    ws_client = OpenAlgoWSClient(
-        url=settings.openalgo_ws_host, api_key=settings.openalgo_api_key.get_secret_value()
-    )
+    ws_client = OpenAlgoWSClient(url=settings.openalgo_ws_host, api_key=settings.openalgo_api_key.get_secret_value())
     ws_client.subscribe(
         [Instrument(exchange=exch, symbol=symbol) for symbol, exch in (*NSE_UNDERLYINGS, *BSE_UNDERLYINGS)]
     )
     recorder = BarRecorder(bar_store)
-    supervisor = WSRecorderSupervisor(ws_client, recorder)
+    # ONE resolver shared by the recorder and the paper cycle, so both read
+    # the same broker expiry chain out of the same per-day cache.
+    contract_resolver = OptionContractResolver(
+        rest_client,
+        offset=settings.paper_cycle_option_offset,
+        max_spread_pct=settings.paper_cycle_max_spread_pct,
+        min_premium_paise=settings.paper_cycle_min_premium_paise,
+    )
+    supervisor = WSRecorderSupervisor(
+        ws_client,
+        recorder,
+        late_instruments=partial(_option_instruments, contract_resolver, settings),
+    )
 
     session_factory = make_session_factory(engine)
     charge_rate_table = load_charge_rate_table(settings.charges_path)
@@ -733,12 +824,7 @@ def build_scheduler(
         config=_default_cycle_config(settings),
         max_orders_per_second=settings.max_orders_per_second,
         settings=settings,
-        contract_resolver=OptionContractResolver(
-            rest_client,
-            offset=settings.paper_cycle_option_offset,
-            max_spread_pct=settings.paper_cycle_max_spread_pct,
-            min_premium_paise=settings.paper_cycle_min_premium_paise,
-        ),
+        contract_resolver=contract_resolver,
         rest_client=rest_client,
     )
 

@@ -152,6 +152,69 @@ class OptionContractResolver:
                 logger.warning("unparseable expiry from broker", underlying=underlying, expiry=text)
         return frozenset(dates)
 
+    def strike_band(self, underlying: str, as_of: dt.datetime, *, band: int) -> list[tuple[str, str]]:
+        """Every `(symbol, placement_exchange)` within `band` strikes either
+        side of ATM, on the nearest expiry, for BOTH option types.
+
+        Exists so the live recorder can archive real option PREMIUMS, not
+        just index levels. Found on 2026-08-03: the WS recorder subscribed
+        only to the four index symbols, so the bar store had no live premium
+        data at all — and every backtest scores strategies on premiums. The
+        only premium source was the exchange's once-a-day bhavcopy, which
+        meant a day's trading could never be measured until the next
+        morning.
+
+        A BAND rather than just ATM because ATM is not a fixed strike: it
+        follows the index all day. Recording only the strike that was ATM at
+        09:15 would lose the actual traded contract the moment the index
+        moved half a percent. `ITMn`/`OTMn` walk in opposite directions for
+        calls and puts, so running both types over the same offsets covers
+        one contiguous strike window for each.
+
+        Returns an EMPTY list rather than raising on any broker failure, and
+        skips individual strikes that fail to resolve: this feeds a
+        subscription list, and losing option coverage must never take the
+        index recording down with it.
+        """
+        index_exchange = UNDERLYING_INDEX_EXCHANGES.get(underlying)
+        if index_exchange is None:
+            logger.warning("no index exchange mapped for underlying", underlying=underlying)
+            return []
+        try:
+            expiries = self._chain(underlying, index_exchange, as_of)
+        except OpenAlgoRestError:
+            logger.exception("expiry chain unavailable for strike band", underlying=underlying)
+            return []
+        if not expiries:
+            logger.warning("broker returned no expiries for strike band", underlying=underlying)
+            return []
+
+        offsets = [
+            "ATM",
+            *(f"ITM{step}" for step in range(1, band + 1)),
+            *(f"OTM{step}" for step in range(1, band + 1)),
+        ]
+        found: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for option_type in ("CE", "PE"):
+            for offset in offsets:
+                try:
+                    contract = self._client.option_symbol(underlying, index_exchange, expiries[0], offset, option_type)
+                except OpenAlgoRestError:
+                    logger.warning(
+                        "strike unresolvable — skipped",
+                        underlying=underlying,
+                        offset=offset,
+                        option_type=option_type,
+                    )
+                    continue
+                if contract.symbol in seen:
+                    continue
+                seen.add(contract.symbol)
+                found.append((contract.symbol, contract.exchange))
+        logger.info("resolved strike band", underlying=underlying, strikes=len(found), band=band)
+        return found
+
     def __call__(self, underlying: str, direction: Direction, as_of: dt.datetime) -> ResolvedContract | None:
         index_exchange = UNDERLYING_INDEX_EXCHANGES.get(underlying)
         if index_exchange is None:
@@ -167,9 +230,7 @@ class OptionContractResolver:
                 logger.warning("broker returned no expiries", underlying=underlying)
                 return None
 
-            contract = self._client.option_symbol(
-                underlying, index_exchange, expiries[0], self._offset, option_type
-            )
+            contract = self._client.option_symbol(underlying, index_exchange, expiries[0], self._offset, option_type)
             quote = self._client.quotes(contract.symbol, contract.exchange)
         except OpenAlgoRestError:
             logger.exception("contract resolution failed", underlying=underlying, direction=direction)

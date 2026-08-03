@@ -142,6 +142,17 @@ class Settings(BaseSettings):
     #: underlying. Deep OTM is the classic small-capital trap: cheap premium
     #: buys a low delta, so a correct directional call still loses to costs.
     paper_cycle_option_offset: str = "ATM"
+    #: How many strikes either side of ATM the WS recorder archives premiums
+    #: for, per underlying, on the nearest expiry. `0` disables option
+    #: recording and restores the index-only behaviour that shipped before
+    #: 2026-08-03.
+    #:
+    #: Not just ATM because ATM follows the index all day — a band keeps the
+    #: actually-traded contract in the archive after the index moves. 5 is
+    #: about +/-1% on NIFTY, which covers a normal session's range; the cost
+    #: is one broker `optionsymbol` call per strike per type per underlying
+    #: at recorder start, rate-limited by `max_quotes_per_second`.
+    recorder_strike_band: int = 5
     #: Stop/target as a % of the OPTION premium. These take priority over the
     #: absolute `*_distance_paise` values above, which are index-point-scaled
     #: leftovers and mean different things at different premium levels.

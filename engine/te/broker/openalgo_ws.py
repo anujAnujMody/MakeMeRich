@@ -63,6 +63,9 @@ class OpenAlgoWSClient:
     reconnect_backoff_sec: tuple[float, ...] = (0.1, 0.2, 0.5, 1.0, 2.0)
 
     _subscriptions: list[Instrument] = field(default_factory=list, init=False)
+    #: The connection `run()` is currently reading, or `None` between
+    #: connects — the handle `add_subscriptions` needs to reach a live feed.
+    _live_ws: _WSConnection | None = field(default=None, init=False)
     #: every frame ever sent, in order — lets tests/observability assert
     #: both auth AND subscribe frames were (re-)sent on each connect.
     sent_frames: list[dict[str, Any]] = field(default_factory=list, init=False)
@@ -74,6 +77,32 @@ class OpenAlgoWSClient:
         for inst in instruments:
             if inst not in self._subscriptions:
                 self._subscriptions.append(inst)
+
+    async def add_subscriptions(self, instruments: list[Instrument]) -> None:
+        """Registers instruments AND subscribes them on the CURRENT
+        connection, without waiting for a reconnect.
+
+        `subscribe()` alone only takes effect on the next connect, which
+        makes it unusable for anything resolved after the feed is already
+        up. Option strikes are exactly that: resolving a band of them costs
+        one rate-limited broker call each, far too slow to sit in front of
+        the connection that records the index bars. So the feed connects on
+        the indices immediately and the strikes join it here, a minute or so
+        later, instead of delaying everything.
+
+        Registration happens even when no connection is live, so a
+        resolution that lands during a reconnect is picked up by
+        `_resubscribe` rather than lost.
+        """
+        fresh = [inst for inst in instruments if inst not in self._subscriptions]
+        self._subscriptions.extend(fresh)
+        ws = self._live_ws
+        if ws is None or not fresh:
+            return
+        for inst in fresh:
+            frame = {"action": "subscribe", "mode": self.mode, "symbol": inst.symbol, "exchange": inst.exchange}
+            await ws.send(json.dumps(frame))
+            self.sent_frames.append(frame)
 
     async def _authenticate(self, ws: _WSConnection) -> None:
         frame = {"action": "authenticate", "api_key": self.api_key}
@@ -109,14 +138,21 @@ class OpenAlgoWSClient:
                 async with websockets.connect(self.url) as ws:
                     await self._authenticate(ws)
                     await self._resubscribe(ws)
+                    # Published only AFTER the replay above, so a concurrent
+                    # `add_subscriptions` cannot interleave its frames with
+                    # the initial batch.
+                    self._live_ws = ws
                     attempt = 0
-                    async for raw in ws:
-                        message = json.loads(raw)
-                        if message.get("type") == "market_data":
-                            try:
-                                on_tick(message)
-                            except Exception:
-                                logger.exception("on_tick handler raised — dropping this tick, connection stays up")
+                    try:
+                        async for raw in ws:
+                            message = json.loads(raw)
+                            if message.get("type") == "market_data":
+                                try:
+                                    on_tick(message)
+                                except Exception:
+                                    logger.exception("on_tick handler raised — dropping this tick, connection stays up")
+                    finally:
+                        self._live_ws = None
             except (ConnectionClosed, OSError):
                 attempt += 1
                 if max_retries is not None and attempt > max_retries:
