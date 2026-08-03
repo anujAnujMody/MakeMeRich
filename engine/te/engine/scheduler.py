@@ -6,8 +6,13 @@ the end of those phases (nothing previously called `te.engine.cycle`'s
 - WS recorder supervisor: starts the live bar recorder at 09:10 IST, stops
   it at 15:35 IST (NSE/BSE cash+F&O session is 09:15-15:30; the 5-minute
   pad on each side covers pre-open auction ticks and a clean final flush).
-- bhavcopy ingest: 18:30 IST daily (well after both NSE's and BSE's
-  bhavcopy files are typically published for the day).
+- bhavcopy ingest: hourly 19:00-23:00 IST, skipping whichever exchange has
+  already landed. It used to be a single 18:30 attempt, on the belief that
+  this was "well after" both files were published; it is not. NSE publishes
+  its F&O bhavcopy around 20:00, so on 2026-08-03 the one attempt 404'd and
+  that day's NIFTY/BANKNIFTY premiums went missing until re-fetched by
+  hand. Retrying costs nothing once the file is in — see
+  `te.data.ingest_log.already_ingested`.
 - instrument sync: 08:45 IST daily, before the WS recorder starts, so lot
   sizes/expiries are current before the session's first bar.
 - OpenAlgo relogin: 08:40 IST daily, before instrument sync — Angel expires
@@ -50,9 +55,12 @@ from te.broker.openalgo_rest import OpenAlgoRestClient, OpenAlgoRestError
 from te.broker.openalgo_ws import Instrument, OpenAlgoWSClient
 from te.data.asof import bars_asof
 from te.data.barstore import BarStore
+from te.data.bhavcopy_bse import SOURCE as BSE_BHAV_SOURCE
 from te.data.bhavcopy_bse import ingest_bhavcopy_bse
+from te.data.bhavcopy_nse import SOURCE as NSE_BHAV_SOURCE
 from te.data.bhavcopy_nse import ingest_bhavcopy_nse
 from te.data.charges_loader import load_charge_rate_table
+from te.data.ingest_log import already_ingested
 from te.data.recorder import BarRecorder
 from te.domain.calendar import TradingCalendar
 from te.domain.clock import DEFAULT_SESSION, IST, SessionWindow, is_market_open
@@ -373,13 +381,33 @@ def _run_calendar_refresh(session_factory: sessionmaker[Session], rest_client: O
 
 
 def _run_bhavcopy_ingest(engine: Engine, trade_date: dt.date | None = None) -> None:
+    """Both exchanges' bhavcopy for `trade_date`, skipping whichever already
+    landed.
+
+    Safe to run repeatedly, which is the point: this is scheduled hourly
+    through the evening rather than once, because the exchanges publish when
+    they publish. On 2026-08-03 the single 18:30 attempt got a 404 from NSE
+    for a file that downloaded fine at 19:35 — NSE's F&O bhavcopy appears
+    around 20:00 IST — so that day's NIFTY and BANKNIFTY option premiums
+    were missing, and would have stayed missing, with only a log line to say
+    so. BSE published on time the same evening, hence the per-source skip:
+    the exchange that already succeeded must not be re-fetched four more
+    times while waiting for the one that hasn't.
+    """
     target_date = trade_date or dt.datetime.now(IST).date()
-    for label, ingest_fn in (("NSE", ingest_bhavcopy_nse), ("BSE", ingest_bhavcopy_bse)):
+    for label, source, ingest_fn in (
+        ("NSE", NSE_BHAV_SOURCE, ingest_bhavcopy_nse),
+        ("BSE", BSE_BHAV_SOURCE, ingest_bhavcopy_bse),
+    ):
+        if already_ingested(engine, source=source, trade_date=target_date):
+            logger.debug("bhavcopy already ingested — skipping", exchange=label, trade_date=str(target_date))
+            continue
         try:
             rows = ingest_fn(engine, target_date)
             logger.info("bhavcopy ingest complete", exchange=label, trade_date=str(target_date), rows=len(rows))
         except Exception:
-            logger.exception("bhavcopy ingest failed", exchange=label, trade_date=str(target_date))
+            # Not fatal, and not final: the next hourly attempt retries it.
+            logger.warning("bhavcopy ingest failed — will retry", exchange=label, trade_date=str(target_date))
 
 
 def _run_instrument_sync(rest_client: OpenAlgoRestClient, engine: Engine) -> None:
@@ -921,9 +949,18 @@ def build_scheduler(
     scheduler.add_job(
         _run_bhavcopy_ingest,
         args=[engine],
-        trigger=CronTrigger(hour=18, minute=30, day_of_week="mon-fri", timezone=IST),
+        # Hourly 19:00-23:00 rather than once at 18:30. NSE publishes its
+        # F&O bhavcopy around 20:00 IST, so the old single early attempt
+        # 404'd and gave up — losing 2026-08-03's NIFTY/BANKNIFTY premiums
+        # until they were re-fetched by hand, and, going by the same 404
+        # elsewhere in the ingest log, quietly losing days before that.
+        # `_run_bhavcopy_ingest` skips whichever exchange already succeeded,
+        # so the later runs cost nothing once the file is in.
+        trigger=CronTrigger(hour="19-23", minute=0, day_of_week="mon-fri", timezone=IST),
         id="bhavcopy_ingest",
         replace_existing=True,
+        max_instances=1,
+        coalesce=True,
     )
     scheduler.add_job(
         _run_instrument_sync,
