@@ -194,8 +194,11 @@ class OptionContractResolver:
             *(f"ITM{step}" for step in range(1, band + 1)),
             *(f"OTM{step}" for step in range(1, band + 1)),
         ]
-        found: list[tuple[str, str]] = []
-        seen: set[str] = set()
+        # Keyed by symbol so first-wins dedup and insertion order come from
+        # one structure: a broker that clamps a deep offset to the end of the
+        # listed chain returns the same contract twice, and subscribing to it
+        # twice would double every tick it produces.
+        found: dict[str, str] = {}
         for option_type in ("CE", "PE"):
             for offset in offsets:
                 try:
@@ -208,12 +211,9 @@ class OptionContractResolver:
                         option_type=option_type,
                     )
                     continue
-                if contract.symbol in seen:
-                    continue
-                seen.add(contract.symbol)
-                found.append((contract.symbol, contract.exchange))
+                found.setdefault(contract.symbol, contract.exchange)
         logger.info("resolved strike band", underlying=underlying, strikes=len(found), band=band)
-        return found
+        return list(found.items())
 
     def __call__(self, underlying: str, direction: Direction, as_of: dt.datetime) -> ResolvedContract | None:
         index_exchange = UNDERLYING_INDEX_EXCHANGES.get(underlying)

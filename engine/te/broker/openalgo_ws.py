@@ -62,9 +62,19 @@ class OpenAlgoWSClient:
     mode: int = 2  # 1=LTP, 2=Quote, 3=Depth
     reconnect_backoff_sec: tuple[float, ...] = (0.1, 0.2, 0.5, 1.0, 2.0)
 
+    #: PERMANENT registrations, added to and never removed — the index
+    #: symbols, which are the same every session.
     _subscriptions: list[Instrument] = field(default_factory=list, init=False)
+    #: REPLACEABLE registrations, wholly superseded by each
+    #: `set_dynamic_subscriptions` call. Option strikes live here because
+    #: they are dated: today's weekly is dead tomorrow. Held append-only
+    #: alongside the indices they would accumulate ~87 expired symbols per
+    #: day in a process left running across sessions, and every reconnect
+    #: would replay the lot before reaching today's real strikes.
+    _dynamic: list[Instrument] = field(default_factory=list, init=False)
     #: The connection `run()` is currently reading, or `None` between
-    #: connects — the handle `add_subscriptions` needs to reach a live feed.
+    #: connects — the handle `set_dynamic_subscriptions` needs to reach a
+    #: live feed.
     _live_ws: _WSConnection | None = field(default=None, init=False)
     #: every frame ever sent, in order — lets tests/observability assert
     #: both auth AND subscribe frames were (re-)sent on each connect.
@@ -78,42 +88,68 @@ class OpenAlgoWSClient:
             if inst not in self._subscriptions:
                 self._subscriptions.append(inst)
 
-    async def add_subscriptions(self, instruments: list[Instrument]) -> None:
-        """Registers instruments AND subscribes them on the CURRENT
-        connection, without waiting for a reconnect.
+    async def set_dynamic_subscriptions(self, instruments: list[Instrument]) -> list[Instrument]:
+        """REPLACES the dynamic set, subscribing whatever is newly added on
+        the CURRENT connection. Returns the instruments actually sent.
 
         `subscribe()` alone only takes effect on the next connect, which
         makes it unusable for anything resolved after the feed is already
         up. Option strikes are exactly that: resolving a band of them costs
-        one rate-limited broker call each, far too slow to sit in front of
+        one broker round trip per strike, far too slow to sit in front of
         the connection that records the index bars. So the feed connects on
         the indices immediately and the strikes join it here, a minute or so
         later, instead of delaying everything.
 
+        Replacement rather than addition so that a set which changes daily
+        (or intraday, as the at-the-money strike drifts) cannot accumulate:
+        what is registered is always the last set asked for, so a reconnect
+        replays today's strikes and not every strike ever resolved.
+
         Registration happens even when no connection is live, so a
         resolution that lands during a reconnect is picked up by
         `_resubscribe` rather than lost.
+
+        Superseded instruments are dropped from the registration but NOT
+        unsubscribed on the live socket: this client speaks the raw
+        protocol, and while the SDK exposes `unsubscribe_*`, the raw frame
+        shape for it is undocumented (see this module's header on how far
+        the subscribe frame itself is already an inference). Guessing a
+        second frame to save a handful of redundant ticks until the next
+        reconnect is the worse trade.
         """
-        fresh = [inst for inst in instruments if inst not in self._subscriptions]
-        self._subscriptions.extend(fresh)
+        already = set(self._subscriptions) | set(self._dynamic)
+        self._dynamic = list(instruments)
+        fresh = [inst for inst in instruments if inst not in already]
         ws = self._live_ws
-        if ws is None or not fresh:
-            return
-        for inst in fresh:
-            frame = {"action": "subscribe", "mode": self.mode, "symbol": inst.symbol, "exchange": inst.exchange}
-            await ws.send(json.dumps(frame))
-            self.sent_frames.append(frame)
+        if ws is None:
+            return []
+        await self._send_subscribes(ws, fresh)
+        return fresh
 
     async def _authenticate(self, ws: _WSConnection) -> None:
         frame = {"action": "authenticate", "api_key": self.api_key}
         await ws.send(json.dumps(frame))
         self.sent_frames.append(frame)
 
-    async def _resubscribe(self, ws: _WSConnection) -> None:
-        for inst in self._subscriptions:
+    async def _send_subscribes(self, ws: _WSConnection, instruments: list[Instrument]) -> None:
+        """One subscribe frame per instrument, recorded in `sent_frames`.
+
+        Shared by the connect-time replay and by live additions so the frame
+        shape is written once: this module's own header flags these key names
+        as INFERRED from OpenAlgo's docs rather than confirmed against a
+        running server, so the correction most likely to be needed here must
+        not have two places to land.
+        """
+        for inst in instruments:
             frame = {"action": "subscribe", "mode": self.mode, "symbol": inst.symbol, "exchange": inst.exchange}
             await ws.send(json.dumps(frame))
             self.sent_frames.append(frame)
+
+    async def _resubscribe(self, ws: _WSConnection) -> None:
+        """Permanent registrations first, then the current dynamic set — so
+        a reconnect always restores the indices even if the option strikes
+        are mid-refresh."""
+        await self._send_subscribes(ws, [*self._subscriptions, *self._dynamic])
 
     async def run(self, on_tick: TickHandler, *, max_retries: int | None = None) -> None:
         """Connects, authenticates, subscribes, forwards every

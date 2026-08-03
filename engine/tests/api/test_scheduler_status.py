@@ -26,10 +26,17 @@ def test_scheduler_status_reports_all_jobs_including_paper_cycle() -> None:
         "instrument_sync",
         "trading_calendar_refresh",
         "paper_cycle",
+        "ws_late_subscription_refresh",
     }
 
     paper_cycle_job = next(job for job in body["jobs"] if job["id"] == "paper_cycle")
     assert paper_cycle_job["maxInstances"] == 1
+
+    # Same guard as the paper cycle, for the same reason: resolving a strike
+    # band is ~88 broker round trips (~32s measured), so a slow run must not
+    # stack up behind the next 5-minute tick.
+    refresh_job = next(job for job in body["jobs"] if job["id"] == "ws_late_subscription_refresh")
+    assert refresh_job["maxInstances"] == 1
 
     # No run has happened yet within the lifespan of this short-lived
     # request (the job's IntervalTrigger fires no sooner than one interval

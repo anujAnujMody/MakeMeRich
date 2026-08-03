@@ -153,7 +153,16 @@ def test_build_scheduler_registers_every_job(tmp_path: Path) -> None:
         "instrument_sync",
         "trading_calendar_refresh",
         "paper_cycle",
+        "ws_late_subscription_refresh",
     }
+
+    # Option strikes are re-resolved on a timer, not once at recorder start.
+    # A single start-time attempt cost a whole session's premium data on
+    # 2026-08-03 (engine up before the OpenAlgo gateway, every broker call
+    # refused, no retry), and cannot follow the at-the-money strike as the
+    # index drifts or the expiry rolls.
+    refresh_job = scheduler.get_job("ws_late_subscription_refresh")
+    assert "*/5" in str(refresh_job.trigger.fields[6]), "must retry within the session, not once"
 
     # The one job that must NOT be mon-fri: it is what tells the rest of the
     # engine which weekdays are real sessions, so it runs on a Sunday.

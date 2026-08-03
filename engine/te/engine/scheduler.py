@@ -60,7 +60,7 @@ from te.domain.costs import ChargeRateTable
 from te.domain.geometry import AbsolutePointGeometry, ExitGeometry, PremiumPercentGeometry
 from te.domain.money import Paise
 from te.domain.symbols import FNO_UNDERLYING_EXCHANGES, build_future_symbol, next_monthly_expiry
-from te.engine.contract import ContractResolver, OptionContractResolver
+from te.engine.contract import UNDERLYING_INDEX_EXCHANGES, ContractResolver, OptionContractResolver
 from te.engine.cycle import CycleConfig, InstrumentConfig, run_entry_cycle, run_exit_cycle
 from te.engine.state import (
     get_guardrails,
@@ -115,7 +115,11 @@ def _option_instruments(resolver: OptionContractResolver, settings: Settings) ->
         return []
     as_of = dt.datetime.now(IST)
     instruments: list[Instrument] = []
-    for underlying, _ in (*NSE_UNDERLYINGS, *BSE_UNDERLYINGS):
+    # Driven by `UNDERLYING_INDEX_EXCHANGES` rather than the
+    # `NSE_UNDERLYINGS`/`BSE_UNDERLYINGS` pairs above: that map is what
+    # `strike_band` itself consults, so an underlying added to one and not
+    # the other would resolve to zero strikes and record nothing, silently.
+    for underlying in UNDERLYING_INDEX_EXCHANGES:
         for symbol, exchange in resolver.strike_band(underlying, as_of, band=band):
             instruments.append(Instrument(exchange=exchange, symbol=symbol))
     return instruments
@@ -146,6 +150,20 @@ def _now_ist() -> dt.datetime:
     return dt.datetime.now(IST)
 
 
+@dataclass(frozen=True)
+class LateSubscriptionStatus:
+    """Outcome of the last attempt to resolve and subscribe the run-time
+    instruments (today's option strikes).
+
+    `subscribed == 0` with `error is None` means it has never been tried —
+    distinct from tried-and-failed, which carries the reason.
+    """
+
+    attempted_at: dt.datetime | None = None
+    subscribed: int = 0
+    error: str | None = None
+
+
 class WSRecorderSupervisor:
     """Owns the WS client's asyncio event loop on a dedicated background
     thread, so APScheduler's synchronous cron jobs can `start()`/`stop()`
@@ -160,52 +178,83 @@ class WSRecorderSupervisor:
     ) -> None:
         self._ws_client = ws_client
         self._recorder = recorder
-        #: Resolved on every `start()` rather than once at build time — see
-        #: `_subscribe_late_instruments`.
+        #: Resolved on every refresh rather than once at build time — see
+        #: `refresh_late_instruments`.
         self._late_instruments = late_instruments
+        self._late_status = LateSubscriptionStatus()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._task: asyncio.Task[None] | None = None
 
-    def _subscribe_late_instruments(self, loop: asyncio.AbstractEventLoop) -> None:
-        """Resolves the subscriptions that can only be known at START time
-        and joins them to the running feed, all on a throwaway thread.
+    @property
+    def late_status(self) -> LateSubscriptionStatus:
+        """The outcome of the last `refresh_late_instruments` attempt.
+
+        Exists because the failure this guards against is otherwise
+        invisible: `is_running()` reports the FEED, which is perfectly
+        healthy on a day where every option strike failed to resolve and not
+        one premium was recorded. Observed live on 2026-08-03 — the engine
+        restarted before the OpenAlgo gateway was reachable, every broker
+        call raised, and nothing anywhere said so.
+        """
+        return self._late_status
+
+    def refresh_late_instruments(self) -> None:
+        """Re-resolves the subscriptions that can only be known at run time
+        and hands the CURRENT desired set to the WS client.
 
         Option strikes are the reason this exists, and also the reason it is
-        not inline. Which contract is at-the-money depends on where the
-        index is trading and which expiry is nearest, so resolving in
-        `build_scheduler` (once, at process start — possibly overnight,
+        not inline in `start()`. Which contract is at-the-money depends on
+        where the index is trading and which expiry is nearest, so resolving
+        in `build_scheduler` (once, at process start — possibly overnight,
         possibly days earlier) would subscribe to yesterday's strikes on a
-        stale expiry. But resolving a band costs one rate-limited broker
-        call per strike, and `start()` is called from the FastAPI lifespan:
-        doing it inline would hold the whole API down for over a minute on
-        every restart, and delay the index bars by the same amount.
+        stale expiry. But a band costs one broker round trip per strike —
+        ~88 of them, measured at ~32s — so `start()` runs this on a
+        throwaway thread and the feed comes up on the indices immediately.
 
-        So the feed comes up on the indices immediately and the strikes join
-        it via `add_subscriptions` once resolved. Every failure is swallowed:
-        this is additive coverage, and neither a broker hiccup nor a slow
-        chain may cost us the index recording.
+        Called REPEATEDLY, not once: on every `start()`, and on a timer
+        while the recorder runs. One-shot resolution turned a transient
+        broker outage into a whole day with no premium data (2026-08-03,
+        engine up before the gateway), and cannot follow the at-the-money
+        strike as the index drifts or the expiry rolls. Re-asking is the
+        retry, the drift correction and the rollover, all in one — which is
+        why `set_dynamic_subscriptions` replaces rather than accumulates.
+
+        Every failure is swallowed but never silent: this is additive
+        coverage, and neither a broker hiccup nor a slow chain may cost us
+        the index recording — but each outcome lands in `late_status`.
         """
-        if self._late_instruments is None:
+        resolve = self._late_instruments
+        loop = self._loop
+        if resolve is None:
             return
-
-        def _resolve_and_subscribe() -> None:
-            try:
-                instruments = self._late_instruments() if self._late_instruments else []
-            except Exception:
-                logger.exception("could not resolve late instruments — recording indices only")
-                return
-            if not instruments:
-                return
-            try:
-                future = asyncio.run_coroutine_threadsafe(self._ws_client.add_subscriptions(instruments), loop)
-                future.result(timeout=60)
-            except Exception:
-                logger.exception("could not subscribe late instruments — recording indices only")
-                return
-            logger.info("subscribed late instruments", count=len(instruments))
-
-        threading.Thread(target=_resolve_and_subscribe, name="ws-late-subscribe", daemon=True).start()
+        attempted_at = dt.datetime.now(IST)
+        if loop is None or not self.is_running():
+            self._late_status = LateSubscriptionStatus(attempted_at, error="recorder is not running")
+            return
+        try:
+            instruments = resolve()
+        except Exception as exc:
+            logger.exception("could not resolve late instruments — recording indices only")
+            self._late_status = LateSubscriptionStatus(attempted_at, error=f"resolve failed: {exc}")
+            return
+        if not instruments:
+            # Previously this returned silently, which is exactly how a full
+            # day of missing premiums went unnoticed.
+            logger.warning("late instrument resolution produced nothing — recording indices only")
+            self._late_status = LateSubscriptionStatus(attempted_at, error="resolved no instruments")
+            return
+        try:
+            future = asyncio.run_coroutine_threadsafe(self._ws_client.set_dynamic_subscriptions(instruments), loop)
+            # Waiting is what surfaces an exception out of the coroutine;
+            # the resolve above already cost ~32s, this send is milliseconds.
+            future.result(timeout=60)
+        except Exception as exc:
+            logger.exception("could not subscribe late instruments — recording indices only")
+            self._late_status = LateSubscriptionStatus(attempted_at, error=f"subscribe failed: {exc}")
+            return
+        self._late_status = LateSubscriptionStatus(attempted_at, subscribed=len(instruments))
+        logger.info("subscribed late instruments", count=len(instruments))
 
     def is_running(self) -> bool:
         """`True` only when the background thread is alive AND its WS task
@@ -243,9 +292,12 @@ class WSRecorderSupervisor:
 
         self._thread = threading.Thread(target=_run_loop, name="ws-recorder-supervisor", daemon=True)
         self._thread.start()
-        # After the loop thread exists, so the resolver has somewhere to
-        # hand its instruments back to.
-        self._subscribe_late_instruments(loop)
+        # On its own thread, and only after the loop thread exists: this
+        # blocks for ~32s of broker calls, and `start()` is on the FastAPI
+        # startup path. The periodic refresh job would pick it up anyway,
+        # but not for several minutes — too long to leave a restart with no
+        # premium recording.
+        threading.Thread(target=self.refresh_late_instruments, name="ws-late-subscribe", daemon=True).start()
         logger.info("WS recorder supervisor started")
 
     def stop(self) -> None:
@@ -847,6 +899,24 @@ def build_scheduler(
         trigger=CronTrigger(hour=15, minute=35, day_of_week="mon-fri", timezone=IST),
         id="ws_recorder_stop",
         replace_existing=True,
+    )
+    # Re-asks the broker for today's strikes while the recorder runs. This
+    # is the retry: on 2026-08-03 the engine came up before the OpenAlgo
+    # gateway, the single start-time resolution failed against a refused
+    # connection, and premium recording stayed off for the whole session
+    # until a human restarted it. It is also the drift correction — the
+    # at-the-money strike follows the index all day — and the expiry
+    # rollover. `refresh_late_instruments` no-ops unless the recorder is
+    # actually running, so this stays quiet outside the session and on
+    # holidays, when `supervisor.start` never fired.
+    scheduler.add_job(
+        supervisor.refresh_late_instruments,
+        trigger=CronTrigger(hour="9-15", minute="*/5", day_of_week="mon-fri", timezone=IST),
+        id="ws_late_subscription_refresh",
+        replace_existing=True,
+        # One slow resolution must not stack up behind the next tick.
+        max_instances=1,
+        coalesce=True,
     )
     scheduler.add_job(
         _run_bhavcopy_ingest,

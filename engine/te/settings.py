@@ -151,7 +151,10 @@ class Settings(BaseSettings):
     #: actually-traded contract in the archive after the index moves. 5 is
     #: about +/-1% on NIFTY, which covers a normal session's range; the cost
     #: is one broker `optionsymbol` call per strike per type per underlying
-    #: at recorder start, rate-limited by `max_quotes_per_second`.
+    #: at recorder start (~88 calls, ~32s measured). Those calls are NOT
+    #: rate-limited — `max_quotes_per_second` gates `quotes()` only — so the
+    #: cost is round-trip latency, paid off the startup path on its own
+    #: thread. Widening the band grows it linearly.
     recorder_strike_band: int = 5
     #: Stop/target as a % of the OPTION premium. These take priority over the
     #: absolute `*_distance_paise` values above, which are index-point-scaled
