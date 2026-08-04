@@ -21,12 +21,13 @@ from te.domain.clock import IST
 from te.domain.costs import CostModel, select_rates
 from te.domain.geometry import AbsolutePointGeometry, PremiumPercentGeometry
 from te.domain.money import Paise
+from te.engine.contract import ResolvedContract
 from te.engine.cycle import CycleConfig, InstrumentConfig, run_entry_cycle, run_exit_cycle
 from te.engine.state import get_last_cycle_pipeline
 from te.execution.manager import ExecutionManager
 from te.execution.store import OrderEventStore
 from te.persistence.db import make_engine, make_session_factory
-from te.persistence.models import Base, OpenPositionRow, SkippedSignalRow, TradeRow
+from te.persistence.models import Base, CycleEvaluationRow, OpenPositionRow, SkippedSignalRow, TradeRow
 from te.risk.killswitch import reset_in_process_cache as reset_killswitch_cache
 from te.risk.killswitch import throttle as throttle_killswitch
 from te.risk.killswitch import trip as trip_killswitch
@@ -507,6 +508,235 @@ def test_paper_trade_pnl_is_net(
     assert trade.target_paise == opened_target_paise
 
 
+def test_the_profit_lock_engages_then_exits_at_a_real_locked_profit(
+    session_factory,
+    execution,
+    cost_model: CostModel,
+    tmp_path: Path,  # noqa: ANN001
+) -> None:
+    """End-to-end through the real persisted schema: the one-time profit
+    lock engages once price crosses its activation threshold, that state
+    survives a round trip through `open_positions.profit_lock_engaged`, and
+    a later dip through the locked (not original) stop closes the trade
+    with `exit_reason == "profit_lock"` — a real profit above entry, not a
+    round trip to the original -20% stop."""
+    store = _breakout_store(tmp_path)
+    config = _config(
+        exit_geometry=PremiumPercentGeometry(
+            stop_pct=Decimal(20),
+            target_pct=Decimal(20),
+            profit_lock_activation_pct=Decimal(15),
+            profit_lock_buffer_pct=Decimal(5),
+        )
+    )
+    entry_at = _open(61)
+
+    run_entry_cycle(
+        session_factory=session_factory,
+        store=store,
+        execution=execution,
+        cost_model=cost_model,
+        config=config,
+        as_of=entry_at,
+    )
+    with session_factory() as session:
+        open_row = session.query(OpenPositionRow).filter(OpenPositionRow.closed_at.is_(None)).one()
+        entry_premium = open_row.entry_premium_paise
+        assert open_row.profit_lock_engaged is False
+        assert open_row.profit_lock_activation_paise == entry_premium + entry_premium * 15 // 100
+
+    activation = entry_premium + entry_premium * 15 // 100
+    closed = run_exit_cycle(
+        session_factory=session_factory,
+        execution=execution,
+        cost_model=cost_model,
+        current_premium=lambda row: Paise(activation),
+        as_of=entry_at + dt.timedelta(minutes=1),
+    )
+    assert closed == [], "crossing activation alone must not close the position"
+    with session_factory() as session:
+        open_row = session.query(OpenPositionRow).filter(OpenPositionRow.closed_at.is_(None)).one()
+        assert open_row.profit_lock_engaged is True
+        locked_stop = activation - activation * 5 // 100
+        assert open_row.current_stop_paise == locked_stop
+        assert locked_stop > entry_premium, "the lock must sit above entry, a real profit floor"
+
+    dip_below_lock = locked_stop - 10  # still well above the ORIGINAL -20% stop
+    closed = run_exit_cycle(
+        session_factory=session_factory,
+        execution=execution,
+        cost_model=cost_model,
+        current_premium=lambda row: Paise(dip_below_lock),
+        as_of=entry_at + dt.timedelta(minutes=2),
+    )
+    assert len(closed) == 1
+    with session_factory() as session:
+        trade = session.query(TradeRow).one()
+        assert trade.exit_reason == "profit_lock"
+        assert trade.exit_premium_paise == dip_below_lock
+        assert trade.exit_premium_paise > entry_premium, "closed at a real profit, not a loss"
+
+
+def test_a_downstream_block_corrects_the_persisted_traded_verdict(
+    session_factory,
+    execution,
+    cost_model: CostModel,
+    tmp_path: Path,  # noqa: ANN001
+) -> None:
+    """Found live on 2026-08-04: a SENSEX signal fired, `record_evaluation`
+    persisted `verdict="traded"` immediately, and the exchange freeze-
+    quantity guard rejected it two dozen lines later — no position ever
+    opened. `GET /api/decisions/today` kept showing "traded" for the rest of
+    the day because nothing had gone back to correct that row: a real
+    `SkippedSignal` was recorded with the real reason, but in a different
+    table the dashboard doesn't read. The persisted evaluation itself must
+    end up honest, not just a second, disconnected record of the truth."""
+    store = _breakout_store(tmp_path)
+    config = _config()
+    entry_at = _open(61)
+
+    def _unresolvable_size(instrument: str, direction: object, as_of: dt.datetime) -> ResolvedContract:
+        # One lot already exceeds the freeze quantity — the exact 2026-08-04
+        # shape (SENSEX06AUG2678700PE, lot 20 vs freeze qty 1).
+        return ResolvedContract(
+            symbol="SENSEX06AUG2678700PE",
+            exchange="BFO",
+            lot_size=65,
+            premium=Paise(3_600),
+            bid=Paise(3_580),
+            ask=Paise(3_600),
+            underlying_ltp=30.0,
+            freeze_qty=10,
+        )
+
+    run_entry_cycle(
+        session_factory=session_factory,
+        store=store,
+        execution=execution,
+        cost_model=cost_model,
+        config=config,
+        as_of=entry_at,
+        contract_resolver=_unresolvable_size,
+    )
+
+    with session_factory() as session:
+        assert session.query(OpenPositionRow).count() == 0, "the freeze-quantity guard must still block the trade"
+        skip = session.query(SkippedSignalRow).one()
+        assert "freeze quantity" in skip.reason
+
+        evaluation = session.query(CycleEvaluationRow).filter(CycleEvaluationRow.instrument == INSTRUMENT).one()
+        assert evaluation.verdict == "skipped", "the persisted verdict must not still say 'traded'"
+        assert "freeze quantity" in evaluation.reason, "the real block reason, not the strategy's original one"
+
+
+def test_a_single_spike_quote_does_not_close_a_position(
+    session_factory,
+    execution,
+    cost_model: CostModel,
+    tmp_path: Path,  # noqa: ANN001
+) -> None:
+    """Found live on 2026-08-04: Angel's SmartAPI websocket has documented,
+    user-reported bad ticks. A single spurious premium print — unconfirmed
+    by any matching move in the underlying — was trusted immediately, fired
+    a "target hit", and closed two real paper positions on a price no live
+    order could have filled at. `run_exit_cycle` must quarantine an
+    unconfirmed jump, not act on it."""
+    store = _breakout_store(tmp_path)
+    config = _config()
+    entry_at = _open(61)
+
+    run_entry_cycle(
+        session_factory=session_factory,
+        store=store,
+        execution=execution,
+        cost_model=cost_model,
+        config=config,
+        as_of=entry_at,
+    )
+    # A normal cycle first, establishing a real confirmed baseline near the
+    # entry premium (3600p) — matches the 2026-08-04 shape, where the spike
+    # hit positions that already had ~20 minutes of confirmed marks, not
+    # brand new ones (a position's very FIRST mark is trusted unconditionally
+    # by design, since there is nothing yet to compare it against).
+    run_exit_cycle(
+        session_factory=session_factory,
+        execution=execution,
+        cost_model=cost_model,
+        current_premium=lambda row: Paise(3_650),
+        as_of=entry_at + dt.timedelta(minutes=1),
+    )
+
+    spike = Paise(20_000)  # wildly past target (5100p) — the 2026-08-04 shape
+    closed = run_exit_cycle(
+        session_factory=session_factory,
+        execution=execution,
+        cost_model=cost_model,
+        current_premium=lambda row: spike,
+        as_of=entry_at + dt.timedelta(minutes=2),
+    )
+
+    assert closed == [], "an unconfirmed spike must not close the position"
+    with session_factory() as session:
+        open_row = session.query(OpenPositionRow).filter(OpenPositionRow.closed_at.is_(None)).one()
+        assert open_row.pending_mark_paise == int(spike), "the candidate must be held for next cycle's comparison"
+        assert open_row.last_mark_paise != int(spike), "the spike must never become the trusted price"
+
+
+def test_a_confirmed_spike_closes_the_position(
+    session_factory,
+    execution,
+    cost_model: CostModel,
+    tmp_path: Path,  # noqa: ANN001
+) -> None:
+    """The other half of the same guard: a real, fast move that reappears at
+    roughly the same level on the VERY NEXT cycle is not a bad tick — two
+    independent readings agreeing is exactly what a single glitch cannot do,
+    and the position must still be free to exit on it."""
+    store = _breakout_store(tmp_path)
+    config = _config()
+    entry_at = _open(61)
+
+    run_entry_cycle(
+        session_factory=session_factory,
+        store=store,
+        execution=execution,
+        cost_model=cost_model,
+        config=config,
+        as_of=entry_at,
+    )
+    # Real confirmed baseline first — see the sibling test for why.
+    run_exit_cycle(
+        session_factory=session_factory,
+        execution=execution,
+        cost_model=cost_model,
+        current_premium=lambda row: Paise(3_650),
+        as_of=entry_at + dt.timedelta(minutes=1),
+    )
+
+    spike = Paise(20_000)
+    run_exit_cycle(
+        session_factory=session_factory,
+        execution=execution,
+        cost_model=cost_model,
+        current_premium=lambda row: spike,
+        as_of=entry_at + dt.timedelta(minutes=2),
+    )
+    # Same reading again, next cycle — confirmation.
+    closed = run_exit_cycle(
+        session_factory=session_factory,
+        execution=execution,
+        cost_model=cost_model,
+        current_premium=lambda row: spike,
+        as_of=entry_at + dt.timedelta(minutes=3),
+    )
+
+    assert len(closed) == 1, "a confirmed move must still be free to close the position"
+    with session_factory() as session:
+        trade = session.query(TradeRow).one()
+        assert trade.exit_premium_paise == int(spike)
+        assert trade.exit_reason == "target"
+
+
 def test_square_off_closes_position_immediately_regardless_of_exit_conditions(
     session_factory,
     execution,
@@ -801,9 +1031,9 @@ def test_disabling_the_percentage_trail_does_not_fall_back_to_the_absolute_one(
 
     with session_factory() as session:
         row = session.query(OpenPositionRow).one()
-    assert row.trailing_distance_paise is None, (
-        f"trail is {row.trailing_distance_paise}p despite trailing_pct=None — the absolute fallback fired"
-    )
+    assert (
+        row.trailing_distance_paise is None
+    ), f"trail is {row.trailing_distance_paise}p despite trailing_pct=None — the absolute fallback fired"
 
 
 def test_absolute_trailing_distance_still_applies_without_percentage_exits(

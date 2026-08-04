@@ -201,6 +201,24 @@ class Settings(BaseSettings):
     #: Re-enable only after a sweep that includes the trail as a fourth
     #: barrier, so live and measured behaviour stay the same thing.
     paper_cycle_trailing_pct: Decimal | None = None
+    #: The ONE-TIME profit lock — distinct from the (disabled) continuous
+    #: trail above. Once a position's profit reaches this % of entry
+    #: premium, its stop jumps EXACTLY ONCE to `paper_cycle_profit_lock_
+    #: buffer_pct` below the price at that moment (a real profit floor, not
+    #: breakeven), then freezes — see `te.domain.geometry.ExitLevels.
+    #: profit_lock_activation` and `te.engine.exits.evaluate_position`.
+    #:
+    #: Backtested 2026-08-04 against 1,305 real historical NIFTY ORB trades
+    #: at these exact numbers before being enabled: mean R roughly flat
+    #: (-0.104R vs -0.102R with no lock) but win rate up materially (50.7%
+    #: vs 46.2%), because it converts some reversals-from-profit into small
+    #: wins at the cost of clipping some trades that would have reached the
+    #: full target. A deliberate risk-shaping choice — it does not raise
+    #: expectancy, and does not fix the underlying strategy's slightly
+    #: negative edge. `None` disables the rule (must be set together with
+    #: `paper_cycle_profit_lock_buffer_pct`).
+    paper_cycle_profit_lock_activation_pct: Decimal | None = Decimal(15)
+    paper_cycle_profit_lock_buffer_pct: Decimal | None = Decimal(5)
     #: Reject a resolved contract whose bid-ask spread exceeds this % of LTP.
     #: Live NIFTY chain (2026-07-31) runs 0.1-0.4% through OTM5 and widens to
     #: ~1.1% by OTM8, so 1.0% admits the liquid band and excludes the rest.

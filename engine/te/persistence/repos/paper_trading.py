@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import datetime as dt
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from te.domain.clock import to_utc as _utc
@@ -57,6 +57,32 @@ def record_evaluation(session: Session, *, cycle_id: int, evaluation: Evaluation
         record_condition(session, evaluation.id, seq, condition)
 
 
+def correct_evaluation_verdict(session: Session, *, evaluation_id: str, verdict: str, reason: str) -> None:
+    """Overwrites a previously-recorded `CycleEvaluationRow`'s verdict and
+    reason with what actually happened.
+
+    Exists because `record_evaluation` persists the STRATEGY's own verdict —
+    "traded" the instant `evaluate()` returns it — before any of the
+    downstream gates (risk limits, contract resolution, sizing, the ML gate,
+    the exchange freeze-quantity cap) have had a chance to block it. Found
+    live on 2026-08-04: a SENSEX signal recorded "traded", then the freeze-
+    quantity guard rejected it a few lines later — no position ever opened,
+    but `GET /api/decisions/today` kept showing "traded" for the rest of the
+    day, because nothing had ever gone back to correct that row. A dashboard
+    that can say "traded" for a trade that never happened is worse than one
+    that is merely incomplete.
+
+    A plain UPDATE, not a second INSERT: exactly one `CycleEvaluationRow`
+    exists per `evaluation_id` (`unique=True`), and the point is to make
+    that one row honest, not to leave the wrong one sitting alongside a
+    correction."""
+    session.execute(
+        update(CycleEvaluationRow)
+        .where(CycleEvaluationRow.evaluation_id == evaluation_id)
+        .values(verdict=verdict, reason=reason)
+    )
+
+
 def record_condition(session: Session, evaluation_id: str, seq: int, condition: ConditionResult) -> None:
     session.add(
         EvaluationConditionRow(
@@ -81,7 +107,9 @@ def evaluations_today(session: Session, on: dt.date) -> list[CycleEvaluationRow]
             select(CycleEvaluationRow)
             .where(CycleEvaluationRow.ts >= start, CycleEvaluationRow.ts <= end)
             .order_by(CycleEvaluationRow.ts.desc())
-        ).scalars().all()
+        )
+        .scalars()
+        .all()
     )
 
 
@@ -91,7 +119,9 @@ def conditions_for(session: Session, evaluation_id: str) -> list[EvaluationCondi
             select(EvaluationConditionRow)
             .where(EvaluationConditionRow.evaluation_id == evaluation_id)
             .order_by(EvaluationConditionRow.seq)
-        ).scalars().all()
+        )
+        .scalars()
+        .all()
     )
 
 
@@ -144,14 +174,18 @@ def insert_open_position(
         entry_premium_paise=int(entry_premium),
         stop_paise=int(exit_plan.stop),
         current_stop_paise=int(exit_plan.stop),
-        trailing_distance_paise=(
-            int(exit_plan.trailing_distance) if exit_plan.trailing_distance is not None else None
-        ),
+        trailing_distance_paise=(int(exit_plan.trailing_distance) if exit_plan.trailing_distance is not None else None),
         target_paise=int(exit_plan.target),
         max_hold_seconds=int(exit_plan.max_hold.total_seconds()),
         hard_exit_by=exit_plan.hard_exit_by.isoformat(),
         opened_at=_utc(opened_at),
         closed_at=None,
+        profit_lock_activation_paise=(
+            int(exit_plan.profit_lock_activation) if exit_plan.profit_lock_activation is not None else None
+        ),
+        profit_lock_buffer_pct=(
+            float(exit_plan.profit_lock_buffer_pct) if exit_plan.profit_lock_buffer_pct is not None else None
+        ),
     )
     session.add(row)
     session.flush()
@@ -169,13 +203,17 @@ def find_open_position(session: Session, *, symbol: str, exchange: str) -> OpenP
     theory), so this returns the FIRST match; a real multi-position-per-
     symbol scenario would need the caller to disambiguate by
     `client_order_id` instead, not attempted here."""
-    return session.execute(
-        select(OpenPositionRow).where(
-            OpenPositionRow.closed_at.is_(None),
-            OpenPositionRow.symbol == symbol,
-            OpenPositionRow.exchange == exchange,
+    return (
+        session.execute(
+            select(OpenPositionRow).where(
+                OpenPositionRow.closed_at.is_(None),
+                OpenPositionRow.symbol == symbol,
+                OpenPositionRow.exchange == exchange,
+            )
         )
-    ).scalars().first()
+        .scalars()
+        .first()
+    )
 
 
 def open_positions_count(session: Session) -> int:
@@ -188,12 +226,32 @@ def update_trailing_stop(session: Session, row: OpenPositionRow, new_stop: Paise
     row.current_stop_paise = int(new_stop)
 
 
+def engage_profit_lock(session: Session, row: OpenPositionRow) -> None:
+    """Flips `profit_lock_engaged` permanently to `True` — called the one
+    cycle `te.engine.exits.evaluate_position` fires the lock. Never called
+    to un-set it: the lock is a one-time mechanism by design."""
+    row.profit_lock_engaged = True
+
+
 def update_last_mark(session: Session, row: OpenPositionRow, premium: Paise, at: dt.datetime) -> None:
     """Record a SUCCESSFUL live mark. Only ever called with a real observed
     price — never a fallback — so `last_mark_paise` stays a fact rather than
-    an assumption, and `last_mark_at` measures how stale that fact is."""
+    an assumption, and `last_mark_at` measures how stale that fact is.
+
+    Always clears `pending_mark_paise`: a confirmed mark means whatever
+    candidate was under review either WAS this price (accepted) or has been
+    superseded by it — either way nothing is left pending."""
     row.last_mark_paise = int(premium)
     row.last_mark_at = _utc(at)
+    row.pending_mark_paise = None
+
+
+def update_pending_mark(session: Session, row: OpenPositionRow, candidate: Paise | None) -> None:
+    """Records (or clears, when `None`) the candidate price awaiting a
+    second cycle's confirmation — see `te.engine.exits.sanity_checked_mark`.
+    Deliberately separate from `update_last_mark`: a quarantined candidate is
+    explicitly NOT yet a fact, and must never overwrite `last_mark_paise`."""
+    row.pending_mark_paise = int(candidate) if candidate is not None else None
 
 
 def mark_position_closed(session: Session, row: OpenPositionRow, *, closed_at: dt.datetime) -> None:
@@ -308,9 +366,7 @@ def underlying_entries_today(session: Session, *, strategy: str, underlying: str
 def trades_today(session: Session, on: dt.date) -> list[TradeRow]:
     start, end = _day_bounds(on)
     return list(
-        session.execute(
-            select(TradeRow).where(TradeRow.closed_at >= start, TradeRow.closed_at <= end)
-        ).scalars().all()
+        session.execute(select(TradeRow).where(TradeRow.closed_at >= start, TradeRow.closed_at <= end)).scalars().all()
     )
 
 
@@ -356,9 +412,7 @@ def total_net_pnl_paise(session: Session) -> Paise:
 def recent_trades(session: Session, *, limit: int = 500) -> list[TradeRow]:
     """The most recent `limit` CLOSED trades, newest first — feeds
     `te.risk.monitors.RollingPerformance` (Tier 3, informational only)."""
-    return list(
-        session.execute(select(TradeRow).order_by(TradeRow.closed_at.desc()).limit(limit)).scalars().all()
-    )
+    return list(session.execute(select(TradeRow).order_by(TradeRow.closed_at.desc()).limit(limit)).scalars().all())
 
 
 def recent_session_dates(session: Session, *, limit: int) -> list[dt.date]:
@@ -366,12 +420,13 @@ def recent_session_dates(session: Session, *, limit: int) -> list[dt.date]:
     trade, newest first. Aggregated in SQL so a caller wanting a trailing
     N-SESSION window can derive its cutoff date without first hydrating
     every trade row in the history."""
-    rows = session.execute(
-        select(func.date(TradeRow.closed_at))
-        .distinct()
-        .order_by(func.date(TradeRow.closed_at).desc())
-        .limit(limit)
-    ).scalars().all()
+    rows = (
+        session.execute(
+            select(func.date(TradeRow.closed_at)).distinct().order_by(func.date(TradeRow.closed_at).desc()).limit(limit)
+        )
+        .scalars()
+        .all()
+    )
     return [dt.date.fromisoformat(str(row)) for row in rows]
 
 
@@ -383,11 +438,13 @@ def order_ids_today(session: Session, on: dt.date) -> list[str]:
     derive order state from the append-only event log (see
     `te/execution/store.py`)."""
     start, end = _day_bounds(on)
-    rows = session.execute(
-        select(OrderEventRow.client_order_id)
-        .distinct()
-        .where(OrderEventRow.ts >= start, OrderEventRow.ts <= end)
-    ).scalars().all()
+    rows = (
+        session.execute(
+            select(OrderEventRow.client_order_id).distinct().where(OrderEventRow.ts >= start, OrderEventRow.ts <= end)
+        )
+        .scalars()
+        .all()
+    )
     return list(rows)
 
 
@@ -399,9 +456,9 @@ def daily_pnl(session: Session, *, month: str | None = None) -> list[tuple[dt.da
     Feeds `GET /api/daily-pnl` — previously a permanent `[]` stub (found
     live on 2026-07-31 alongside `equity_curve`, both missed by the earlier
     Tier-0 dashboard-wiring pass that fixed the other read routers)."""
-    query = select(
-        func.date(TradeRow.closed_at), func.sum(TradeRow.net_pnl_paise), func.count()
-    ).group_by(func.date(TradeRow.closed_at))
+    query = select(func.date(TradeRow.closed_at), func.sum(TradeRow.net_pnl_paise), func.count()).group_by(
+        func.date(TradeRow.closed_at)
+    )
     if month is not None:
         query = query.where(func.strftime("%Y-%m", TradeRow.closed_at) == month)
     rows = session.execute(query.order_by(func.date(TradeRow.closed_at))).all()
@@ -443,7 +500,7 @@ def trades_closed_since(session: Session, cutoff: dt.date) -> list[TradeRow]:
     trailing-window statistic actually uses, and no others."""
     start = dt.datetime.combine(cutoff, dt.time.min, tzinfo=dt.UTC)
     return list(
-        session.execute(
-            select(TradeRow).where(TradeRow.closed_at >= start).order_by(TradeRow.closed_at.desc())
-        ).scalars().all()
+        session.execute(select(TradeRow).where(TradeRow.closed_at >= start).order_by(TradeRow.closed_at.desc()))
+        .scalars()
+        .all()
     )

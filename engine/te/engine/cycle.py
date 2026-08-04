@@ -37,13 +37,21 @@ from te.domain.orders import OrderRequest
 from te.domain.pnl import GrossPnl, mark_to_market_pnl, net_pnl
 from te.domain.signal import ExitPlan, Signal
 from te.engine.contract import ContractResolver, OptionContractResolver
-from te.engine.exits import OpenPosition, evaluate_position, time_exit
+from te.engine.exits import (
+    DEFAULT_MAX_MARK_JUMP_PCT,
+    OpenPosition,
+    evaluate_position,
+    sanity_checked_mark,
+    time_exit,
+)
 from te.engine.state import PIPELINE_STAGE_KEYS, PipelineStageTiming, set_last_cycle_pipeline
 from te.execution.manager import ExecutionManager
 from te.ml.gates import MLHook, MLInfluence
 from te.persistence.db import session_scope
 from te.persistence.models import OpenPositionRow
 from te.persistence.repos.paper_trading import (
+    correct_evaluation_verdict,
+    engage_profit_lock,
     find_open_position,
     insert_open_position,
     insert_trade,
@@ -56,6 +64,7 @@ from te.persistence.repos.paper_trading import (
     total_net_pnl_paise,
     underlying_entries_today,
     update_last_mark,
+    update_pending_mark,
     update_trailing_stop,
 )
 from te.risk.killswitch import KillSwitchTrippedError, is_currently_throttled
@@ -175,8 +184,10 @@ def unrealized_pnl_paise(
         marked: Paise | None = current_premium(row) if current_premium is not None else None
         if marked is None and row.last_mark_paise is not None:
             marked = Paise(row.last_mark_paise)
-        current = marked if marked is not None else Paise(
-            latest_close_paise(store, row.symbol, as_of, fallback=row.entry_premium_paise)
+        current = (
+            marked
+            if marked is not None
+            else Paise(latest_close_paise(store, row.symbol, as_of, fallback=row.entry_premium_paise))
         )
         total += int(
             mark_to_market_pnl(
@@ -199,6 +210,12 @@ def _row_to_position(row: OpenPositionRow) -> OpenPosition:
         target=Paise(row.target_paise),
         max_hold=dt.timedelta(seconds=row.max_hold_seconds),
         hard_exit_by=dt.time.fromisoformat(row.hard_exit_by),
+        profit_lock_activation=(
+            Paise(row.profit_lock_activation_paise) if row.profit_lock_activation_paise is not None else None
+        ),
+        profit_lock_buffer_pct=(
+            Decimal(str(row.profit_lock_buffer_pct)) if row.profit_lock_buffer_pct is not None else None
+        ),
     )
     return OpenPosition(
         symbol=row.symbol,
@@ -210,6 +227,7 @@ def _row_to_position(row: OpenPositionRow) -> OpenPosition:
         opened_at=_as_utc(row.opened_at),
         exit_plan=exit_plan,
         current_stop=Paise(row.current_stop_paise),
+        profit_lock_engaged=row.profit_lock_engaged,
     )
 
 
@@ -254,15 +272,25 @@ def run_entry_cycle(
     with session_scope(session_factory) as session:
         cycle_id = record_cycle(session, ts=as_of, mode=config.mode)
 
-    def _skip(instrument: str, reason: str) -> None:
+    def _skip(instrument: str, reason: str, *, evaluation_id: str | None = None) -> None:
         """Every early exit from the per-instrument loop below persists a
         `SkippedSignal` with the REAL reason — the plan's explicit
         call-out that a silently-swallowed skip is the exact bug class that
-        meant the old engine never traded."""
+        meant the old engine never traded.
+
+        `evaluation_id`: pass the current `evaluation.id` whenever this skip
+        fires AFTER `record_evaluation` already persisted a "traded" verdict
+        for it (every call site below the verdict check does). Corrects that
+        row to "skipped" with the real reason — see
+        `correct_evaluation_verdict`'s docstring for the 2026-08-04 incident
+        this closes. Omitted only by the one call site that skips BEFORE any
+        evaluation this cycle exists to correct."""
         with session_scope(session_factory) as session:
             record_skipped_signal(
                 session, ts=as_of, strategy=config.strategy_name, instrument=instrument, reason=reason
             )
+            if evaluation_id is not None:
+                correct_evaluation_verdict(session, evaluation_id=evaluation_id, verdict="skipped", reason=reason)
 
     # Real, measured per-stage wall-clock cost for this cycle — feeds the
     # dashboard's "Current cycle" strip (`PipelineStrip`/`get_dashboard_
@@ -402,7 +430,7 @@ def run_entry_cycle(
             # per te.strategy.orb's contract. Treat as a skip rather than
             # crash the whole cycle if a future Strategy implementation
             # ever violates that contract.
-            _skip(instrument, "strategy reported verdict=traded but produced no Signal")
+            _skip(instrument, "strategy reported verdict=traded but produced no Signal", evaluation_id=evaluation.id)
             continue
 
         # Max entries per underlying per session — the standard ORB
@@ -422,6 +450,7 @@ def run_entry_cycle(
                 instrument,
                 f"{entries_today} entr(ies) on this underlying today, at or above the per-session limit of "
                 f"{config.max_entries_per_underlying_per_day}",
+                evaluation_id=evaluation.id,
             )
             continue
 
@@ -450,7 +479,7 @@ def run_entry_cycle(
                 blocked_reason = str(exc)
         if blocked_reason is not None:
             stage_ms["risk"] += (time.perf_counter() - _t2) * 1000
-            _skip(instrument, blocked_reason)
+            _skip(instrument, blocked_reason, evaluation_id=evaluation.id)
             continue
 
         # Contract resolution — the index breakout becomes a real option to
@@ -470,7 +499,11 @@ def run_entry_cycle(
             contract = contract_resolver(instrument, signal.direction, as_of)
             stage_ms["fetch"] += (time.perf_counter() - _tc) * 1000
             if contract is None:
-                _skip(instrument, "no tradeable option contract could be resolved (see logs for the guard that fired)")
+                _skip(
+                    instrument,
+                    "no tradeable option contract could be resolved (see logs for the guard that fired)",
+                    evaluation_id=evaluation.id,
+                )
                 continue
             trade_symbol = contract.symbol
             trade_exchange = contract.exchange
@@ -503,7 +536,11 @@ def run_entry_cycle(
         )
         stage_ms["risk"] += (time.perf_counter() - _t2) * 1000
         if sizing.lots == 0:
-            _skip(instrument, sizing.rejected_reason or "sizing rejected with no reason (bug)")
+            _skip(
+                instrument,
+                sizing.rejected_reason or "sizing rejected with no reason (bug)",
+                evaluation_id=evaluation.id,
+            )
             continue
 
         # `ml_hook` is the ONLY place `te.ml` can touch this decision — see
@@ -530,7 +567,7 @@ def run_entry_cycle(
         stage_reached["decide"] = True
 
         if influence.veto:
-            _skip(instrument, "ML maturity gate vetoed this signal")
+            _skip(instrument, "ML maturity gate vetoed this signal", evaluation_id=evaluation.id)
             continue
         if lots < 1:
             _skip(
@@ -538,6 +575,7 @@ def run_entry_cycle(
                 "throttle/ML size multiplier resized position below 1 lot "
                 f"(combined_multiplier={combined_multiplier}, throttled={throttled}, "
                 f"ml_multiplier={influence.size_multiplier})",
+                evaluation_id=evaluation.id,
             )
             continue
 
@@ -566,6 +604,7 @@ def run_entry_cycle(
                     instrument,
                     f"one lot ({lot_size}) exceeds the exchange freeze quantity ({freeze_qty}) for "
                     f"{trade_symbol} — this contract cannot be traded in any size",
+                    evaluation_id=evaluation.id,
                 )
                 continue
             with session_scope(session_factory) as session:
@@ -598,6 +637,8 @@ def run_entry_cycle(
             target=target_premium,
             max_hold=config.max_hold,
             hard_exit_by=config.hard_exit_by,
+            profit_lock_activation=levels.profit_lock_activation,
+            profit_lock_buffer_pct=levels.profit_lock_buffer_pct,
         )
         with session_scope(session_factory) as session:
             insert_open_position(
@@ -627,6 +668,7 @@ def run_exit_cycle(
     cost_model: CostModel,
     current_premium: Callable[[OpenPositionRow], Paise | None],
     as_of: dt.datetime,
+    max_mark_jump_pct: float = DEFAULT_MAX_MARK_JUMP_PCT,
 ) -> list[str]:
     """Evaluates exits on every currently open position. `current_premium`
     supplies the live mark for one position's symbol (the caller's job to
@@ -654,8 +696,43 @@ def run_exit_cycle(
                 premium = None
 
             if premium is not None:
-                update_last_mark(session, row, premium, as_of)
-                updated, decision = evaluate_position(position, current_premium=premium, now=as_of)
+                # A bad tick must not be allowed to fire a stop/target/trail
+                # directly — see `sanity_checked_mark`'s docstring for the
+                # 2026-08-04 incident (a single spurious tick fabricated a
+                # "target hit" and closed two real positions). `accepted` is
+                # either `premium` (trusted immediately or just confirmed by
+                # a second agreeing reading) or the last confirmed price
+                # (quarantined — nothing acts on `premium` this cycle).
+                last_confirmed = Paise(row.last_mark_paise) if row.last_mark_paise is not None else None
+                pending = Paise(row.pending_mark_paise) if row.pending_mark_paise is not None else None
+                accepted, new_pending = sanity_checked_mark(
+                    candidate=premium,
+                    last_confirmed=last_confirmed,
+                    pending=pending,
+                    max_jump_pct=max_mark_jump_pct,
+                )
+                if new_pending is not None:
+                    logger.warning(
+                        "premium jump quarantined pending confirmation",
+                        symbol=row.symbol,
+                        candidate_paise=int(premium),
+                        last_confirmed_paise=int(last_confirmed) if last_confirmed is not None else None,
+                    )
+                    record_risk_event(
+                        session,
+                        kind="mark_quarantined",
+                        ts=as_of,
+                        detail=(
+                            f"{row.symbol}: candidate {int(premium)}p is more than {max_mark_jump_pct}% from "
+                            f"the last confirmed "
+                            f"{int(last_confirmed) if last_confirmed is not None else 'n/a'}p — held for "
+                            "next-cycle confirmation, not acted on"
+                        ),
+                    )
+                    update_pending_mark(session, row, new_pending)
+                else:
+                    update_last_mark(session, row, accepted, as_of)
+                updated, decision = evaluate_position(position, current_premium=accepted, now=as_of)
             elif row.last_mark_paise is not None:
                 # Stale mark: the clock-driven exits MUST still fire (a quote
                 # outage cannot be allowed to strand a position past 15:20),
@@ -671,16 +748,21 @@ def run_exit_cycle(
                 # place. Leave it open and make the gap visible.
                 logger.error("open position has never been priced; exits cannot be evaluated", symbol=row.symbol)
                 record_risk_event(
-                    session, kind="position_unpriceable", ts=as_of,
+                    session,
+                    kind="position_unpriceable",
+                    ts=as_of,
                     detail=f"{row.symbol}: no quote, no bar and no previous mark — exits not evaluated",
                 )
                 continue
 
             if decision is None:
-                # Only write when the trailing stop actually ratcheted —
-                # an unchanged stop is the common case every cycle.
+                # Only write when the stop actually moved (trailing ratchet
+                # or the one-time profit lock) — an unchanged stop is the
+                # common case every cycle.
                 if int(updated.current_stop) != row.current_stop_paise:
                     update_trailing_stop(session, row, updated.current_stop)
+                if updated.profit_lock_engaged and not row.profit_lock_engaged:
+                    engage_profit_lock(session, row)
                 continue
 
             _close_position(

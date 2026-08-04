@@ -31,10 +31,11 @@ from dataclasses import dataclass, replace
 from typing import Literal
 
 from te.domain.clock import DEFAULT_SESSION, IST, SessionWindow
+from te.domain.geometry import pct_of
 from te.domain.money import Paise
 from te.domain.signal import Direction, ExitPlan
 
-ExitReason = Literal["stop", "trailing_stop", "target", "time"]
+ExitReason = Literal["stop", "trailing_stop", "target", "time", "profit_lock"]
 
 
 @dataclass(frozen=True)
@@ -53,6 +54,11 @@ class OpenPosition:
     opened_at: dt.datetime
     exit_plan: ExitPlan
     current_stop: Paise
+    #: Whether the one-time profit lock (see `ExitPlan.profit_lock_activation`)
+    #: has already fired. `False` until `evaluate_position` engages it, then
+    #: permanently `True` for the rest of the position's life — it is a
+    #: ONE-TIME jump, not a continuous ratchet like trailing.
+    profit_lock_engaged: bool = False
 
     @property
     def entry_premium(self) -> Paise:
@@ -93,6 +99,69 @@ def open_position(
         exit_plan=exit_plan,
         current_stop=exit_plan.stop,
     )
+
+
+#: How far a candidate mark may differ from the last CONFIRMED price before
+#: it needs a second cycle's agreement, as a percent of that confirmed price.
+#: 20%, not tuned finer than that: this is a bad-tick filter, not a
+#: volatility model, and a real fast move on genuine news can plausibly clear
+#: single-digit percent in one minute (see the module docstring's incident —
+#: the fabricated jump there was ~30%, well past this). Overly tight
+#: catches real moves too and delays real exits; the fix for that is
+#: confirmation within one more cycle, not chasing a tighter number.
+DEFAULT_MAX_MARK_JUMP_PCT = 20
+
+#: How close a SECOND reading must be to the pending candidate to count as
+#: agreement rather than a second, unrelated glitch. Tighter than the jump
+#: threshold on purpose: confirmation should mean "the market is really
+#: here now", not "also far from where it was".
+_CONFIRM_TOLERANCE_PCT = 5
+
+
+def sanity_checked_mark(
+    *,
+    candidate: Paise,
+    last_confirmed: Paise | None,
+    pending: Paise | None,
+    max_jump_pct: float = DEFAULT_MAX_MARK_JUMP_PCT,
+) -> tuple[Paise, Paise | None]:
+    """Filters one cycle's fresh quote before it is trusted for a stop/
+    target/trail decision. Returns `(mark_to_use, new_pending)`.
+
+    Found live on 2026-08-04: Angel's SmartAPI websocket has documented,
+    user-reported bad ticks (wrong high/low prices on real tokens). One such
+    tick on an option premium — unconfirmed by any matching move in the
+    underlying — was trusted immediately, fired a "target hit", and closed
+    two real paper positions on a price no live order could have filled at.
+
+    The filter: a candidate within `max_jump_pct` of the last CONFIRMED
+    price is trusted immediately (this is the every-cycle common case). A
+    bigger jump is quarantined — the position keeps trading on its last
+    confirmed price this cycle, and the candidate is remembered as
+    `pending`. If the NEXT cycle's candidate lands close to that pending
+    value (within `_CONFIRM_TOLERANCE_PCT`), two independent readings have
+    now agreed on the new level, which a single bad tick cannot do — that
+    candidate is accepted as real. A candidate that does NOT confirm the
+    previous one becomes the new pending value in its own right, so an
+    outlier is never held against a later, unrelated reading.
+
+    `last_confirmed is None` (nothing has ever priced this position) trusts
+    the first reading unconditionally — there is nothing yet to compare it
+    against, and refusing it would leave the position permanently
+    unpriceable."""
+    if last_confirmed is None:
+        return candidate, None
+
+    def _pct_diff(a: Paise, b: Paise) -> float:
+        return abs(int(a) - int(b)) / int(b) * 100 if int(b) != 0 else float("inf")
+
+    if _pct_diff(candidate, last_confirmed) <= max_jump_pct:
+        return candidate, None
+
+    if pending is not None and _pct_diff(candidate, pending) <= _CONFIRM_TOLERANCE_PCT:
+        return candidate, None  # confirmed by a second, agreeing reading
+
+    return last_confirmed, candidate
 
 
 def next_trailing_stop(
@@ -158,10 +227,39 @@ def evaluate_position(
         new_stop = next_trailing_stop(
             position.current_stop, current_premium, plan.trailing_distance, position.direction
         )
-    updated = replace(position, current_stop=new_stop) if new_stop != position.current_stop else position
+
+    # The profit lock is a SEPARATE, ONE-TIME mechanism from trailing — see
+    # `ExitPlan.profit_lock_activation`'s docstring. It engages once (never
+    # re-engages), locks the stop `profit_lock_buffer_pct` below the price
+    # AT ACTIVATION (not below entry — a real profit floor), and then never
+    # moves again on its own account. Combined with any trailing ratchet via
+    # `max()` so whichever mechanism is more protective wins on any given
+    # cycle; in practice this project runs at most one of the two at a time.
+    profit_lock_engaged = position.profit_lock_engaged
+    if (
+        not profit_lock_engaged
+        and plan.profit_lock_activation is not None
+        and plan.profit_lock_buffer_pct is not None
+        and current_premium >= plan.profit_lock_activation
+    ):
+        lock_stop = Paise(current_premium - pct_of(current_premium, plan.profit_lock_buffer_pct))
+        new_stop = Paise(max(new_stop, lock_stop))
+        profit_lock_engaged = True
+
+    updated = position
+    if new_stop != position.current_stop or profit_lock_engaged != position.profit_lock_engaged:
+        updated = replace(position, current_stop=new_stop, profit_lock_engaged=profit_lock_engaged)
 
     if current_premium <= new_stop:
-        reason: ExitReason = "trailing_stop" if new_stop > plan.stop else "stop"
+        if new_stop <= plan.stop:
+            reason: ExitReason = "stop"
+        elif profit_lock_engaged:
+            # Once engaged, an elevated stop is attributed to the lock even
+            # in a LATER cycle than the one that set it — the level exists
+            # because of the lock, regardless of which cycle produced it.
+            reason = "profit_lock"
+        else:
+            reason = "trailing_stop"
         return updated, ExitDecision(reason=reason, exit_premium=current_premium)
 
     return updated, None

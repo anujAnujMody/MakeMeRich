@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import datetime as dt
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Literal
 
 from te.domain.money import Paise
@@ -40,6 +41,14 @@ class ExitPlan:
     target: Paise
     max_hold: dt.timedelta
     hard_exit_by: dt.time
+    #: Premium at which the ONE-TIME profit lock engages, and how far below
+    #: THAT price (not entry) the locked stop sits — see
+    #: `te.domain.geometry.ExitLevels.profit_lock_activation`'s docstring
+    #: for the 2026-08-04 backtest that shaped these numbers. `None`/`None`
+    #: means the rule is off; both are always set or unset together (see
+    #: `__post_init__`), same convention as `trailing_distance`.
+    profit_lock_activation: Paise | None = None
+    profit_lock_buffer_pct: Decimal | None = None
 
     @property
     def trailing_activation(self) -> Paise | None:
@@ -83,6 +92,15 @@ class ExitPlan:
             raise ValueError(f"max_hold must be positive, got {self.max_hold!r}")
         if self.trailing_distance is not None and self.trailing_distance <= 0:
             raise ValueError(f"trailing_distance must be positive when set, got {self.trailing_distance!r}")
+        if (self.profit_lock_activation is None) != (self.profit_lock_buffer_pct is None):
+            raise ValueError("profit_lock_activation and profit_lock_buffer_pct must be set together")
+        if self.profit_lock_activation is not None and not (self.stop < self.profit_lock_activation < self.target):
+            raise ValueError(
+                f"profit_lock_activation ({self.profit_lock_activation}) must sit between stop "
+                f"({self.stop}) and target ({self.target})"
+            )
+        if self.profit_lock_buffer_pct is not None and not (0 < self.profit_lock_buffer_pct < 100):
+            raise ValueError(f"profit_lock_buffer_pct must be in (0, 100), got {self.profit_lock_buffer_pct!r}")
 
 
 @dataclass(frozen=True)

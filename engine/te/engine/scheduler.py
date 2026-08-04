@@ -637,6 +637,8 @@ def _exit_geometry(settings: Settings) -> ExitGeometry:
             stop_pct=settings.paper_cycle_stop_pct,
             target_pct=settings.paper_cycle_target_pct,
             trailing_pct=settings.paper_cycle_trailing_pct,
+            profit_lock_activation_pct=settings.paper_cycle_profit_lock_activation_pct,
+            profit_lock_buffer_pct=settings.paper_cycle_profit_lock_buffer_pct,
         )
     return AbsolutePointGeometry(
         stop_distance=Paise(settings.paper_cycle_stop_distance_paise),

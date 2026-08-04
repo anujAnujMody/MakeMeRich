@@ -59,11 +59,85 @@ def test_percent_helper_truncates() -> None:
         ({"stop_pct": Decimal(100), "target_pct": Decimal(40)}, "stop_pct"),
         ({"stop_pct": Decimal(20), "target_pct": Decimal(0)}, "target_pct"),
         ({"stop_pct": Decimal(20), "target_pct": Decimal(40), "trailing_pct": Decimal(0)}, "trailing_pct"),
+        (
+            {"stop_pct": Decimal(20), "target_pct": Decimal(40), "profit_lock_activation_pct": Decimal(15)},
+            "profit_lock_activation_pct and profit_lock_buffer_pct",
+        ),
+        (
+            {"stop_pct": Decimal(20), "target_pct": Decimal(40), "profit_lock_buffer_pct": Decimal(5)},
+            "profit_lock_activation_pct and profit_lock_buffer_pct",
+        ),
+        (
+            {
+                "stop_pct": Decimal(20),
+                "target_pct": Decimal(40),
+                "profit_lock_activation_pct": Decimal(0),
+                "profit_lock_buffer_pct": Decimal(5),
+            },
+            "profit_lock_activation_pct",
+        ),
+        (
+            {
+                "stop_pct": Decimal(20),
+                "target_pct": Decimal(40),
+                "profit_lock_activation_pct": Decimal(15),
+                "profit_lock_buffer_pct": Decimal(100),
+            },
+            "profit_lock_buffer_pct",
+        ),
     ],
 )
 def test_percentage_geometry_rejects_nonsense(kwargs: dict[str, Decimal], match: str) -> None:
     with pytest.raises(ValueError, match=match):
         PremiumPercentGeometry(**kwargs)  # type: ignore[arg-type]
+
+
+class TestProfitLock:
+    """The ONE-TIME profit lock — distinct from the (disabled) continuous
+    trail. Found live worth adding on 2026-08-04 after backtesting the exact
+    shape against 1,305 real historical trades: roughly flat mean R but a
+    materially higher win rate and no more full round-trips on a position
+    that was already deep in profit."""
+
+    def test_off_by_default(self) -> None:
+        levels = PremiumPercentGeometry(stop_pct=Decimal(20), target_pct=Decimal(20)).levels(ENTRY)
+        assert levels.profit_lock_activation is None
+        assert levels.profit_lock_buffer_pct is None
+
+    def test_activation_is_a_premium_above_entry(self) -> None:
+        levels = PremiumPercentGeometry(
+            stop_pct=Decimal(20),
+            target_pct=Decimal(20),
+            profit_lock_activation_pct=Decimal(15),
+            profit_lock_buffer_pct=Decimal(5),
+        ).levels(ENTRY)
+        # 15% of 8150 = 1222 (truncated) -> 8150 + 1222 = 9372
+        assert levels.profit_lock_activation == Paise(9_372)
+        assert levels.profit_lock_buffer_pct == Decimal(5)
+
+    def test_scales_with_the_premium_like_every_other_percentage_field(self) -> None:
+        cheap = PremiumPercentGeometry(
+            stop_pct=Decimal(20),
+            target_pct=Decimal(20),
+            profit_lock_activation_pct=Decimal(15),
+            profit_lock_buffer_pct=Decimal(5),
+        ).levels(Paise(3_000))
+        dear = PremiumPercentGeometry(
+            stop_pct=Decimal(20),
+            target_pct=Decimal(20),
+            profit_lock_activation_pct=Decimal(15),
+            profit_lock_buffer_pct=Decimal(5),
+        ).levels(Paise(30_000))
+        assert cheap.profit_lock_activation == Paise(3_450)  # 3000 + 15%
+        assert dear.profit_lock_activation == Paise(34_500)  # 30000 + 15%
+
+    def test_absolute_geometry_never_carries_a_profit_lock(self) -> None:
+        """Live-only feature — `AbsolutePointGeometry` backs backtests
+        replayed from `option_bhav` and pre-percentage tests, never live
+        trading, so it has no fields for this at all."""
+        levels = AbsolutePointGeometry(stop_distance=Paise(300), target_distance=Paise(300)).levels(ENTRY)
+        assert levels.profit_lock_activation is None
+        assert levels.profit_lock_buffer_pct is None
 
 
 def test_a_geometry_cannot_hold_both_forms_at_once() -> None:

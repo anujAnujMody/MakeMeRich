@@ -257,6 +257,28 @@ class OpenPositionRow(Base):
     last_mark_paise: Mapped[int | None] = mapped_column(nullable=True)
     last_mark_at: Mapped[dt.datetime | None] = mapped_column(UtcDateTime, nullable=True)
 
+    #: A candidate price that jumped too far from `last_mark_paise` to trust
+    #: on its own — held here so the NEXT cycle's fresh quote can be compared
+    #: against it. Two consecutive cycles agreeing is what tells a real, fast
+    #: move apart from a single bad tick (see `te.engine.exits.
+    #: sanity_checked_mark`). Found live on 2026-08-04: a single-tick spike on
+    #: an option premium, unconfirmed by the underlying's own move, was
+    #: trusted immediately and closed two positions on a fabricated
+    #: "target hit". NULL is the normal case — no candidate under review.
+    pending_mark_paise: Mapped[int | None] = mapped_column(nullable=True)
+
+    #: The ONE-TIME profit lock — see `te.domain.geometry.ExitLevels.
+    #: profit_lock_activation` and `te.engine.exits.evaluate_position`.
+    #: `profit_lock_activation_paise`/`profit_lock_buffer_pct` mirror
+    #: `ExitPlan`'s fields (both NULL together when the rule is off);
+    #: `profit_lock_engaged` is live position STATE (mutated once the lock
+    #: fires), not part of the plan — same split as `stop_paise` (the
+    #: original plan) vs `current_stop_paise` (the live, possibly-ratcheted
+    #: value).
+    profit_lock_activation_paise: Mapped[int | None] = mapped_column(nullable=True)
+    profit_lock_buffer_pct: Mapped[float | None] = mapped_column(nullable=True)
+    profit_lock_engaged: Mapped[bool] = mapped_column(nullable=False, default=False)
+
 
 class TradeRow(Base):
     """A closed round-trip trade. NO bare `pnl` column, per the plan's
@@ -305,9 +327,7 @@ class TradeRow(Base):
     #: `open_positions` too — a wider change than this column. The column
     #: exists (nullable) so that later change is a pure backfill rather than
     #: another migration of the trades table.
-    cycle_evaluation_id: Mapped[int | None] = mapped_column(
-        ForeignKey("cycle_evaluations.id"), nullable=True
-    )
+    cycle_evaluation_id: Mapped[int | None] = mapped_column(ForeignKey("cycle_evaluations.id"), nullable=True)
 
 
 class ApprovalRow(Base):
