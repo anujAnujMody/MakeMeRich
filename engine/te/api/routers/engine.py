@@ -51,6 +51,7 @@ def get_scheduler_status(request: Request) -> SchedulerStatus:
     operation."""
     scheduler = getattr(request.app.state, "scheduler", None)
     runner = getattr(request.app.state, "paper_cycle_runner", None)
+    supervisor = getattr(request.app.state, "ws_supervisor", None)
 
     jobs = (
         [
@@ -60,10 +61,13 @@ def get_scheduler_status(request: Request) -> SchedulerStatus:
         if scheduler is not None
         else []
     )
+    feed_health = supervisor.feed_health if supervisor is not None else None
     return SchedulerStatus(
         jobs=jobs,
         paperCycleLastRunAt=runner.status.last_run_at if runner is not None else None,
         paperCycleLastResult=runner.status.last_result if runner is not None else None,
+        feedLastCheckedAt=feed_health.checked_at if feed_health is not None else None,
+        feedLastTickAt=feed_health.last_tick_at if feed_health is not None else None,
     )
 
 
@@ -197,14 +201,28 @@ def reset_drawdown_breaker(request: Request, response: Response) -> EngineHealth
 
 
 @router.post("/relogin-broker", response_model=ReloginResponse)
-def relogin_broker(response: Response) -> ReloginResponse:
+def relogin_broker(request: Request, response: Response) -> ReloginResponse:
     """Ad-hoc same-day OpenAlgo-app + Angel-broker relogin (see
     `te.engine.scheduler.run_openalgo_relogin`) — the scheduled 08:40 IST
     job covers the daily case, this covers recovering from an unplanned
     mid-session outage without waiting for tomorrow's cron or clicking
     through OpenAlgo's own web UI. Real credentials, real broker call, on
-    every invocation — not something to poll or call speculatively."""
+    every invocation — not something to poll or call speculatively.
+
+    Bounces the WS recorder (stop, then start) when it's already running.
+    Found live on 2026-08-04: OpenAlgo deletes its Angel WS broker adapter
+    the moment a relogin lands ("force re-initialization with fresh
+    credentials on next connection"), but this engine's WS client only
+    re-authenticates on its OWN reconnect — and a relogin mid-session
+    doesn't touch that connection. Every tick, index AND option, silently
+    stopped until the next `supervisor.start()` (09:10 IST the next trading
+    day) with nothing anywhere saying so. A restart here is what actually
+    triggers the client to reconnect and OpenAlgo to recreate the adapter."""
     result = run_openalgo_relogin(settings)
+    supervisor = getattr(request.app.state, "ws_supervisor", None)
+    if result.ok and supervisor is not None and supervisor.is_running():
+        supervisor.stop()
+        supervisor.start()
     if not result.ok:
         set_provenance(response, not_ready_reason=result.message)
     else:
@@ -285,9 +303,7 @@ def get_instruments(response: Response) -> InstrumentSelectionsPayload:
     lot_size for every instrument, silently wrong for anything but a single
     NFO symbol). `PaperCycleRunner` reads this exact call on every cycle."""
     with session_factory() as session:
-        selections = get_instrument_selections(
-            session, defaults=instrument_selections_defaults_from_settings(settings)
-        )
+        selections = get_instrument_selections(session, defaults=instrument_selections_defaults_from_settings(settings))
     set_provenance(response, provenance="paper", sample_size=1)
     return InstrumentSelectionsPayload(
         instruments=[

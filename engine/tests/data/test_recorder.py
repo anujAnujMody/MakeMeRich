@@ -265,3 +265,28 @@ def test_a_failed_flush_keeps_the_bar_for_a_later_retry_instead_of_losing_it(tmp
     out = real_store.read(symbol="NIFTY", start=_WINDOW_START, end=_WINDOW_END, interval="1m")
     assert len(out) == 1
     assert out.iloc[0]["o"] == 24200.0  # the original 09:20 bar's data, not lost or corrupted
+
+
+def test_last_tick_at_tracks_wall_clock_receipt_not_the_tick_own_timestamp(tmp_path: Path) -> None:
+    """`WSRecorderSupervisor.check_feed_health` (see `te.engine.scheduler`)
+    needs "are we CURRENTLY receiving anything" — a dead broker adapter
+    leaves the WS thread alive with `is_running()` still `True`, and only
+    this catches it. Must reflect real wall-clock receipt, not the
+    (possibly old, possibly replayed) `event_ts` on the tick itself."""
+    recorder = BarRecorder(BarStore(tmp_path))
+    assert recorder.last_tick_at is None
+
+    before = dt.datetime.now(dt.UTC)
+    recorder.on_tick(_tick("NIFTY", "2026-07-29T09:20:05+00:00", 24200.0))
+    after = dt.datetime.now(dt.UTC)
+
+    assert recorder.last_tick_at is not None
+    assert before <= recorder.last_tick_at <= after
+
+
+def test_last_tick_at_ignores_a_tick_with_no_symbol(tmp_path: Path) -> None:
+    """A malformed frame is dropped before it can prove the feed is alive —
+    it must not falsely mark the feed as healthy."""
+    recorder = BarRecorder(BarStore(tmp_path))
+    recorder.on_tick({"type": "market_data", "data": {}})
+    assert recorder.last_tick_at is None

@@ -6,6 +6,10 @@ the end of those phases (nothing previously called `te.engine.cycle`'s
 - WS recorder supervisor: starts the live bar recorder at 09:10 IST, stops
   it at 15:35 IST (NSE/BSE cash+F&O session is 09:15-15:30; the 5-minute
   pad on each side covers pre-open auction ticks and a clean final flush).
+- WS feed health check: every 5 minutes 09:00-15:55 IST, verifies ticks are
+  actually arriving (not just that the WS thread is alive) and self-heals
+  by bouncing the recorder if the feed has gone stale — see
+  `FeedHealthStatus`.
 - bhavcopy ingest: hourly 19:00-23:00 IST, skipping whichever exchange has
   already landed. It used to be a single 18:30 attempt, on the belief that
   this was "well after" both files were published; it is not. NSE publishes
@@ -172,6 +176,25 @@ class LateSubscriptionStatus:
     error: str | None = None
 
 
+@dataclass(frozen=True)
+class FeedHealthStatus:
+    """Outcome of the last `check_feed_health` run.
+
+    Exists because "the WS thread is alive" and "ticks are actually
+    arriving" are different facts. Found live on 2026-08-04: an ad-hoc
+    broker relogin made OpenAlgo delete its Angel WS adapter, but this
+    engine's own WS connection to OpenAlgo never dropped — so `is_running()`
+    stayed `True`, no reconnect ever fired, and every tick, index and
+    option, silently stopped for about an hour before a human noticed by
+    hand. `healed=True` means this check found the feed stale and
+    bounced the recorder itself, rather than just logging and waiting.
+    """
+
+    checked_at: dt.datetime | None = None
+    last_tick_at: dt.datetime | None = None
+    healed: bool = False
+
+
 class WSRecorderSupervisor:
     """Owns the WS client's asyncio event loop on a dedicated background
     thread, so APScheduler's synchronous cron jobs can `start()`/`stop()`
@@ -190,9 +213,15 @@ class WSRecorderSupervisor:
         #: `refresh_late_instruments`.
         self._late_instruments = late_instruments
         self._late_status = LateSubscriptionStatus()
+        self._feed_health = FeedHealthStatus()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._task: asyncio.Task[None] | None = None
+        #: Set on every `start()` (including a self-heal restart) — gives
+        #: `check_feed_health` a grace period before the first tick has had
+        #: a realistic chance to arrive, instead of flagging a feed that
+        #: hasn't been up long enough to prove itself either way.
+        self._started_at: dt.datetime | None = None
 
     @property
     def late_status(self) -> LateSubscriptionStatus:
@@ -206,6 +235,47 @@ class WSRecorderSupervisor:
         call raised, and nothing anywhere said so.
         """
         return self._late_status
+
+    @property
+    def feed_health(self) -> FeedHealthStatus:
+        """The outcome of the last `check_feed_health` run — see
+        `FeedHealthStatus` for the failure mode this exists to catch."""
+        return self._feed_health
+
+    def check_feed_health(self, *, stale_after: dt.timedelta = dt.timedelta(minutes=3)) -> None:
+        """Verifies ticks are actually arriving, not just that the WS
+        thread is alive — see `FeedHealthStatus`'s docstring for the exact
+        2026-08-04 incident this closes. Self-heals (stop then start) the
+        moment it finds the feed stale, rather than only logging: a bounce
+        is exactly the fix a human would apply by hand, and there is no
+        reason to wait for one when the recorder can apply it itself within
+        one 5-minute check cycle instead of however long it takes someone to
+        notice.
+
+        A no-op when the recorder isn't running at all — matches
+        `refresh_late_instruments`'s convention of staying quiet outside the
+        session and on holidays, when `start()` never fired."""
+        if not self.is_running():
+            return
+        now = dt.datetime.now(dt.UTC)
+        started_at = self._started_at
+        if started_at is not None and now - started_at < stale_after:
+            # Just (re)started — the first tick can take a few seconds, and
+            # a self-heal resets this clock. Flagging a feed that hasn't had
+            # time to prove itself either way would just bounce it forever.
+            return
+        last_tick = self._recorder.last_tick_at
+        stale = last_tick is None or (now - last_tick) > stale_after
+        self._feed_health = FeedHealthStatus(checked_at=now, last_tick_at=last_tick, healed=stale)
+        if not stale:
+            return
+        logger.error(
+            "feed is stale — no ticks recently, reconnecting",
+            last_tick_at=last_tick.isoformat() if last_tick else None,
+            stale_after_seconds=stale_after.total_seconds(),
+        )
+        self.stop()
+        self.start()
 
     def refresh_late_instruments(self) -> None:
         """Re-resolves the subscriptions that can only be known at run time
@@ -286,6 +356,7 @@ class WSRecorderSupervisor:
 
         loop = asyncio.new_event_loop()
         self._loop = loop
+        self._started_at = dt.datetime.now(dt.UTC)
 
         def _on_tick(message: dict[str, object]) -> None:
             self._recorder.on_tick(message)
@@ -943,6 +1014,21 @@ def build_scheduler(
         id="ws_late_subscription_refresh",
         replace_existing=True,
         # One slow resolution must not stack up behind the next tick.
+        max_instances=1,
+        coalesce=True,
+    )
+    # Catches the class of bug `ws_late_subscription_refresh` cannot: a
+    # relogin (or any other event that kills the broker side of the feed
+    # without dropping THIS process's WS connection) leaves `is_running()`
+    # `True` with zero ticks arriving, silently, for as long as nobody
+    # checks by hand — see `FeedHealthStatus`. Same 5-minute cadence as the
+    # late-subscription refresh so a dead feed is caught and self-healed
+    # within one cycle, not a whole session.
+    scheduler.add_job(
+        supervisor.check_feed_health,
+        trigger=CronTrigger(hour="9-15", minute="*/5", day_of_week="mon-fri", timezone=IST),
+        id="ws_feed_health_check",
+        replace_existing=True,
         max_instances=1,
         coalesce=True,
     )

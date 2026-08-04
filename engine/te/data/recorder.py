@@ -87,6 +87,17 @@ class BarRecorder:
         #: Last cumulative session volume seen per symbol, carried across
         #: bar boundaries so a new bar knows where the previous one ended.
         self._last_cumulative_volume: dict[str, float] = {}
+        #: Wall-clock time of the last tick actually processed (not the
+        #: tick's own `event_ts`) — this is what a feed-health check needs:
+        #: "are we CURRENTLY receiving anything", not "when did the market
+        #: last move". A dead broker adapter leaves the WS thread alive and
+        #: `is_running()` `True` while zero ticks arrive; this is the only
+        #: signal that catches that. See `WSRecorderSupervisor.feed_is_stale`.
+        self._last_tick_at: dt.datetime | None = None
+
+    @property
+    def last_tick_at(self) -> dt.datetime | None:
+        return self._last_tick_at
 
     def on_tick(self, message: dict[str, Any]) -> int:
         """Feeds one WS `market_data` frame in. Returns the number of bar
@@ -97,6 +108,7 @@ class BarRecorder:
         exchange = data.get("exchange", "NSE_INDEX")
         if not symbol:
             return 0
+        self._last_tick_at = dt.datetime.now(dt.UTC)
 
         raw_ts = data.get("timestamp")
         if raw_ts is None:

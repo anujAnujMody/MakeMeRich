@@ -27,6 +27,7 @@ def test_scheduler_status_reports_all_jobs_including_paper_cycle() -> None:
         "trading_calendar_refresh",
         "paper_cycle",
         "ws_late_subscription_refresh",
+        "ws_feed_health_check",
     }
 
     paper_cycle_job = next(job for job in body["jobs"] if job["id"] == "paper_cycle")
@@ -38,9 +39,14 @@ def test_scheduler_status_reports_all_jobs_including_paper_cycle() -> None:
     refresh_job = next(job for job in body["jobs"] if job["id"] == "ws_late_subscription_refresh")
     assert refresh_job["maxInstances"] == 1
 
+    health_job = next(job for job in body["jobs"] if job["id"] == "ws_feed_health_check")
+    assert health_job["maxInstances"] == 1
+
     # No run has happened yet within the lifespan of this short-lived
     # request (the job's IntervalTrigger fires no sooner than one interval
     # after scheduler.start()) — last-run fields are honestly None, not a
     # fabricated value.
     assert body["paperCycleLastRunAt"] is None
     assert body["paperCycleLastResult"] is None
+    assert body["feedLastCheckedAt"] is None
+    assert body["feedLastTickAt"] is None

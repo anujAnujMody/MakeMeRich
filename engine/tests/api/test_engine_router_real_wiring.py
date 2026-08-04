@@ -14,6 +14,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import te.api.routers.engine as engine_router
+from te.broker.openalgo_login import LoginResult
 from te.engine.state import get_run_state
 from te.execution.halt import is_halted
 from te.persistence.db import make_engine, make_session_factory
@@ -81,6 +82,89 @@ def test_relogin_broker_honestly_reports_not_configured(isolated_client) -> None
     body = response.json()
     assert body["success"] is False
     assert body["stage"] == "not_configured"
+
+
+class _FakeSupervisor:
+    """Stands in for `WSRecorderSupervisor` — records stop/start calls
+    without touching a real WS connection."""
+
+    def __init__(self, *, running: bool) -> None:
+        self._running = running
+        self.calls: list[str] = []
+
+    def is_running(self) -> bool:  # noqa: ANN201
+        return self._running
+
+    def stop(self) -> None:
+        self.calls.append("stop")
+        self._running = False
+
+    def start(self) -> None:
+        self.calls.append("start")
+        self._running = True
+
+
+def test_relogin_broker_bounces_a_running_recorder(isolated_client, monkeypatch) -> None:  # noqa: ANN001
+    """Found live on 2026-08-04: a relogin makes OpenAlgo delete its Angel WS
+    broker adapter to force fresh credentials on next connect, but this
+    engine's WS client only re-authenticates on ITS OWN reconnect — a
+    mid-session relogin never triggers that. Every tick, index and option,
+    silently stopped for the rest of the session with nothing anywhere
+    saying so. The endpoint must stop-then-start the recorder itself
+    whenever the relogin succeeds and the recorder was already live."""
+    client, _sf = isolated_client
+    fake = _FakeSupervisor(running=True)
+    client.app.state.ws_supervisor = fake
+
+    monkeypatch.setattr(
+        engine_router,
+        "run_openalgo_relogin",
+        lambda _settings: LoginResult(True, "done", "logged in"),
+    )
+
+    response = client.post("/api/engine/relogin-broker")
+    assert response.status_code == 200
+    assert response.json()["success"] is True
+    assert fake.calls == ["stop", "start"]
+
+
+def test_relogin_broker_leaves_a_stopped_recorder_alone(isolated_client, monkeypatch) -> None:  # noqa: ANN001
+    """Outside market hours the recorder is legitimately not running (e.g.
+    the scheduled 08:40 relogin, well before 09:10's `ws_recorder_start`) —
+    bouncing it would start recording early for no reason."""
+    client, _sf = isolated_client
+    fake = _FakeSupervisor(running=False)
+    client.app.state.ws_supervisor = fake
+
+    monkeypatch.setattr(
+        engine_router,
+        "run_openalgo_relogin",
+        lambda _settings: LoginResult(True, "done", "logged in"),
+    )
+
+    response = client.post("/api/engine/relogin-broker")
+    assert response.status_code == 200
+    assert fake.calls == []
+
+
+def test_relogin_broker_does_not_bounce_on_failed_login(isolated_client, monkeypatch) -> None:  # noqa: ANN001
+    """A failed relogin means Angel/OpenAlgo state didn't change — bouncing
+    a healthy recorder on the strength of a failed login would only cost a
+    real gap in the bar archive for nothing."""
+    client, _sf = isolated_client
+    fake = _FakeSupervisor(running=True)
+    client.app.state.ws_supervisor = fake
+
+    monkeypatch.setattr(
+        engine_router,
+        "run_openalgo_relogin",
+        lambda _settings: LoginResult(False, "transport", "request to OpenAlgo failed"),
+    )
+
+    response = client.post("/api/engine/relogin-broker")
+    assert response.status_code == 200
+    assert response.json()["success"] is False
+    assert fake.calls == []
 
 
 def test_guardrails_get_returns_env_defaults_when_unset(isolated_client) -> None:  # noqa: ANN001

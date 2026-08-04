@@ -154,6 +154,7 @@ def test_build_scheduler_registers_every_job(tmp_path: Path) -> None:
         "trading_calendar_refresh",
         "paper_cycle",
         "ws_late_subscription_refresh",
+        "ws_feed_health_check",
     }
 
     # Option strikes are re-resolved on a timer, not once at recorder start.
@@ -163,6 +164,15 @@ def test_build_scheduler_registers_every_job(tmp_path: Path) -> None:
     # index drifts or the expiry rolls.
     refresh_job = scheduler.get_job("ws_late_subscription_refresh")
     assert "*/5" in str(refresh_job.trigger.fields[6]), "must retry within the session, not once"
+
+    # Catches what the late-subscription refresh cannot: a relogin that
+    # kills the broker side of the feed without dropping this process's own
+    # WS connection, leaving `is_running()` True with zero ticks arriving —
+    # found live on 2026-08-04. Same 5-minute cadence so a dead feed is
+    # self-healed within one cycle, not a whole session.
+    health_job = scheduler.get_job("ws_feed_health_check")
+    assert "*/5" in str(health_job.trigger.fields[6]), "must check within the session, not once"
+    assert health_job.max_instances == 1
 
     # The one job that must NOT be mon-fri: it is what tells the rest of the
     # engine which weekdays are real sessions, so it runs on a Sunday.
@@ -192,9 +202,7 @@ def test_paper_cycle_job_registered_with_max_instances_one(tmp_path: Path) -> No
     engine.dispose()
 
 
-def test_ws_client_uses_the_configured_ws_host_verbatim(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_ws_client_uses_the_configured_ws_host_verbatim(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Regression guard: the WS URL used to be derived by string surgery on
     the REST host (`.replace("http://", "ws://") + ":8765"`), which — since
     `openalgo_host` already carries a port — produced the invalid
@@ -541,9 +549,7 @@ def test_paper_cycle_falls_back_to_env_defaults_with_no_saved_guardrails(
     assert config.risk_limits.max_trades_per_day == expected.max_trades_per_day  # type: ignore[attr-defined]
 
 
-def test_paper_cycle_reads_live_guardrails_without_restart(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_paper_cycle_reads_live_guardrails_without_restart(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The core proof for the plan's Tier 1: a guardrails change saved via
     the API takes effect on the VERY NEXT scheduled cycle, on the SAME
     running `PaperCycleRunner` instance — no process restart needed."""
@@ -671,8 +677,17 @@ def test_a_position_is_quoted_once_per_cycle_not_once_per_consumer() -> None:
         def quotes(self, symbol: str, exchange: str) -> Quote:
             calls.append(symbol)
             return Quote(
-                symbol=symbol, exchange=exchange, ltp=100.0, open=0.0, high=0.0, low=0.0,
-                prev_close=0.0, volume=0.0, oi=0.0, bid=99.5, ask=100.5,
+                symbol=symbol,
+                exchange=exchange,
+                ltp=100.0,
+                open=0.0,
+                high=0.0,
+                low=0.0,
+                prev_close=0.0,
+                volume=0.0,
+                oi=0.0,
+                bid=99.5,
+                ask=100.5,
             )
 
     class _Row:

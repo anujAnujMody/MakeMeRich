@@ -37,3 +37,9 @@ class SchedulerStatus(BaseModel):
     jobs: list[SchedulerJobStatus]
     paperCycleLastRunAt: dt.datetime | None
     paperCycleLastResult: str | None
+    #: From `WSRecorderSupervisor.feed_health` — proves ticks are actually
+    #: arriving, not just that the WS thread is alive. `None`/`None` before
+    #: the first `ws_feed_health_check` run (e.g. before the recorder has
+    #: started for the day).
+    feedLastCheckedAt: dt.datetime | None = None
+    feedLastTickAt: dt.datetime | None = None
