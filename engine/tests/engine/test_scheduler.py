@@ -160,6 +160,10 @@ def test_build_scheduler_registers_every_job(tmp_path: Path) -> None:
         "paper_cycle",
         "ws_late_subscription_refresh",
         "ws_feed_health_check",
+        # 20:00 weeknights, after the 15:35 recorder stop so the day's
+        # evaluations and their outcome bars are all in before anything
+        # trains on them. See `te.ml.nightly`.
+        "ml_nightly_training",
     }
 
     # Option strikes are re-resolved on a timer, not once at recorder start.

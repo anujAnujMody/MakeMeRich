@@ -33,6 +33,10 @@ def test_scheduler_status_reports_all_jobs_including_paper_cycle() -> None:
         "paper_cycle",
         "ws_late_subscription_refresh",
         "ws_feed_health_check",
+        # Nightly label + train + register. Visible for the same reason as
+        # the halt reset: an engine that retrains itself overnight should say
+        # so in its own status, not only in a log file.
+        "ml_nightly_training",
     }
 
     paper_cycle_job = next(job for job in body["jobs"] if job["id"] == "paper_cycle")

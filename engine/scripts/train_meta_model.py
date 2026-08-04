@@ -66,16 +66,12 @@ import argparse
 import datetime as dt
 import sys
 
-import pandas as pd
-
-from scripts.label_replay_firings import MAX_HOLD, RATES_VERIFIED_FROM, barriers
 from te.data.barstore import BarStore
 from te.data.charges_loader import load_charge_rate_table
 from te.domain.costs import CostModel, select_rates
-from te.ml.barriers import ATM_SNAPSHOTS, round_trip_cost_in_index_points
-from te.ml.dataset import build_training_set
+from te.ml.barriers import ATM_SNAPSHOTS
 from te.ml.featurespec import SECONDARY_V1
-from te.ml.labeling import label_firings_from_evaluations
+from te.ml.nightly import build_labeled_dataset
 from te.ml.train import ModelBackend, train_meta_model
 from te.ml.trials import TrialLedger
 from te.persistence.db import make_engine, make_session_factory
@@ -122,42 +118,17 @@ def main() -> int:
 
     print(f"spec {SECONDARY_V1.name} v{SECONDARY_V1.version}: {', '.join(SECONDARY_V1.columns)}\n")
 
-    rows: list[dict[str, object]] = []
-    for symbol in chosen:
-        stop, target = barriers(symbol)
-        firings = label_firings_from_evaluations(
-            session_factory,
-            store,
-            cost_model,
-            strategy="orb",
-            exchange=ATM_SNAPSHOTS[symbol].exchange,
-            stop_distance=stop,
-            target_distance=target,
-            max_hold=MAX_HOLD,
-            instrument=symbol,
-            since=RATES_VERIFIED_FROM,
-            cost_per_unit=round_trip_cost_in_index_points(symbol, cost_model, RATES_VERIFIED_FROM),
-        )
-        print(f"{symbol:10s} {len(firings):>5,} labelled firings")
-        for firing in firings:
-            features = build_training_set(
-                firing.entry_ts, SECONDARY_V1, store, None, instrument=firing.instrument
-            )
-            rows.append(
-                {
-                    **{c: features[c] for c in SECONDARY_V1.columns},
-                    "_label": firing.label,
-                    "_entry_ts": firing.entry_ts,
-                    "_exit_ts": firing.exit_ts,
-                    "_weight": firing.weight,
-                }
-            )
+    # ONE dataset path, shared with the scheduled nightly job
+    # (`te.ml.nightly.run_nightly_training`). This loop used to live here in
+    # full; a hand-run script and a cron job building their training sets
+    # from two copies of the same code is how the two quietly start
+    # describing different strategies.
+    frame = build_labeled_dataset(session_factory, store, cost_model, instruments=tuple(chosen))
 
-    if not rows:
+    if frame.empty:
         print("no labelled firings — nothing to train on", file=sys.stderr)
         return 1
 
-    frame = pd.DataFrame(rows)
     features = frame[list(SECONDARY_V1.columns)]
     labels = frame["_label"].astype(int)
     positives = float(labels.mean())

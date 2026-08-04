@@ -589,7 +589,20 @@ def run_entry_cycle(
         _t3 = time.perf_counter()
         influence = MLInfluence(size_multiplier=Decimal(1), veto=False, displayed_verdict=None)
         if ml_hook is not None:
-            influence = ml_hook.evaluate(instrument=instrument, as_of=as_of, cycle_id=cycle_id)
+            # NEVER allowed to raise into the trading loop. The whole premise
+            # of the shadow stage is that the ML layer cannot affect a trade —
+            # but an unguarded call breaks that in the one direction nobody
+            # checks: `ShadowMLHook.evaluate` builds a feature row from bars
+            # and a missing/short lookback raises, which would abort the
+            # entry cycle for EVERY instrument, not just this one. A layer
+            # that is structurally forbidden from changing a decision must
+            # also be unable to prevent one. Same rule as
+            # `ExecutionManager._observe_slippage`: measurement must not be
+            # able to break the thing it measures.
+            try:
+                influence = ml_hook.evaluate(instrument=instrument, as_of=as_of, cycle_id=cycle_id)
+            except Exception:  # noqa: BLE001 — see above; falls back to the inert influence
+                logger.exception("ml hook failed; continuing with no ML influence", instrument=instrument)
 
         # `throttle_multiplier` is `1` unless a Phase 7 monitor
         # (`te.risk.monitors`) has thrown the DB-only throttle flag this

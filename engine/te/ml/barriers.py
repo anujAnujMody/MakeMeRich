@@ -77,6 +77,40 @@ ATM_SNAPSHOTS: dict[str, AtmSnapshot] = {
 }
 
 
+#: Must track `Settings.paper_cycle_stop_pct` / `paper_cycle_target_pct`.
+#: 1:1 since the barrier sweep — labelling at a geometry the engine no longer
+#: trades would describe a different strategy, and any runway or filter
+#: derived from those labels would be tuned for a configuration that is not
+#: running. See `scripts/sweep_barriers.py` for the evidence.
+#:
+#: Moved here from `scripts/label_replay_firings.py` on 2026-08-05 for the
+#: reason in this module's docstring: `te.ml.nightly` (the scheduled training
+#: job) needs them, and a package module importing from `scripts/` would make
+#: the engine's nightly job depend on a directory that is neither shipped nor
+#: on `testpaths`.
+STOP_PCT = Decimal(20)
+TARGET_PCT = Decimal(20)
+MAX_HOLD = dt.timedelta(hours=3)
+
+#: Earliest firing that can be labelled with rates we actually hold.
+#:
+#: Was 2026-04-01 while `config/charges.yaml` carried a single rate row, and
+#: `CostModel` refuses to price a trade predating its earliest row rather
+#: than guessing. On 2026-08-01 the three earlier regimes were researched and
+#: added (0.0625% STT pre-Oct-2024, the Oct-2024 uniform exchange fee, the
+#: Mar-2026 NSE IPFT restructure), so the whole span of the Shoonya option
+#: archive is now priceable.
+#:
+#: Keep this in step with the FIRST row of `config/charges.yaml` — a date
+#: earlier than that row will raise, which is the intended failure.
+RATES_VERIFIED_FROM = dt.date(2024, 1, 1)
+
+
+def barriers(symbol: str) -> tuple[Paise, Paise]:
+    """`index_barriers` at the geometry the engine actually trades."""
+    return index_barriers(symbol, stop_pct=STOP_PCT, target_pct=TARGET_PCT)
+
+
 def index_barriers(symbol: str, *, stop_pct: Decimal, target_pct: Decimal) -> tuple[Paise, Paise]:
     """Premium-percentage barriers as INDEX-point distances, in paise.
 

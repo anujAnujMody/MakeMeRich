@@ -199,3 +199,49 @@ def test_ml_cannot_affect_decisions_below_gating(
             with session_factory() as baseline_session:
                 baseline_row = baseline_session.query(OpenPositionRow).one()
                 assert row.lots == baseline_row.lots
+
+
+@dataclass
+class _ExplodingHook:
+    """A hook whose `evaluate` raises — the realistic failure, not a
+    contrived one. `ShadowMLHook.evaluate` builds a feature row from bars via
+    `build_training_set`, and a short lookback, a missing India VIX series or
+    an unpickleable artifact all raise from inside it."""
+
+    def evaluate(self, *, instrument: str, as_of: dt.datetime, cycle_id: int) -> MLInfluence:
+        raise RuntimeError("feature build failed")
+
+
+def test_a_failing_ml_hook_cannot_stop_the_cycle_trading(
+    session_factory,
+    execution,
+    cost_model: CostModel,
+    tmp_path: Path,  # noqa: ANN001
+) -> None:
+    """The companion to the test above, in the direction nobody checks.
+
+    `MaturityGate` proves ML cannot CHANGE a decision below `gating`. It
+    says nothing about ML PREVENTING one — and before this was guarded, an
+    exception from `evaluate` propagated straight out of `run_entry_cycle`,
+    aborting the entry pass for every instrument in it. That would have
+    turned the shadow layer, whose entire purpose is to be inert, into a
+    single point of failure for trading, at the exact moment it was first
+    wired into production.
+    """
+    rule_only_decision = _run(session_factory, execution, cost_model, tmp_path, ml_hook=None)
+
+    fresh_engine = make_engine(f"sqlite:///{tmp_path / 'exploding.db'}")
+    Base.metadata.create_all(fresh_engine)
+    fresh_session_factory = make_session_factory(fresh_engine)
+    fresh_execution = ExecutionManager(
+        fresh_session_factory,
+        OrderEventStore(fresh_session_factory),
+        SimulatedBroker(cost_model=cost_model, on=ON),
+        _NoLimiter(),
+    )
+
+    exploded_decision = _run(
+        fresh_session_factory, fresh_execution, cost_model, tmp_path, ml_hook=_ExplodingHook()
+    )
+
+    assert exploded_decision == rule_only_decision

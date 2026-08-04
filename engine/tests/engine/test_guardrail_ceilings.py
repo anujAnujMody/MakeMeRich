@@ -22,6 +22,7 @@ import pytest
 
 from te.domain.money import Paise
 from te.engine.state import (
+    MAX_DAILY_LOSS_PCT_OF_CAPITAL,
     MAX_DRAWDOWN_PCT_CEILING,
     MAX_POSITION_SIZE_PCT_CEILING,
     MAX_RISK_PER_TRADE_PCT,
@@ -34,6 +35,16 @@ from te.persistence.db import make_engine, make_session_factory, session_scope
 from te.persistence.models import Base
 
 CAPITAL = Paise(30_000_000)  # Rs 3,00,000 — the real live value
+
+
+def _ceiling_daily_loss(capital: Paise) -> Paise:
+    """The permitted daily loss at `capital`, derived from the constant.
+
+    Written this way on purpose: the ceiling moved once already (5% -> 7% on
+    2026-08-05) and every hardcoded rupee expectation in this file silently
+    became an assertion about a value BELOW the limit rather than ON it —
+    which is the one thing a ceiling test must not do."""
+    return Paise(int(Decimal(int(capital)) * MAX_DAILY_LOSS_PCT_OF_CAPITAL / Decimal(100)))
 
 
 @pytest.fixture
@@ -60,7 +71,7 @@ def _safe(**overrides: object) -> AccountGuardrails:
 @pytest.mark.parametrize(
     ("field", "value", "needle"),
     [
-        ("risk_per_trade_pct", Decimal(5), "exceeds the hard ceiling"),
+        ("risk_per_trade_pct", MAX_RISK_PER_TRADE_PCT + Decimal(1), "exceeds the hard ceiling"),
         ("max_position_size_pct", Decimal(100), "exceeds the hard ceiling"),
         ("max_drawdown_pct", Decimal(100), "never trips"),
         ("max_daily_loss", Paise(4_500_000), "of capital"),  # Rs 45,000 = 15%
@@ -81,7 +92,11 @@ def test_a_save_at_the_ceiling_is_allowed(session_factory) -> None:
                 risk_per_trade_pct=MAX_RISK_PER_TRADE_PCT,
                 max_position_size_pct=MAX_POSITION_SIZE_PCT_CEILING,
                 max_drawdown_pct=MAX_DRAWDOWN_PCT_CEILING,
-                max_daily_loss=Paise(1_500_000),  # exactly 5% of Rs 3,00,000
+                # Exactly the ceiling — derived from the constant rather than
+                # written as a literal, so raising the ceiling (as happened on
+                # 2026-08-05, 5% -> 7%) cannot leave this test asserting a
+                # value that is merely BELOW the limit it claims to sit on.
+                max_daily_loss=_ceiling_daily_loss(CAPITAL),
             ),
         )
 
@@ -105,7 +120,9 @@ def test_values_already_stored_above_a_ceiling_are_clamped_on_read(session_facto
     assert got.risk_per_trade_pct == MAX_RISK_PER_TRADE_PCT
     assert got.max_drawdown_pct == MAX_DRAWDOWN_PCT_CEILING
     assert got.max_position_size_pct == MAX_POSITION_SIZE_PCT_CEILING
-    assert got.max_daily_loss == Paise(1_500_000), "Rs 45,000 on Rs 3,00,000 capital is 15%, ceiling is 5%"
+    assert got.max_daily_loss == _ceiling_daily_loss(CAPITAL), (
+        f"Rs 45,000 on Rs 3,00,000 capital is 15%, ceiling is {MAX_DAILY_LOSS_PCT_OF_CAPITAL}%"
+    )
 
 
 def test_clamping_never_raises_a_value(session_factory) -> None:
@@ -123,14 +140,16 @@ def test_clamping_never_raises_a_value(session_factory) -> None:
 
 
 def test_the_daily_loss_ceiling_scales_with_capital(session_factory) -> None:
-    """It is 5% OF CAPITAL, not a fixed rupee figure — so raising capital
-    raises the permitted daily loss, and lowering capital lowers it without
-    needing the operator to re-save."""
+    """It is a PERCENT OF CAPITAL, not a fixed rupee figure — so raising
+    capital raises the permitted daily loss, and lowering capital lowers it
+    without needing the operator to re-save."""
+    smaller = Paise(10_000_000)  # Rs 1,00,000
     with session_scope(session_factory) as session:
-        upsert_engine_state(session, "capital_paise", "10000000")  # Rs 1,00,000
+        upsert_engine_state(session, "capital_paise", str(int(smaller)))
         upsert_engine_state(session, "max_daily_loss_paise", "4500000")  # Rs 45,000
 
     with session_factory() as session:
         got = get_guardrails(session, defaults=_safe())
 
-    assert got.max_daily_loss == Paise(500_000), "5% of Rs 1,00,000 is Rs 5,000"
+    assert got.max_daily_loss == _ceiling_daily_loss(smaller)
+    assert got.max_daily_loss < _ceiling_daily_loss(CAPITAL), "a smaller account must permit a smaller daily loss"

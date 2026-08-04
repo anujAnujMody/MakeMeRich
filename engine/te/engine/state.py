@@ -67,8 +67,24 @@ class AccountGuardrails:
 #
 # Why these numbers: risk-of-ruin. At 5% risked per trade, a 10-loss streak
 # — which is an ordinary occurrence inside ~250 trades at a ~50% win rate —
-# is a ~40% account drawdown. At 1.5% the same streak costs under 15%. The
-# ceilings below are the conventional prop-desk band, not a preference.
+# is a ~40% account drawdown. At 1.5% the same streak costs under 15%.
+#
+# RAISED 2026-08-05, deliberately, by the owner — and the arithmetic above
+# is unchanged and still true. The reason is affordability, measured, not
+# preference: on the real Rs 30,000 account one NIFTY lot at a ~Rs 42
+# premium risks ~Rs 549 at a 20% stop, while 1.5% of capital is Rs 450. At
+# the old ceiling `size_position` rejected EVERY signal for want of Rs 99 —
+# verified by re-sizing 2026-08-04's four real trades, all four of which
+# came back `lots=0`. A ceiling that permits no trade at all does not
+# protect the account, it just makes the engine idle while looking healthy.
+#
+# So the band below is now the SMALL-ACCOUNT band, not the prop-desk one,
+# and it is a knowingly accepted trade: 5% per trade means a 10-loss streak
+# costs ~40% of Rs 30,000. `MAX_DAILY_LOSS_PCT_OF_CAPITAL` is what actually
+# bounds that in practice — at Rs 2,000/day the account stands down after
+# roughly one full stop-out, long before any streak can compound. Revisit
+# both together, never one alone: dropping the daily limit back to 5%
+# (Rs 1,500) while leaving risk at 5% means the first loser ends every day.
 #
 # Enforced in BOTH directions on purpose:
 #   * `set_guardrails` REJECTS a save above a ceiling, with the ceiling named
@@ -79,8 +95,11 @@ class AccountGuardrails:
 #     is the safe direction: the failure mode is trading smaller than asked,
 #     never larger. The clamped values are what `GET /api/engine/guardrails`
 #     returns, so the dashboard shows what is genuinely in force.
-MAX_RISK_PER_TRADE_PCT = Decimal("1.5")
-MAX_DAILY_LOSS_PCT_OF_CAPITAL = Decimal(5)
+MAX_RISK_PER_TRADE_PCT = Decimal(5)
+#: 7, not 5, so the owner's chosen Rs 2,000/day fits on Rs 30,000 (6.67%)
+#: with no headroom to spare — a deliberately tight ceiling rather than a
+#: round number that would quietly permit Rs 3,000.
+MAX_DAILY_LOSS_PCT_OF_CAPITAL = Decimal(7)
 MAX_DRAWDOWN_PCT_CEILING = Decimal(20)
 MAX_POSITION_SIZE_PCT_CEILING = Decimal(25)
 
@@ -260,7 +279,8 @@ def set_guardrails(session: Session, guardrails: AccountGuardrails) -> None:
     if guardrails.risk_per_trade_pct > MAX_RISK_PER_TRADE_PCT:
         raise ValueError(
             f"risk_per_trade_pct {guardrails.risk_per_trade_pct}% exceeds the hard ceiling of "
-            f"{MAX_RISK_PER_TRADE_PCT}% — at 5% a 10-loss streak is a ~40% drawdown"
+            f"{MAX_RISK_PER_TRADE_PCT}% — at {MAX_RISK_PER_TRADE_PCT}% a 10-loss streak is already "
+            f"a ~40% account drawdown"
         )
     if guardrails.max_position_size_pct > MAX_POSITION_SIZE_PCT_CEILING:
         raise ValueError(

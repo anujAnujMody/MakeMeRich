@@ -68,7 +68,7 @@ from te.data.ingest_log import already_ingested
 from te.data.recorder import BarRecorder
 from te.domain.calendar import TradingCalendar
 from te.domain.clock import DEFAULT_SESSION, IST, SessionWindow, is_market_open
-from te.domain.costs import ChargeRateTable
+from te.domain.costs import ChargeRateTable, CostModel
 from te.domain.geometry import AbsolutePointGeometry, ExitGeometry, PremiumPercentGeometry
 from te.domain.money import Paise
 from te.domain.symbols import FNO_UNDERLYING_EXCHANGES, build_future_symbol, next_monthly_expiry
@@ -85,6 +85,8 @@ from te.engine.state import (
 from te.engine.trading_calendar import get_calendar, refresh_calendar
 from te.execution.halt import clear_daily_halt, halt_reason
 from te.execution.manager import build_paper_execution_stack
+from te.ml.gates import MLHook
+from te.ml.nightly import ShadowHookProvider, run_nightly_training
 from te.persistence.db import make_session_factory, session_scope
 from te.persistence.models import OpenPositionRow
 from te.persistence.repos.paper_trading import record_risk_event
@@ -533,6 +535,41 @@ def reset_daily_loss_halt(session_factory: sessionmaker[Session]) -> bool:
     return True
 
 
+def run_nightly_training_job(
+    session_factory: sessionmaker[Session],
+    engine: Engine,
+    store: BarStore,
+    charge_rate_table: ChargeRateTable,
+    settings: Settings,
+) -> None:
+    """Trains and REGISTERS the shadow model on the day's accumulated
+    evaluations. Never promotes it — see `te.ml.nightly`.
+
+    The instrument list is read from `te.engine.state` at run time rather
+    than captured at build time, so it follows the same dashboard selection
+    the trading cycle uses. A model trained on instruments the engine no
+    longer trades would be learning about a different system than the one
+    running.
+
+    Cannot affect trading: the model it writes is consumed only at `shadow`
+    stage, where `MaturityGate.influence` is a structural no-op.
+    """
+    with session_factory() as session:
+        selections = get_instrument_selections(
+            session, defaults=instrument_selections_defaults_from_settings(settings)
+        )
+    instruments = tuple(s.symbol for s in selections if s.active)
+    # The WHOLE table, not one day's row: labelling walks years of firings
+    # and each must be priced at the rates in force on its own date.
+    run_nightly_training(
+        session_factory,
+        engine,
+        store,
+        CostModel(charge_rate_table),
+        instruments=instruments,
+    )
+
+
 def run_openalgo_relogin(settings: Settings) -> LoginResult:
     """The daily OpenAlgo-app + Angel-broker relogin (see
     `te.broker.openalgo_login`). Returns a `LoginResult` rather than raising
@@ -821,6 +858,18 @@ class PaperCycleRunner:
     #: Used to mark open OPTION positions, which have no recorded bars. See
     #: `_current_premium_from_quotes`. `None` falls back to bar-based marks.
     rest_client: OpenAlgoRestClient | None = None
+    #: Called once per entry cycle for the current shadow-stage `MLHook`, or
+    #: `None` when no model has been trained yet — see
+    #: `te.ml.nightly.ShadowHookProvider`. A callable rather than a hook so a
+    #: model registered by tonight's training job is picked up tomorrow
+    #: without restarting the engine.
+    #:
+    #: This cannot influence trading. At `shadow` stage
+    #: `MaturityGate.influence` returns `MLInfluence(1, False, None)` for any
+    #: probability, and `run_entry_cycle` additionally swallows any exception
+    #: the hook raises. Its entire effect is to write rows to
+    #: `ml_predictions`, which is what later training reads.
+    ml_hook_provider: Callable[[], MLHook | None] | None = None
     #: Not an init argument — always starts empty and is rewritten by
     #: `run_once`. `GET /api/engine/scheduler-status` reads it directly.
     status: PaperCycleStatus = field(default_factory=PaperCycleStatus, init=False)
@@ -942,6 +991,7 @@ class PaperCycleRunner:
                 as_of=as_of,
                 contract_resolver=self.contract_resolver,
                 current_premium=premium_source,
+                ml_hook=self.ml_hook_provider() if self.ml_hook_provider is not None else None,
             )
         run_exit_cycle(
             session_factory=self.session_factory,
@@ -1014,6 +1064,7 @@ def build_scheduler(
         settings=settings,
         contract_resolver=contract_resolver,
         rest_client=rest_client,
+        ml_hook_provider=ShadowHookProvider(session_factory, bar_store),
     )
 
     scheduler = BackgroundScheduler(timezone=IST)
@@ -1040,6 +1091,21 @@ def build_scheduler(
         trigger=CronTrigger(hour=9, minute=10, day_of_week="mon-fri", timezone=IST),
         id="ws_recorder_start",
         replace_existing=True,
+    )
+    # 20:00, well after the 15:35 recorder stop, so the day's evaluations and
+    # their outcome bars are all recorded before anything trains on them.
+    # Weeknights only: there is nothing new to learn from on a Saturday, and
+    # re-training on an unchanged sample would inflate the trial count DSR
+    # deflates against for no new information.
+    scheduler.add_job(
+        run_nightly_training_job,
+        args=[session_factory, engine, bar_store, charge_rate_table, settings],
+        trigger=CronTrigger(hour=20, minute=0, day_of_week="mon-fri", timezone=IST),
+        id="ml_nightly_training",
+        replace_existing=True,
+        # Training takes minutes and must never stack up behind itself.
+        max_instances=1,
+        coalesce=True,
     )
     scheduler.add_job(
         supervisor.stop,

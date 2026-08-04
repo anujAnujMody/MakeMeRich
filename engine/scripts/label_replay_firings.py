@@ -42,10 +42,8 @@ as one.
 from __future__ import annotations
 
 import argparse
-import datetime as dt
 import sys
 from collections import Counter
-from decimal import Decimal
 from functools import partial
 
 from te.data.barstore import BarStore
@@ -53,42 +51,25 @@ from te.data.charges_loader import load_charge_rate_table
 from te.data.lot_size_history import UnknownLotSizeError, load_lot_size_history, lot_size_on
 from te.data.option_history import OptionContractIndex
 from te.domain.costs import CostModel
-from te.domain.money import Paise
 from te.ml.barriers import (
     ATM_SNAPSHOTS,
+    MAX_HOLD,
+    RATES_VERIFIED_FROM,
+    STOP_PCT,
+    TARGET_PCT,
     barrier_pct_as_index_pct,
-    index_barriers,
+    barriers,
     round_trip_cost_in_index_points,
 )
 from te.ml.labeling import RealPremiumConfig, label_firings_from_evaluations
 from te.persistence.db import make_engine, make_session_factory
 from te.settings import Settings
 
-#: Must track `Settings.paper_cycle_stop_pct` / `paper_cycle_target_pct`.
-#: 1:1 since the barrier sweep — labelling at a geometry the engine no longer
-#: trades would describe a different strategy, and any runway or filter
-#: derived from those labels would be tuned for a configuration that is not
-#: running. See `scripts/sweep_barriers.py` for the evidence.
-STOP_PCT = Decimal(20)
-TARGET_PCT = Decimal(20)
-MAX_HOLD = dt.timedelta(hours=3)
-
-#: Earliest firing that can be labelled with rates we actually hold.
-#:
-#: Was 2026-04-01 while `config/charges.yaml` carried a single rate row, and
-#: `CostModel` refuses to price a trade predating its earliest row rather
-#: than guessing. On 2026-08-01 the three earlier regimes were researched and
-#: added (0.0625% STT pre-Oct-2024, the Oct-2024 uniform exchange fee, the
-#: Mar-2026 NSE IPFT restructure), so the whole span of the Shoonya option
-#: archive is now priceable.
-#:
-#: Keep this in step with the FIRST row of `config/charges.yaml` — a date
-#: earlier than that row will raise, which is the intended failure.
-RATES_VERIFIED_FROM = dt.date(2024, 1, 1)
-
-
-def barriers(symbol: str) -> tuple[Paise, Paise]:
-    return index_barriers(symbol, stop_pct=STOP_PCT, target_pct=TARGET_PCT)
+#: Re-exported so the four sibling scripts that already import these from
+#: here keep working; the definitions moved into `te.ml.barriers` on
+#: 2026-08-05 so the scheduled training job can reach them without a package
+#: module importing from `scripts/`. See that module's docstring.
+__all__ = ["MAX_HOLD", "RATES_VERIFIED_FROM", "STOP_PCT", "TARGET_PCT", "barriers"]
 
 
 def main() -> int:

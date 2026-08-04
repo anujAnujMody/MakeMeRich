@@ -88,7 +88,14 @@ class Settings(BaseSettings):
     #: comment there for the risk-of-ruin arithmetic. Shipping a default
     #: above the ceiling would mean the very first read clamped it, which
     #: reads as the engine ignoring its own configuration.
-    paper_cycle_risk_budget_pct: Decimal = Decimal("1.5")
+    #:
+    #: 5%, raised from 1.5% on 2026-08-05 by the owner. At 1.5% of Rs 30,000
+    #: the risk budget is Rs 450, and one NIFTY lot at a ~Rs 42 premium risks
+    #: ~Rs 549 at a 20% stop — so the old value rejected every signal outright
+    #: (all four of 2026-08-04's real trades re-size to `lots=0` at 1.5%).
+    #: This is a knowingly larger bet per trade, bounded in practice by
+    #: `paper_cycle_max_daily_loss_paise` below rather than by this number.
+    paper_cycle_risk_budget_pct: Decimal = Decimal(5)
     paper_cycle_min_edge_multiple: Decimal = Decimal("1.2")
     paper_cycle_stop_distance_paise: int = 700
     paper_cycle_target_distance_paise: int = 1_500
@@ -126,16 +133,21 @@ class Settings(BaseSettings):
     #: entire loss. Its stop never fired; the clock closed it. It carried full
     #: downside while its upside was arithmetically unreachable.
     paper_cycle_min_minutes_before_hard_exit: int = 40
-    #: Rs 1,000 — chosen by the owner, not derived. Against the Rs 30,000
-    #: capital above it is 3.3%, comfortably under the 5% ceiling in
-    #: `te.engine.state.MAX_DAILY_LOSS_PCT_OF_CAPITAL` (which would allow
-    #: Rs 1,500), so it is a real limit rather than one the clamp imposes.
-    #: Sized deliberately against the stop: one NIFTY lot at a ~Rs 74 premium
-    #: risks ~Rs 481 at a 10% stop, so this permits two losing trades and
-    #: then stands the day down.
+    #: Rs 2,000 — chosen by the owner on 2026-08-05, not derived. Against the
+    #: Rs 30,000 capital above it is 6.67%, just under the 7% ceiling in
+    #: `te.engine.state.MAX_DAILY_LOSS_PCT_OF_CAPITAL`, so it is a real limit
+    #: rather than one the clamp imposes.
+    #:
+    #: It is sized against the STOP, and must be re-derived whenever
+    #: `paper_cycle_risk_budget_pct` changes: at 5% risk one trade can lose
+    #: ~Rs 1,500, so Rs 2,000 permits ONE full stop-out and then stands the
+    #: day down. Raised from Rs 1,000 for exactly that reason — at Rs 1,000
+    #: the first losing trade would already have breached the day's limit,
+    #: which over a 1-2 month paper run collects almost no sample.
+    #:
     #: Still kept in step with `paper_cycle_capital_paise` — if capital ever
-    #: falls, re-check this against the 5% ceiling or the first read clamps it.
-    paper_cycle_max_daily_loss_paise: int = 100_000
+    #: falls, re-check this against the 7% ceiling or the first read clamps it.
+    paper_cycle_max_daily_loss_paise: int = 200_000
     paper_cycle_max_concurrent_positions: int = 5
     #: Stand down from NEW entries for the rest of the day after this many
     #: consecutive losing trades (`0` disables). Three is the conventional
