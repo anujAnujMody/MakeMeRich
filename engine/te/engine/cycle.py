@@ -18,6 +18,7 @@ Two entry points, run every cycle:
 from __future__ import annotations
 
 import datetime as dt
+import functools
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -182,6 +183,28 @@ def unrealized_pnl_paise(
     total = 0
     for row in open_positions(session):
         marked: Paise | None = current_premium(row) if current_premium is not None else None
+        if marked is not None:
+            # READ-ONLY sanity check — see `sanity_checked_mark`'s docstring
+            # and `te.engine.scheduler`'s "ONE premium source for both
+            # cycles" comment, which states the invariant this closes: the
+            # entry cycle (this function feeds its risk gates,
+            # `check_daily_loss_limit`/`check_max_drawdown` below) runs
+            # BEFORE the exit cycle, which is the sole owner of quarantining
+            # a bad tick and persisting `pending_mark_paise`/
+            # `last_mark_paise`. Found 2026-08-04 by a code-quality review of
+            # the tick-sanity fix: it closed the hole for the exit decision
+            # but left these risk gates reading the raw, unfiltered tick,
+            # silently breaking the one-premium-source invariant — a single
+            # bad tick could trip the daily-loss halt or mask a real
+            # drawdown before the exit cycle ever saw (and quarantined) it.
+            # The returned `new_pending` is discarded: this call must never
+            # promote or persist a pending mark, only read the same
+            # confirmed price the exit cycle's own decision will use.
+            marked, _ = sanity_checked_mark(
+                candidate=marked,
+                last_confirmed=Paise(row.last_mark_paise) if row.last_mark_paise is not None else None,
+                pending=Paise(row.pending_mark_paise) if row.pending_mark_paise is not None else None,
+            )
         if marked is None and row.last_mark_paise is not None:
             marked = Paise(row.last_mark_paise)
         current = (
@@ -416,8 +439,22 @@ def run_entry_cycle(
             record_evaluation(session, cycle_id=cycle_id, evaluation=evaluation)
 
         if evaluation.verdict != "traded":
+            # No `evaluation_id` needed: `record_evaluation` just persisted
+            # THIS verdict (already "skipped", never "traded"), so there is
+            # nothing to correct — unlike every downstream skip below, all
+            # of which fire after a "traded" verdict is already on disk.
             _skip(instrument, evaluation.reason)
             continue
+
+        # Bound once per instrument, right after the "traded" verdict this
+        # cycle is on disk, so every downstream skip below corrects it
+        # without having to thread `evaluation_id` through by hand at each
+        # call site. That hand-threading is exactly the failure mode this
+        # guards against: a future eighth gate that forgets the keyword
+        # would silently leave a persisted "traded" verdict uncorrected —
+        # see `correct_evaluation_verdict`'s docstring for the 2026-08-04
+        # incident that made this correction necessary in the first place.
+        skip = functools.partial(_skip, evaluation_id=evaluation.id)
 
         # `Strategy` (the Protocol) deliberately only declares `name`/
         # `evaluate()` per the plan's exact signature; `last_signal` is an
@@ -430,7 +467,7 @@ def run_entry_cycle(
             # per te.strategy.orb's contract. Treat as a skip rather than
             # crash the whole cycle if a future Strategy implementation
             # ever violates that contract.
-            _skip(instrument, "strategy reported verdict=traded but produced no Signal", evaluation_id=evaluation.id)
+            skip(instrument, "strategy reported verdict=traded but produced no Signal")
             continue
 
         # Max entries per underlying per session — the standard ORB
@@ -446,11 +483,10 @@ def run_entry_cycle(
                 session, strategy=config.strategy_name, underlying=instrument, on=as_of.date()
             )
         if entries_today >= config.max_entries_per_underlying_per_day:
-            _skip(
+            skip(
                 instrument,
                 f"{entries_today} entr(ies) on this underlying today, at or above the per-session limit of "
                 f"{config.max_entries_per_underlying_per_day}",
-                evaluation_id=evaluation.id,
             )
             continue
 
@@ -479,7 +515,7 @@ def run_entry_cycle(
                 blocked_reason = str(exc)
         if blocked_reason is not None:
             stage_ms["risk"] += (time.perf_counter() - _t2) * 1000
-            _skip(instrument, blocked_reason, evaluation_id=evaluation.id)
+            skip(instrument, blocked_reason)
             continue
 
         # Contract resolution — the index breakout becomes a real option to
@@ -499,10 +535,9 @@ def run_entry_cycle(
             contract = contract_resolver(instrument, signal.direction, as_of)
             stage_ms["fetch"] += (time.perf_counter() - _tc) * 1000
             if contract is None:
-                _skip(
+                skip(
                     instrument,
                     "no tradeable option contract could be resolved (see logs for the guard that fired)",
-                    evaluation_id=evaluation.id,
                 )
                 continue
             trade_symbol = contract.symbol
@@ -536,10 +571,9 @@ def run_entry_cycle(
         )
         stage_ms["risk"] += (time.perf_counter() - _t2) * 1000
         if sizing.lots == 0:
-            _skip(
+            skip(
                 instrument,
                 sizing.rejected_reason or "sizing rejected with no reason (bug)",
-                evaluation_id=evaluation.id,
             )
             continue
 
@@ -567,15 +601,14 @@ def run_entry_cycle(
         stage_reached["decide"] = True
 
         if influence.veto:
-            _skip(instrument, "ML maturity gate vetoed this signal", evaluation_id=evaluation.id)
+            skip(instrument, "ML maturity gate vetoed this signal")
             continue
         if lots < 1:
-            _skip(
+            skip(
                 instrument,
                 "throttle/ML size multiplier resized position below 1 lot "
                 f"(combined_multiplier={combined_multiplier}, throttled={throttled}, "
                 f"ml_multiplier={influence.size_multiplier})",
-                evaluation_id=evaluation.id,
             )
             continue
 
@@ -600,11 +633,10 @@ def run_entry_cycle(
         if freeze_qty > 0 and lot_size * lots > freeze_qty:
             capped = freeze_qty // lot_size
             if capped < 1:
-                _skip(
+                skip(
                     instrument,
                     f"one lot ({lot_size}) exceeds the exchange freeze quantity ({freeze_qty}) for "
                     f"{trade_symbol} — this contract cannot be traded in any size",
-                    evaluation_id=evaluation.id,
                 )
                 continue
             with session_scope(session_factory) as session:

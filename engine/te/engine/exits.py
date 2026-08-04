@@ -246,9 +246,7 @@ def evaluate_position(
         new_stop = Paise(max(new_stop, lock_stop))
         profit_lock_engaged = True
 
-    updated = position
-    if new_stop != position.current_stop or profit_lock_engaged != position.profit_lock_engaged:
-        updated = replace(position, current_stop=new_stop, profit_lock_engaged=profit_lock_engaged)
+    updated = replace(position, current_stop=new_stop, profit_lock_engaged=profit_lock_engaged)
 
     if current_premium <= new_stop:
         if new_stop <= plan.stop:

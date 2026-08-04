@@ -22,7 +22,7 @@ from te.domain.costs import CostModel, select_rates
 from te.domain.geometry import AbsolutePointGeometry, PremiumPercentGeometry
 from te.domain.money import Paise
 from te.engine.contract import ResolvedContract
-from te.engine.cycle import CycleConfig, InstrumentConfig, run_entry_cycle, run_exit_cycle
+from te.engine.cycle import CycleConfig, InstrumentConfig, run_entry_cycle, run_exit_cycle, unrealized_pnl_paise
 from te.engine.state import get_last_cycle_pipeline
 from te.execution.manager import ExecutionManager
 from te.execution.store import OrderEventStore
@@ -735,6 +735,72 @@ def test_a_confirmed_spike_closes_the_position(
         trade = session.query(TradeRow).one()
         assert trade.exit_premium_paise == int(spike)
         assert trade.exit_reason == "target"
+
+
+def test_the_risk_gates_read_the_same_sanity_checked_mark_as_the_exit_decision(
+    session_factory,
+    execution,
+    cost_model: CostModel,
+    tmp_path: Path,  # noqa: ANN001
+) -> None:
+    """`unrealized_pnl_paise` feeds `check_daily_loss_limit`/
+    `check_max_drawdown` in `run_entry_cycle` — the halt/kill-switch path.
+    Found 2026-08-04 by a code-quality review of the tick-sanity fix (see
+    the two spike tests above): that fix closed the hole for the exit
+    decision but left this function reading `current_premium(row)` raw, so a
+    single bad tick could trip the daily-loss halt or mask a real drawdown
+    before the exit cycle ever saw (and quarantined) it — silently breaking
+    `te.engine.scheduler`'s stated "ONE premium source for both cycles"
+    invariant, since the entry cycle runs first and would have seen the raw
+    tick while the exit cycle quarantines it. A spike the exit cycle would
+    quarantine must therefore produce the SAME unrealized P&L here as the
+    confirmed mark, not the raw candidate."""
+    store = _breakout_store(tmp_path)
+    config = _config()
+    entry_at = _open(61)
+
+    run_entry_cycle(
+        session_factory=session_factory,
+        store=store,
+        execution=execution,
+        cost_model=cost_model,
+        config=config,
+        as_of=entry_at,
+    )
+    # A real confirmed baseline first — a position's very FIRST-EVER mark is
+    # trusted unconditionally by design (see the sibling exit-cycle spike
+    # tests above), so a spike immediately after entry would not exercise
+    # this filter at all.
+    baseline = Paise(3_650)
+    run_exit_cycle(
+        session_factory=session_factory,
+        execution=execution,
+        cost_model=cost_model,
+        current_premium=lambda row: baseline,
+        as_of=entry_at + dt.timedelta(minutes=1),
+    )
+
+    spike = Paise(20_000)  # wildly past target — the same unconfirmed jump as the exit-cycle tests above
+    as_of = entry_at + dt.timedelta(minutes=2)
+    with session_factory() as session:
+        seeing_the_spike = unrealized_pnl_paise(
+            session, store=store, cost_model=cost_model, as_of=as_of, current_premium=lambda row: spike
+        )
+        seeing_the_confirmed_mark = unrealized_pnl_paise(
+            session, store=store, cost_model=cost_model, as_of=as_of, current_premium=lambda row: baseline
+        )
+
+    assert int(seeing_the_spike) == int(
+        seeing_the_confirmed_mark
+    ), "the risk gates read the raw spike instead of the same sanity-checked mark the exit decision would use"
+
+    # And this read-side call must not have persisted anything — the
+    # quarantine (`pending_mark_paise`) and promotion (`last_mark_paise`) of
+    # a mark remain `run_exit_cycle`'s alone to write.
+    with session_factory() as session:
+        open_row = session.query(OpenPositionRow).filter(OpenPositionRow.closed_at.is_(None)).one()
+        assert open_row.last_mark_paise == int(baseline)
+        assert open_row.pending_mark_paise is None
 
 
 def test_square_off_closes_position_immediately_regardless_of_exit_conditions(
