@@ -35,6 +35,8 @@ from te.domain.costs import CostModel, select_rates
 from te.domain.money import Paise
 from te.domain.signal import ExitPlan
 from te.engine.cycle import run_exit_cycle, unrealized_pnl_paise
+from te.engine.scheduler import reset_daily_loss_halt
+from te.execution.halt import is_halted
 from te.execution.manager import ExecutionManager
 from te.execution.store import OrderEventStore
 from te.persistence.db import make_engine, make_session_factory
@@ -204,3 +206,80 @@ def test_a_pricing_error_on_one_position_does_not_block_the_others(
     assert closed == []  # survived rather than propagating
     with session_factory() as session:
         assert "position_unpriceable" in [r.kind for r in session.query(RiskEventRow).all()]
+
+
+def test_an_unpriceable_position_past_its_hard_exit_halts_the_engine(
+    session_factory: sessionmaker[Session], execution: object, cost_model: CostModel
+) -> None:
+    """The gap this closes, found 2026-08-04: the branch above `continue`d,
+    which skipped `time_exit` too. So an unpriceable position never hit its
+    15:15 hard exit or its max-hold and simply stayed open — an intraday
+    engine holding a position overnight, carrying real exposure, with one log
+    line to show for it.
+
+    Past the hard-exit time this stops being a data-quality note and becomes
+    an operator emergency. Halting blocks new entries while leaving exits
+    running, and demands a human. The price is still never fabricated."""
+    _seed(session_factory, hard_exit_by=dt.time(15, 20))
+    past_hard_exit = dt.datetime(2026, 7, 31, 10, 0, tzinfo=dt.UTC)  # 15:30 IST
+
+    closed = run_exit_cycle(
+        session_factory=session_factory,
+        execution=execution,  # type: ignore[arg-type]
+        cost_model=cost_model,
+        current_premium=lambda row: None,
+        as_of=past_hard_exit,
+    )
+
+    assert closed == []
+    with session_factory() as session:
+        assert session.query(TradeRow).count() == 0, "a price was invented to force the position closed"
+        kinds = [r.kind for r in session.query(RiskEventRow).all()]
+        assert "position_unpriceable_past_hard_exit" in kinds
+        assert is_halted(session) is True, "an unclosable position past its hard exit must reach a human"
+
+
+def test_the_halt_it_raises_is_not_one_that_clears_itself_overnight(
+    session_factory: sessionmaker[Session], execution: object, cost_model: CostModel
+) -> None:
+    """`reset_daily_loss_halt` clears the daily-loss halt every morning. This
+    one must NOT be caught by that: a position still open and unpriceable is
+    not a per-day condition, and auto-clearing it would hand the problem
+    straight back to the engine that could not solve it."""
+    _seed(session_factory, hard_exit_by=dt.time(15, 20))
+
+    run_exit_cycle(
+        session_factory=session_factory,
+        execution=execution,  # type: ignore[arg-type]
+        cost_model=cost_model,
+        current_premium=lambda row: None,
+        as_of=dt.datetime(2026, 7, 31, 10, 0, tzinfo=dt.UTC),
+    )
+
+    assert reset_daily_loss_halt(session_factory) is False
+    with session_factory() as session:
+        assert is_halted(session) is True
+
+
+def test_before_the_hard_exit_it_is_only_a_risk_event_not_a_halt(
+    session_factory: sessionmaker[Session], execution: object, cost_model: CostModel
+) -> None:
+    """A quote can fail for a cycle or two and recover. Halting the whole
+    engine over a transient gap would be far more disruptive than the gap —
+    the escalation is specifically about being past the point where the
+    position should already have been closed."""
+    _seed(session_factory, hard_exit_by=dt.time(15, 20))
+
+    run_exit_cycle(
+        session_factory=session_factory,
+        execution=execution,  # type: ignore[arg-type]
+        cost_model=cost_model,
+        current_premium=lambda row: None,
+        as_of=OPENED_AT + dt.timedelta(minutes=1),  # 10:31 IST, hours to go
+    )
+
+    with session_factory() as session:
+        kinds = [r.kind for r in session.query(RiskEventRow).all()]
+        assert "position_unpriceable" in kinds
+        assert "position_unpriceable_past_hard_exit" not in kinds
+        assert is_halted(session) is False, "a transient quote gap must not halt trading"

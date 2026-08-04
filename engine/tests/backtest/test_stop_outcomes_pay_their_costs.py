@@ -130,7 +130,7 @@ def test_label_scores_a_real_stopped_trade_below_minus_one(tmp_path: Path, rates
     path = [100.0] * 46 + [70.0] * (375 - 46)
     store, symbol = _store_with_option(tmp_path, path=path)
 
-    trade = _label(
+    trade, unaffordable = _label(
         store=store,
         contracts=_OneContract(symbol, Decimal(24000)),  # type: ignore[arg-type]
         cost_model=rates,
@@ -144,8 +144,76 @@ def test_label_scores_a_real_stopped_trade_below_minus_one(tmp_path: Path, rates
         max_hold=dt.timedelta(hours=3),
         strikes_out_of_the_money=0,
     )
+    assert not unaffordable
     assert trade is not None
     assert trade.barrier == "stop"
     assert trade.r_multiple < -1.0, (
         f"a stopped trade scored {trade.r_multiple:.4f} — the round trip it paid is missing"
     )
+
+
+# -- sizing must decide affordability, and must never touch the R ------------
+
+
+def _label_kwargs(store: BarStore, symbol: str, cost_model: CostModel) -> dict:
+    return {
+        "store": store,
+        "contracts": _OneContract(symbol, Decimal(24000)),
+        "cost_model": cost_model,
+        "lot_size_for": lambda _day: _LOT,
+        "index_level": Decimal(24000),
+        "entry_ts": _ENTRY,
+        "direction": "long_call",
+        "exchange": "NFO",
+        "stop_pct": _STOP_PCT,
+        "target_pct": _TARGET_PCT,
+        "max_hold": dt.timedelta(hours=3),
+        "strikes_out_of_the_money": 0,
+    }
+
+
+def test_sizing_parameters_never_change_the_r_multiple_or_barrier(tmp_path: Path, rates: CostModel) -> None:
+    """`size_position` decides `lots`/affordability on TOP of an r-multiple
+    that must already be final. Threading real sizing kwargs through `_label`
+    (added so the daily rupee report can price real money) must reproduce
+    the exact same r-multiple/barrier as calling it with no sizing opinion at
+    all — the regression guard the plan asked for."""
+    path = [100.0] * 46 + [70.0] * (375 - 46)
+    store, symbol = _store_with_option(tmp_path, path=path)
+    kwargs = _label_kwargs(store, symbol, rates)
+
+    unsized_trade, unsized_unaffordable = _label(**kwargs)
+    sized_trade, sized_unaffordable = _label(
+        **kwargs,
+        capital=Paise(50_000_00),
+        risk_budget_pct=Decimal(20),
+        max_position_size_pct=Decimal(100),
+        min_edge_multiple=Decimal("1.2"),
+    )
+
+    assert not unsized_unaffordable and not sized_unaffordable
+    assert unsized_trade is not None and sized_trade is not None
+    assert sized_trade.r_multiple == unsized_trade.r_multiple
+    assert sized_trade.barrier == unsized_trade.barrier
+    # Real sizing fields are populated once real sizing kwargs are supplied.
+    assert sized_trade.lots >= 1
+    assert sized_trade.lot_size == _LOT
+    assert sized_trade.net_paise_per_unit != 0
+    assert sized_trade.exit_ts is not None
+
+
+def test_a_trade_capital_cannot_afford_is_unaffordable_not_a_trade(tmp_path: Path, rates: CostModel) -> None:
+    """A real, labelled outcome (a real stop, in this fixture) that
+    `size_position` rejects for insufficient capital must come back as
+    `(None, True)` — not silently dropped as `unlabelled`, and never wearing
+    a `StrategyTrade` shape that would let it be counted as a placed trade."""
+    path = [100.0] * 46 + [70.0] * (375 - 46)
+    store, symbol = _store_with_option(tmp_path, path=path)
+    kwargs = _label_kwargs(store, symbol, rates)
+
+    # Entry premium ~Rs 100 x lot size 75 = Rs 7,500 per lot; Rs 1,000
+    # capital cannot afford even one.
+    trade, unaffordable = _label(**kwargs, capital=Paise(1_000_00))
+
+    assert trade is None
+    assert unaffordable is True

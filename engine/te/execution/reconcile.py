@@ -11,6 +11,45 @@ locally folded event-sourced state. Per the plan, this NEVER auto-heals:
   expected to be frequent early on, and resisting the temptation to
   auto-heal is deliberate. `POST /api/engine/acknowledge-reconciliation`
   (a later phase's API surface) is the only sanctioned way past a halt.
+
+### Why this is NOT scheduled, decided 2026-08-04
+
+Deliberately unscheduled, not forgotten. Turning it on while the engine
+paper-trades would halt it on the first cycle.
+
+`reconcile()` diffs local open positions against `BrokerPort.position_reports()`.
+In paper mode the broker is a `SimulatedBroker` rebuilt FRESH inside
+`te.execution.manager.build_paper_execution_stack` every cycle, so its
+`_positions` is always empty. Every genuinely open position reads as a
+mismatch, and a mismatch halts by design.
+
+NautilusTrader draws the same line for the same reason -- "Only the
+`LiveExecutionEngine` performs reconciliation, since backtesting controls both
+sides" (https://nautilustrader.io/docs/latest/concepts/reconciliation).
+Reconciliation only means something against an EXTERNAL system: an order
+placed by hand in the broker app, a fill we never saw, a position the broker
+thinks we hold. None of those can exist when we are the broker.
+
+So this is a LIVE-mode safety net, to be scheduled when live mode is enabled
+(`te.risk.live_gate`), not before. Wanting paper-mode coverage of this code
+path is reasonable, but the prerequisite is making the simulated broker's
+positions persist across cycles -- until then the check can only produce false
+halts, never find a real problem.
+
+### Two known divergences from that reference implementation
+
+1. NautilusTrader does NOT halt on mismatch. It treats the venue as the source
+   of truth, self-heals its local state, and logs what it cannot resolve --
+   the argument being that the broker holds the binding position and the local
+   model is only a cache, so a network blip should not stop trading. Halting
+   here is a deliberate, more conservative posture for an unattended retail
+   engine, and is kept on purpose; it is recorded as a choice rather than an
+   oversight.
+2. It also separates STARTUP reconciliation (once, before strategies run,
+   mandatory) from continuous runtime checks. This module only implements the
+   continuous kind. The startup pass is arguably the more valuable of the two,
+   since it is what catches a position that appeared while the engine was off.
+   Not built yet.
 """
 
 from __future__ import annotations

@@ -51,6 +51,8 @@ from te.domain.costs import CostModel
 from te.domain.money import Paise
 from te.ml.labeling import label_one_firing_on_premium, premium_barrier_levels
 from te.ml.trials import TrialLedger
+from te.risk.limits import consecutive_losses_breached, daily_loss_breached, drawdown_breached
+from te.risk.sizing import size_position
 from te.strategy.context import StrategyContext
 from te.strategy.indicators import SESSION_OPEN_HOUR, SESSION_OPEN_MINUTE
 from te.strategy.registry import get as get_strategy
@@ -78,6 +80,20 @@ LAST_ENTRY = DEFAULT_LAST_ENTRY
 #: describe a handful of days rather than the rule.
 MAX_ENTRIES_PER_DAY = 3
 
+#: Sizing defaults for `run_many`/`_label`. Deliberately NOT the real
+#: `Settings.paper_cycle_*` risk config: these exist only so that
+#: `size_position` structurally cannot reject a trade for an existing
+#: caller that never asked for sizing in the first place
+#: (`scripts/backtest_all_strategies.py` and the r-multiple regression
+#: tests) — capital effectively unlimited, no minimum edge required, no
+#: position-size cap. A caller that wants REAL affordability (e.g. the
+#: daily rupee report) must pass its own `capital`/`risk_budget_pct`/
+#: `max_position_size_pct`/`min_edge_multiple`.
+_UNLIMITED_SIZING_CAPITAL = Paise(10**15)
+_UNLIMITED_SIZING_RISK_BUDGET_PCT = Decimal(100)
+_UNLIMITED_SIZING_MAX_POSITION_PCT = Decimal(100)
+_UNLIMITED_SIZING_MIN_EDGE_MULTIPLE = Decimal(0)
+
 
 @dataclass(frozen=True)
 class StrategyTrade:
@@ -88,6 +104,39 @@ class StrategyTrade:
     #: Outcome in units of the stop distance: -1.0 is a full stop, +1.0 is
     #: one stop distance earned, both NET of real brokerage/STT/GST.
     r_multiple: float
+    #: The real per-UNIT net (paise), NET of costs — what `r_multiple` is
+    #: computed from, kept alongside it rather than only as a ratio. This is
+    #: what makes real rupee reporting (`te.backtest.daily`) possible instead
+    #: of only R-multiple/Sharpe reporting.
+    net_paise_per_unit: int = 0
+    #: How many lots `te.risk.sizing.size_position` fit inside the caller's
+    #: capital/risk budget. Defaults to `1` for callers (and the direct
+    #: `StrategyTrade(...)` fixtures in `tests/backtest/
+    #: test_strategy_scoring.py`) that never asked for real sizing.
+    lots: int = 1
+    lot_size: int = 1
+    #: The day the trade actually CLOSED — `PremiumLabel.resolved_at`. A
+    #: rupee-per-day report keys on this, not `entry_ts`, per
+    #: `te.backtest.daily`'s own convention. Defaults to `entry_ts` when not
+    #: supplied so old fixtures that only cared about `r_multiple` remain
+    #: valid without inventing a fake exit time.
+    exit_ts: dt.datetime | None = None
+    #: The three premiums `te.risk.sizing.size_position` needs, carried on
+    #: the labelled trade so a caller can RE-SIZE it later without walking
+    #: the option's premium bars again.
+    #:
+    #: That is what makes the parameter sweep (`te.backtest.sweep`) tractable:
+    #: risk-per-trade changes only affordability and lot count, never the
+    #: barrier outcome, so one labelling pass can be re-sized at four risk
+    #: levels instead of being walked four times. Default `0` for the
+    #: fixtures that construct `StrategyTrade` directly and never re-size.
+    entry_premium_paise: int = 0
+    stop_premium_paise: int = 0
+    target_premium_paise: int = 0
+
+    def __post_init__(self) -> None:
+        if self.exit_ts is None:
+            object.__setattr__(self, "exit_ts", self.entry_ts)
 
 
 @dataclass(frozen=True)
@@ -110,6 +159,48 @@ class BacktestResult:
     n_trials_at_scoring: int
     first_day: dt.date | None
     last_day: dt.date | None
+    #: Signals the strategy actually fired that a real premium/stop/target
+    #: walked to a labelled outcome, but that `size_position` rejected as
+    #: unaffordable at the caller's capital/risk budget — kept SEPARATE from
+    #: `unlabelled` (which is data unavailability, not affordability) and
+    #: from `trades` (which must only ever count trades that could actually
+    #: have been placed). Per `honest-metrics`: a rejection you cannot see is
+    #: a lie, and on small capital this can be most of the signals. Defaults
+    #: to `0` for callers that never asked for real sizing (see
+    #: `_UNLIMITED_SIZING_*` above), so those never see a false rejection.
+    unaffordable: int = 0
+    #: Days cut short by `max_daily_loss_paise` — the day's cumulative
+    #: realized net breached it, so no further entries were taken THAT DAY.
+    #: Per `honest-metrics`, this is reported alongside `trades`/
+    #: `unaffordable`, never hidden: a run that silently skipped entries
+    #: while reporting only the ones it took would overstate how much the
+    #: strategy actually traded. Defaults to `0` for every caller that never
+    #: asked for daily-loss enforcement (`max_daily_loss_paise=None`).
+    halted_days: int = 0
+    #: Days cut short by `max_consecutive_losses` — same day-scoped
+    #: stand-down semantics as `te.risk.limits.check_consecutive_losses`.
+    #: Defaults to `0` when `max_consecutive_losses=None`.
+    standdown_days: int = 0
+    #: Whether `max_drawdown_pct` (a persistent halt, unlike the two daily
+    #: counters above) or an account wipe-out (equity <= 0 under
+    #: `compound_equity=True`) stopped this strategy's run early. Defaults to
+    #: `False` for every caller that asked for neither.
+    drawdown_halted: bool = False
+    #: `capital + cumulative realized net` at the end of the run (or at the
+    #: point the run stopped, if `drawdown_halted`). Always computed, even
+    #: when `compound_equity=False` (sizing then still uses the fixed
+    #: `capital`, but the equity figure itself is real).
+    final_equity_paise: int = 0
+    #: Total realized net P&L in paise over the whole run — the money
+    #: question, as opposed to `mean_r`'s unit-free one. Every strategy in
+    #: this library had only ever been scored in R-multiples, which cannot
+    #: answer "how much would this have made".
+    net_pnl_paise: int = 0
+    #: The capital the run was sized against. Stored WITH `net_pnl_paise`
+    #: because a rupee P&L is meaningless without it: -Rs 6,000 is a fifth of
+    #: a Rs 30,000 account and a rounding error on a Rs 30,00,000 one, and a
+    #: reader cannot tell which from the P&L alone.
+    capital_paise: int = 0
 
     @property
     def beats_luck(self) -> bool:
@@ -225,9 +316,18 @@ def run_many(
     target_pct: Decimal = Decimal(20),
     max_hold: dt.timedelta = dt.timedelta(hours=3),
     strikes_out_of_the_money: int = 0,
+    capital: Paise = _UNLIMITED_SIZING_CAPITAL,
+    risk_budget_pct: Decimal = _UNLIMITED_SIZING_RISK_BUDGET_PCT,
+    max_position_size_pct: Decimal = _UNLIMITED_SIZING_MAX_POSITION_PCT,
+    min_edge_multiple: Decimal = _UNLIMITED_SIZING_MIN_EDGE_MULTIPLE,
     trial_ledger: TrialLedger | None = None,
     run_id: str = "manual",
-) -> dict[str, BacktestResult]:
+    collect_trades: bool = False,
+    max_daily_loss_paise: int | None = None,
+    max_consecutive_losses: int | None = None,
+    max_drawdown_pct: Decimal | None = None,
+    compound_equity: bool = False,
+) -> dict[str, BacktestResult] | tuple[dict[str, BacktestResult], dict[str, list[StrategyTrade]]]:
     """Backtests many strategies in ONE pass over history.
 
     The optimisation that makes the full library practical, and it is exact
@@ -240,7 +340,53 @@ def run_many(
 
     Strategies never see each other: each keeps its own instance and its own
     `last_signal`, and none of them writes to the shared frame.
+
+    `collect_trades=False` (the default, and every pre-existing caller's
+    behaviour) returns just the per-strategy summaries, matching
+    `results_store.py`'s stated design that individual trades are not part
+    of a `BacktestResult` — a 32-strategy x 600-session run keeping every
+    trade in memory has no reason to when nothing downstream reads it.
+    `collect_trades=True` additionally returns the real per-strategy trade
+    lists (`StrategyTrade`, carrying real rupee P&L), for a caller like the
+    daily rupee report that genuinely needs day-by-day money, not just the
+    scored summary.
+
+    ### Risk enforcement (opt-in, defaulted off)
+
+    `max_daily_loss_paise`/`max_consecutive_losses`/`max_drawdown_pct`
+    enforce the SAME rules the live engine does — `te.risk.limits.
+    daily_loss_breached`/`consecutive_losses_breached`/`drawdown_breached`,
+    the pure predicates `check_daily_loss_limit`/`check_consecutive_losses`/
+    `check_max_drawdown` themselves call — never a re-implementation, so the
+    two paths cannot silently drift apart. All three default to `None`
+    (disabled), so every pre-existing caller (`scripts/
+    backtest_all_strategies.py`, the r-multiple regression tests) is
+    byte-for-byte unchanged.
+
+    `max_daily_loss_paise`/`max_consecutive_losses` are day-scoped stand-
+    downs (mirroring live): once breached, no further entries THAT DAY, but
+    the flag clears the next day. `max_drawdown_pct` is a PERSISTENT halt
+    (also mirroring live): once breached, that strategy takes no further
+    entries for the REST OF THE RUN. Every day/strategy cut short this way is
+    counted on the returned `BacktestResult` (`halted_days`/
+    `standdown_days`/`drawdown_halted`), never silently absorbed — a run
+    that skipped a third of its days while reporting only the days it kept
+    would be exactly the kind of number `honest-metrics` forbids.
+
+    `compound_equity=True` sizes every trade off CURRENT equity (`capital +
+    cumulative realized net so far`) instead of the fixed starting `capital`
+    — real money compounds; after losing money you are betting a smaller
+    stake, not the original one. If equity drops to or below zero the
+    account is wiped: the run stops for that strategy immediately
+    (`drawdown_halted=True`) rather than continuing to size trades off
+    negative capital. `final_equity_paise` on the result is always the
+    ending `capital + cumulative realized net`, whether or not
+    `compound_equity` was used for sizing.
     """
+    # Did the caller ask for REAL sizing, or accept the unlimited defaults?
+    # Only a real answer may be reported as money — see `_assemble` below.
+    _sized_for_real = capital != _UNLIMITED_SIZING_CAPITAL
+
     cached_store = _WholeSymbolCache(store.root, store)
     sessions = _sessions(store, instrument)
     # The REAL expiry calendar, from the contract archive itself — not a
@@ -251,6 +397,77 @@ def run_many(
 
     trades: dict[str, list[StrategyTrade]] = {name: [] for name in strategy_names}
     unlabelled: dict[str, int] = dict.fromkeys(strategy_names, 0)
+    unaffordable: dict[str, int] = dict.fromkeys(strategy_names, 0)
+
+    # Risk-enforcement state — tracked per strategy, persisting across the
+    # whole run (unlike the day-scoped dicts reset inside the loop below).
+    # `equity_paise` is always tracked (it is what `final_equity_paise`
+    # reports), even for callers who never asked for `compound_equity` or any
+    # of the three limits.
+    equity_paise: dict[str, int] = dict.fromkeys(strategy_names, int(capital))
+    peak_equity_paise: dict[str, int] = dict.fromkeys(strategy_names, int(capital))
+    drawdown_halted: dict[str, bool] = dict.fromkeys(strategy_names, False)
+    halted_days: dict[str, int] = dict.fromkeys(strategy_names, 0)
+    standdown_days: dict[str, int] = dict.fromkeys(strategy_names, 0)
+
+    # Trades ENTERED but not yet resolved. Their P&L does not exist until
+    # `exit_ts`, so it must not reach equity, the daily net, or the
+    # consecutive-loss streak before then.
+    #
+    # This used to credit the outcome at ENTRY. With up to three entries a
+    # day that let the second and third be sized off money the first had not
+    # yet made, and had the daily-loss limit checked against a result that
+    # had not happened � an edge the live engine cannot possibly have.
+    # Caught in review 2026-08-05.
+    pending: dict[str, list[StrategyTrade]] = {name: [] for name in strategy_names}
+
+    def _settle(name: str, upto: dt.datetime) -> None:
+        """Credits every held trade that has resolved by `upto`, in
+        resolution order, applying the risk limits as each lands."""
+        due = [t for t in pending[name] if (t.exit_ts or t.entry_ts) <= upto]
+        if not due:
+            return
+        pending[name] = [t for t in pending[name] if (t.exit_ts or t.entry_ts) > upto]
+        for trade in sorted(due, key=lambda t: t.exit_ts or t.entry_ts):
+            net_total = trade.net_paise_per_unit * trade.lot_size * trade.lots
+            equity_paise[name] += net_total
+            daily_net_paise[name] += net_total
+            recent_trade_nets[name].insert(0, net_total)
+
+            if max_drawdown_pct is not None:
+                peak_equity_paise[name] = max(peak_equity_paise[name], equity_paise[name])
+                if drawdown_breached(
+                    current_equity_paise=equity_paise[name],
+                    peak_equity_paise=peak_equity_paise[name],
+                    max_drawdown_pct=max_drawdown_pct,
+                ):
+                    drawdown_halted[name] = True
+            if compound_equity and equity_paise[name] <= 0:
+                # The account is wiped. Stop the run for this strategy rather
+                # than sizing further trades off negative capital. Gated on
+                # `compound_equity`: a caller who never asked sizing to follow
+                # equity must not have its run cut short by a tracked-but-
+                # unused equity figure going negative.
+                drawdown_halted[name] = True
+
+            if (
+                max_daily_loss_paise is not None
+                and not day_loss_halted[name]
+                and daily_loss_breached(
+                    net_paise=daily_net_paise[name], max_daily_loss_paise=int(max_daily_loss_paise)
+                )
+            ):
+                day_loss_halted[name] = True
+                halted_days[name] += 1
+            if (
+                max_consecutive_losses is not None
+                and not day_standdown[name]
+                and consecutive_losses_breached(
+                    recent_trade_nets=recent_trade_nets[name], limit=max_consecutive_losses
+                )
+            ):
+                day_standdown[name] = True
+                standdown_days[name] += 1
 
     previous_session: pd.DataFrame | None = None
     for day, frame in sessions:
@@ -276,12 +493,28 @@ def run_many(
 
         strategies = {name: get_strategy(name) for name in strategy_names}
         entries_today = dict.fromkeys(strategy_names, 0)
+        # Day-scoped risk state — reset every day, unlike `drawdown_halted`/
+        # `equity_paise` above, which persist across the whole run. Mirrors
+        # live: a daily-loss halt or a consecutive-losses stand-down expires
+        # with the trading day.
+        daily_net_paise = dict.fromkeys(strategy_names, 0)
+        recent_trade_nets: dict[str, list[int]] = {name: [] for name in strategy_names}
+        day_loss_halted = dict.fromkeys(strategy_names, False)
+        day_standdown = dict.fromkeys(strategy_names, False)
 
         as_of = first
         while as_of <= last:
             ctx.as_of = as_of
+            for name in strategy_names:
+                _settle(name, as_of)
             for name, strategy in strategies.items():
+                if drawdown_halted[name]:
+                    continue  # persistent halt — this strategy trades no more for the rest of the run
                 if entries_today[name] >= MAX_ENTRIES_PER_DAY:
+                    continue
+                if max_daily_loss_paise is not None and day_loss_halted[name]:
+                    continue
+                if max_consecutive_losses is not None and day_standdown[name]:
                     continue
                 evaluation = strategy.evaluate(ctx)
                 if evaluation.verdict != "traded":
@@ -290,7 +523,8 @@ def run_many(
                 if signal is None:
                     continue
                 entries_today[name] += 1
-                trade = _label(
+                trade_capital = Paise(equity_paise[name]) if compound_equity else capital
+                trade, was_unaffordable = _label(
                     store=cached_store,
                     contracts=contracts,
                     cost_model=cost_model,
@@ -303,12 +537,27 @@ def run_many(
                     target_pct=target_pct,
                     max_hold=max_hold,
                     strikes_out_of_the_money=strikes_out_of_the_money,
+                    capital=trade_capital,
+                    risk_budget_pct=risk_budget_pct,
+                    max_position_size_pct=max_position_size_pct,
+                    min_edge_multiple=min_edge_multiple,
                 )
-                if trade is None:
-                    unlabelled[name] += 1
-                else:
+                if trade is not None:
                     trades[name].append(trade)
+                    # HELD until it actually resolves — see `_settle` below.
+                    # Crediting here would size the day's later entries off
+                    # money this trade has not made yet.
+                    pending[name].append(trade)
+                elif was_unaffordable:
+                    unaffordable[name] += 1
+                else:
+                    unlabelled[name] += 1
             as_of += dt.timedelta(minutes=1)
+        # Anything still open at the end of the day settles now: every exit
+        # path is bounded by `max_hold` and the hard exit, so nothing can
+        # legitimately survive the session.
+        for name in strategy_names:
+            _settle(name, as_of + dt.timedelta(days=1))
 
     # Scored as ONE batch, so every strategy in this run is judged against
     # the same trial count rather than against however many happened to be
@@ -320,18 +569,42 @@ def run_many(
         trial_ledger=trial_ledger,
         run_id=run_id,
     )
-    return {
+    results = {
         name: _assemble(
             strategy=name,
             instrument=instrument,
             scored=scored[name],
             trade_count=len(trades[name]),
             unlabelled=unlabelled[name],
+            unaffordable=unaffordable[name],
             first_day=sessions[0][0] if sessions else None,
             last_day=sessions[-1][0] if sessions else None,
+            halted_days=halted_days[name],
+            standdown_days=standdown_days[name],
+            drawdown_halted=drawdown_halted[name],
+            # Money is reported ONLY when the caller asked for real sizing.
+            #
+            # With the `_UNLIMITED_SIZING_*` defaults, capital is Rs 10
+            # trillion and `size_position` returns on the order of a billion
+            # lots, so these figures come out in the 10^13 paise range.
+            # `scripts/backtest_all_strategies.py` is exactly such a caller
+            # and persists them through `save_results` — which would put
+            # fabricated money on the Strategies page, the precise
+            # `honest-metrics` failure this file's own docstring warns
+            # about. An honest zero says "not measured"; a plausible-looking
+            # number does not. Caught in review 2026-08-05.
+            final_equity_paise=equity_paise[name] if _sized_for_real else 0,
+            # Equity is seeded at `capital` and moved only by realized net,
+            # so the difference IS the run's P&L — derived here rather than
+            # accumulated separately so the two can never disagree.
+            net_pnl_paise=(equity_paise[name] - int(capital)) if _sized_for_real else 0,
+            capital_paise=int(capital) if _sized_for_real else 0,
         )
         for name in strategy_names
     }
+    if collect_trades:
+        return results, trades
+    return results
 
 
 class _DaySlice(BarStore):
@@ -379,7 +652,21 @@ def _label(
     target_pct: Decimal,
     max_hold: dt.timedelta,
     strikes_out_of_the_money: int,
-) -> StrategyTrade | None:
+    capital: Paise = _UNLIMITED_SIZING_CAPITAL,
+    risk_budget_pct: Decimal = _UNLIMITED_SIZING_RISK_BUDGET_PCT,
+    max_position_size_pct: Decimal = _UNLIMITED_SIZING_MAX_POSITION_PCT,
+    min_edge_multiple: Decimal = _UNLIMITED_SIZING_MIN_EDGE_MULTIPLE,
+) -> tuple[StrategyTrade | None, bool]:
+    """Labels one firing on its real option premium path.
+
+    Returns `(trade, unaffordable)`. `unaffordable` is `True` only when a
+    firing walked all the way to a real labelled outcome and
+    `te.risk.sizing.size_position` then rejected it as unaffordable at the
+    caller's capital/risk budget — distinct from every other `None` case
+    below (no contract, no label, no exit bars), which is missing DATA, not
+    a rejected trade, and must not be counted as either a trade or an
+    unaffordable signal.
+    """
     contract = contracts.nearest(
         on=entry_ts.astimezone(IST).date(),
         index_level=index_level,
@@ -387,7 +674,7 @@ def _label(
         strikes_out_of_the_money=strikes_out_of_the_money,
     )
     if contract is None:
-        return None
+        return None, False
     lot_size = lot_size_for(entry_ts.date())
     label = label_one_firing_on_premium(
         store=store,
@@ -401,7 +688,7 @@ def _label(
         lot_size=lot_size,
     )
     if label is None:
-        return None
+        return None, False
 
     # EVERY outcome is priced the same way: find the premium the position
     # actually exited at, then net the real round trip off it.
@@ -434,7 +721,7 @@ def _label(
         # whose moves are real but slower than the horizon.
         exit_bars = bars_asof(store, contract.symbol, label.resolved_at, dt.timedelta(minutes=10), interval="1m")
         if exit_bars.empty:
-            return None
+            return None, False
         exit_premium = Paise(int(round(float(exit_bars.iloc[-1]["c"]) * 100)))
 
     round_trip = cost_model.round_trip(
@@ -448,13 +735,46 @@ def _label(
     net = float(exit_premium) - float(label.entry_premium) - float(round_trip) / lot_size
     r_multiple = net / stop_distance if stop_distance else 0.0
 
+    # A real per-unit net was just computed above and used to be thrown
+    # away here — everything from this point on is what makes a rupee
+    # figure (not just an R-multiple) possible for this firing.
+    sizing = size_position(
+        capital=capital,
+        risk_budget_pct=risk_budget_pct,
+        premium=label.entry_premium,
+        stop_premium=stop_level,
+        target_premium=target_level,
+        lot_size=lot_size,
+        costs=cost_model,
+        exchange=exchange,
+        on=entry_ts.date(),
+        min_edge_multiple=min_edge_multiple,
+        max_position_size_pct=max_position_size_pct,
+    )
+    if sizing.lots == 0:
+        # A real, labelled outcome that the capital/risk budget could not
+        # have afforded. It must not silently vanish (that would make
+        # small-capital rejection invisible) and must not be counted as a
+        # trade (that would misrepresent what actually would have been
+        # placed) — see `BacktestResult.unaffordable`.
+        return None, True
+
     return StrategyTrade(
         entry_ts=entry_ts,
         direction=direction,
         option_symbol=contract.symbol,
         barrier=label.barrier,
         r_multiple=r_multiple,
-    )
+        net_paise_per_unit=int(round(net)),
+        lots=sizing.lots,
+        lot_size=lot_size,
+        exit_ts=label.resolved_at,
+        # Carried so `te.backtest.sweep` can re-run `size_position` at a
+        # different risk budget without re-walking the premium bars.
+        entry_premium_paise=int(label.entry_premium),
+        stop_premium_paise=int(stop_level),
+        target_premium_paise=int(target_level),
+    ), False
 
 
 def _score(
@@ -467,6 +787,7 @@ def _score(
     last_day: dt.date | None,
     trial_ledger: TrialLedger | None,
     run_id: str,
+    unaffordable: int = 0,
 ) -> BacktestResult:
     """Scores ONE strategy. `run_many` uses `score_many` instead, so that a
     whole library is judged against a single trial count; this remains for
@@ -483,6 +804,7 @@ def _score(
         ),
         trade_count=len(trades),
         unlabelled=unlabelled,
+        unaffordable=unaffordable,
         first_day=first_day,
         last_day=last_day,
     )
@@ -497,6 +819,13 @@ def _assemble(
     unlabelled: int,
     first_day: dt.date | None,
     last_day: dt.date | None,
+    unaffordable: int = 0,
+    halted_days: int = 0,
+    standdown_days: int = 0,
+    drawdown_halted: bool = False,
+    final_equity_paise: int = 0,
+    net_pnl_paise: int = 0,
+    capital_paise: int = 0,
 ) -> BacktestResult:
     """Wraps a scored sample (or the absence of one) in a `BacktestResult`.
     An unscored strategy reports zeros, never a placeholder that reads like
@@ -515,6 +844,13 @@ def _assemble(
             n_trials_at_scoring=0,
             first_day=first_day,
             last_day=last_day,
+            unaffordable=unaffordable,
+            halted_days=halted_days,
+            standdown_days=standdown_days,
+            drawdown_halted=drawdown_halted,
+            final_equity_paise=final_equity_paise,
+            net_pnl_paise=net_pnl_paise,
+            capital_paise=capital_paise,
         )
     return BacktestResult(
         strategy=strategy,
@@ -529,4 +865,11 @@ def _assemble(
         n_trials_at_scoring=scored.n_trials_at_scoring,
         first_day=first_day,
         last_day=last_day,
+        unaffordable=unaffordable,
+        halted_days=halted_days,
+        standdown_days=standdown_days,
+        drawdown_halted=drawdown_halted,
+        final_equity_paise=final_equity_paise,
+        net_pnl_paise=net_pnl_paise,
+        capital_paise=capital_paise,
     )

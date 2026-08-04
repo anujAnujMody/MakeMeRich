@@ -76,6 +76,14 @@ class OrderRequest:
     order_type: OrderType = "MARKET"
     limit_price: Paise | None = None
     reduce_only: bool = False
+    #: The market at the moment the caller decided to send this — carried
+    #: through onto `OrderInitialized` so slippage has a benchmark to measure
+    #: against. See that event's fields for why the mid of these, rather than
+    #: `limit_price`, is the correct one. Optional because not every caller
+    #: has a live quote (a backtest replay does not), and a missing benchmark
+    #: must read as "not measured" rather than as a fabricated zero.
+    arrival_bid: Paise | None = None
+    arrival_ask: Paise | None = None
 
 
 @dataclass(frozen=True)

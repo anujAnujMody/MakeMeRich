@@ -20,6 +20,11 @@ def test_scheduler_status_reports_all_jobs_including_paper_cycle() -> None:
     job_ids = {job["id"] for job in body["jobs"]}
     assert job_ids == {
         "openalgo_relogin",
+        # Clears yesterday's daily-loss halt before trading starts — it must
+        # be VISIBLE in the status payload, not just registered, because a
+        # silent auto-unhalt is exactly the kind of thing an operator should
+        # be able to see the engine doing.
+        "daily_loss_halt_reset",
         "ws_recorder_start",
         "ws_recorder_stop",
         "bhavcopy_ingest",

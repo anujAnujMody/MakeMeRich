@@ -12,6 +12,7 @@ daily loss limit keeps blocking new orders across a restart too.
 from __future__ import annotations
 
 import datetime as dt
+from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 
@@ -19,7 +20,7 @@ from sqlalchemy.orm import Session
 
 from te.domain.money import Paise
 from te.engine.state import get_peak_equity_paise, set_peak_equity_paise
-from te.execution.halt import set_halt
+from te.execution.halt import DAILY_LOSS_HALT, set_halt
 from te.persistence.repos.paper_trading import (
     daily_net_pnl_paise,
     open_positions_count,
@@ -57,6 +58,56 @@ class LimitBreachError(Exception):
 _ZERO_PAISE = Paise(0)
 
 
+# --- Pure predicates -----------------------------------------------------
+#
+# Extracted so a backtest (which has no SQLAlchemy `Session` to hand these
+# `check_*` functions) can enforce the EXACT SAME rules the live engine does,
+# without re-implementing them — the two must never be able to drift apart.
+# Each predicate is the one place a rule's comparison operator/edge case
+# lives; the `check_*` functions below are now thin wrappers that add
+# persistence (reading the DB for the inputs, writing the halt/risk-event
+# rows) around the same decision.
+
+
+def daily_loss_breached(*, net_paise: int, max_daily_loss_paise: int) -> bool:
+    """Mirrors `check_daily_loss_limit`'s comparison exactly: breached once
+    net P&L (realized + unrealized) is AT OR BEYOND the negative of the
+    limit, not merely past it."""
+    return net_paise <= -max_daily_loss_paise
+
+
+def _consecutive_loss_streak(recent_trade_nets: Sequence[int]) -> int:
+    """Counts backwards from the front of `recent_trade_nets` (assumed
+    MOST-RECENT-FIRST) and stops at the first non-loss. Breakeven (`net ==
+    0`) counts as a reset, not a loss — mirrors `check_consecutive_losses`."""
+    streak = 0
+    for net in recent_trade_nets:
+        if net >= 0:
+            break
+        streak += 1
+    return streak
+
+
+def consecutive_losses_breached(*, recent_trade_nets: Sequence[int], limit: int) -> bool:
+    """`recent_trade_nets` must be ordered MOST-RECENT-FIRST (mirrors
+    `check_consecutive_losses`' own `sorted(..., reverse=True)`). `limit <= 0`
+    disables the check entirely, matching `RiskLimitsConfig.max_consecutive_losses`'s
+    `0` meaning "off"."""
+    if limit <= 0:
+        return False
+    return _consecutive_loss_streak(recent_trade_nets) >= limit
+
+
+def drawdown_breached(*, current_equity_paise: int, peak_equity_paise: int, max_drawdown_pct: Decimal) -> bool:
+    """Mirrors `check_max_drawdown`'s comparison exactly. `peak_equity_paise
+    <= 0` returns `False` (no meaningful watermark yet) rather than dividing
+    by zero — the same early-return `check_max_drawdown` takes."""
+    if peak_equity_paise <= 0:
+        return False
+    drawdown_pct = Decimal(peak_equity_paise - current_equity_paise) / Decimal(peak_equity_paise) * Decimal(100)
+    return drawdown_pct >= max_drawdown_pct
+
+
 def check_daily_loss_limit(
     session: Session,
     config: RiskLimitsConfig,
@@ -76,13 +127,16 @@ def check_daily_loss_limit(
     haven't been booked into a closed `Trade` yet — without ever tripping
     the halt that is supposed to protect capital."""
     net = daily_net_pnl_paise(session, on) + unrealized_pnl_paise
-    if net <= -config.max_daily_loss_paise:
+    if daily_loss_breached(net_paise=int(net), max_daily_loss_paise=int(config.max_daily_loss_paise)):
         reason = (
             f"daily net P&L including open positions ({net}p) breached the daily loss limit "
             f"(-{config.max_daily_loss_paise}p) on {on.isoformat()}"
         )
         record_risk_event(session, ts=now, kind="daily_loss_halt", detail=reason)
-        set_halt(session, reason)
+        # Labelled so `clear_daily_halt` can reset it at the next session
+        # start. This is the ONLY halt in the system that clears itself —
+        # every other one means a human has to look at something.
+        set_halt(session, reason, kind=DAILY_LOSS_HALT)
         raise LimitBreachError("daily_loss", reason)
 
 
@@ -109,18 +163,21 @@ def check_max_drawdown(
     if stored_peak is None or peak != stored_peak:
         set_peak_equity_paise(session, peak)
 
-    if peak <= 0:
-        return  # no meaningful watermark yet (e.g. capital itself is 0 in a test) — nothing to compare against
+    if not drawdown_breached(
+        current_equity_paise=int(current_equity_paise),
+        peak_equity_paise=int(peak),
+        max_drawdown_pct=config.max_drawdown_pct,
+    ):
+        return  # no meaningful watermark yet, or within the band — nothing to halt
 
     drawdown_pct = Decimal(peak - current_equity_paise) / Decimal(peak) * Decimal(100)
-    if drawdown_pct >= config.max_drawdown_pct:
-        reason = (
-            f"current equity ({current_equity_paise}p) is {drawdown_pct:.2f}% below its peak "
-            f"({peak}p), breaching max_drawdown_pct ({config.max_drawdown_pct}%)"
-        )
-        record_risk_event(session, ts=now, kind="max_drawdown_halt", detail=reason)
-        set_halt(session, reason)
-        raise LimitBreachError("max_drawdown", reason)
+    reason = (
+        f"current equity ({current_equity_paise}p) is {drawdown_pct:.2f}% below its peak "
+        f"({peak}p), breaching max_drawdown_pct ({config.max_drawdown_pct}%)"
+    )
+    record_risk_event(session, ts=now, kind="max_drawdown_halt", detail=reason)
+    set_halt(session, reason)
+    raise LimitBreachError("max_drawdown", reason)
 
 
 def check_max_concurrent_positions(session: Session, config: RiskLimitsConfig) -> None:
@@ -151,12 +208,11 @@ def check_consecutive_losses(session: Session, config: RiskLimitsConfig, *, on: 
     same way every other check in this module does."""
     if config.max_consecutive_losses <= 0:
         return
-    streak = 0
-    for row in sorted(trades_today(session, on), key=lambda r: r.closed_at, reverse=True):
-        if row.net_pnl_paise >= 0:
-            break
-        streak += 1
-    if streak >= config.max_consecutive_losses:
+    recent_nets = [
+        row.net_pnl_paise for row in sorted(trades_today(session, on), key=lambda r: r.closed_at, reverse=True)
+    ]
+    if consecutive_losses_breached(recent_trade_nets=recent_nets, limit=config.max_consecutive_losses):
+        streak = _consecutive_loss_streak(recent_nets)
         reason = (
             f"{streak} consecutive losing trade(s) today, at or above the limit of "
             f"{config.max_consecutive_losses} — no new entries for the rest of the session"

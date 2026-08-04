@@ -75,7 +75,15 @@ class Settings(BaseSettings):
     paper_cycle_exchange: str = "NFO"
     paper_cycle_strategy: str = "orb"
     paper_cycle_lot_size: int = 65
-    paper_cycle_capital_paise: int = 2_000_000
+    #: Rs 30,000 — the REAL account this will trade, set 2026-08-04. Paper
+    #: trading deliberately runs at the same capital as the live account:
+    #: sized off a larger balance it takes positions that could never be
+    #: reproduced live, and on Rs 30,000 affordability is what rejects most
+    #: signals, so a paper run on anything bigger would not feel the
+    #: constraint that actually governs. Measured the same day: at this
+    #: capital `size_position` rejects roughly 85% of ORB's signals as
+    #: unaffordable — that is the honest picture, not a bug to size around.
+    paper_cycle_capital_paise: int = 3_000_000
     #: Capped by `te.engine.state.MAX_RISK_PER_TRADE_PCT` — see the ceilings
     #: comment there for the risk-of-ruin arithmetic. Shipping a default
     #: above the ceiling would mean the very first read clamped it, which
@@ -118,11 +126,15 @@ class Settings(BaseSettings):
     #: entire loss. Its stop never fired; the clock closed it. It carried full
     #: downside while its upside was arithmetically unreachable.
     paper_cycle_min_minutes_before_hard_exit: int = 40
-    #: Rs 1,000 = 5% of the Rs 20,000 default capital, the ceiling in
-    #: `te.engine.state.MAX_DAILY_LOSS_PCT_OF_CAPITAL`. Was Rs 10,000 — half
-    #: the default capital, which is not a loss limit so much as a
-    #: formality. Kept in step with `paper_cycle_capital_paise`: if that
-    #: changes, this must change with it or the first read will clamp it.
+    #: Rs 1,000 — chosen by the owner, not derived. Against the Rs 30,000
+    #: capital above it is 3.3%, comfortably under the 5% ceiling in
+    #: `te.engine.state.MAX_DAILY_LOSS_PCT_OF_CAPITAL` (which would allow
+    #: Rs 1,500), so it is a real limit rather than one the clamp imposes.
+    #: Sized deliberately against the stop: one NIFTY lot at a ~Rs 74 premium
+    #: risks ~Rs 481 at a 10% stop, so this permits two losing trades and
+    #: then stands the day down.
+    #: Still kept in step with `paper_cycle_capital_paise` — if capital ever
+    #: falls, re-check this against the 5% ceiling or the first read clamps it.
     paper_cycle_max_daily_loss_paise: int = 100_000
     paper_cycle_max_concurrent_positions: int = 5
     #: Stand down from NEW entries for the rest of the day after this many

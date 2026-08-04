@@ -44,7 +44,12 @@ _EVENT_TYPES: dict[str, type[OrderEvent]] = {
     "OrderExpired": OrderExpired,
 }
 
-_PAISE_FIELDS = {"fill_price"}
+#: Fields deserialized back into `Paise`. `requested_price`/`arrival_bid`/
+#: `arrival_ask` are OPTIONAL — an order written before they existed, or one
+#: placed with no quote to hand, has them absent or null. `_deserialize`
+#: therefore skips `None` rather than calling `Paise(None)`, so replaying the
+#: existing event log keeps working unchanged.
+_PAISE_FIELDS = {"fill_price", "requested_price", "arrival_bid", "arrival_ask"}
 
 
 def _serialize(event: OrderEvent) -> str:
@@ -58,7 +63,7 @@ def _deserialize(event_type: str, payload_json: str) -> OrderEvent:
     payload = json.loads(payload_json)
     payload["ts"] = dt.datetime.fromisoformat(payload["ts"])
     for field in _PAISE_FIELDS:
-        if field in payload:
+        if payload.get(field) is not None:
             payload[field] = Paise(payload[field])
     return cls(**payload)
 

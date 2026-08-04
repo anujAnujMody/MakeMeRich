@@ -43,6 +43,12 @@ def persist_initial_event(
         side=request.side,
         quantity=request.quantity,
         ts=ts or dt.datetime.now(dt.UTC),
+        # Captured here, at t=0, because it cannot be recovered later — see
+        # `OrderInitialized`. This function already runs BEFORE any network
+        # call, which is exactly the instant the benchmark must describe.
+        requested_price=request.limit_price,
+        arrival_bid=request.arrival_bid,
+        arrival_ask=request.arrival_ask,
     )
     store.append(event)
     return event

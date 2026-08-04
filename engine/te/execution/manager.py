@@ -21,6 +21,7 @@ import datetime as dt
 from collections.abc import Callable
 from typing import Protocol
 
+import structlog
 from sqlalchemy.orm import Session, sessionmaker
 
 from te.broker.protocol import BrokerPort, FillReport
@@ -30,7 +31,9 @@ from te.domain.costs import ChargeRateTable, CostModel, select_rates
 from te.domain.events import (
     OrderAccepted,
     OrderCancelled,
+    OrderEvent,
     OrderFilled,
+    OrderInitialized,
     OrderPartiallyFilled,
     OrderRejected,
     OrderSubmitted,
@@ -42,6 +45,9 @@ from te.execution.idempotency import mint_client_order_id, persist_initial_event
 from te.execution.inflight import resolve_inflight
 from te.execution.store import OrderEventStore
 from te.persistence.db import session_scope
+from te.risk.monitors import SlippageMonitor
+
+logger = structlog.get_logger(__name__)
 
 _TERMINAL_FILL_EVENTS = (OrderFilled, OrderPartiallyFilled)
 
@@ -152,6 +158,63 @@ class ExecutionManager:
                 ts=report.ts,
             )
         )
+        self._observe_slippage(events[0], report)
+
+    def _observe_slippage(self, initialized: OrderEvent, report: FillReport) -> None:
+        """Records one (expected, actual) pair for `te.risk.monitors`.
+
+        The monitor existed but had never observed anything, so the
+        live-money gate's "slippage is clean" condition passed on an empty
+        sample — a gate that cannot fail is not a gate.
+
+        The benchmark is the ARRIVAL MID, not the price we asked for.
+        Judging a fill against our own limit scores a genuine market move as
+        bad execution: ask Rs 74, market moves to Rs 76, fill at Rs 76, and
+        a limit-only comparison calls that Rs 2 of slippage when the fill
+        was in fact fair. Measuring against where the market actually was at
+        submission is Perold's implementation shortfall (1988), which is
+        what execution desks use. `requested_price` is the fallback only
+        when no two-sided quote was captured.
+
+        Never raises: a failure to MEASURE execution must not be able to
+        break execution itself.
+        """
+        if not isinstance(initialized, OrderInitialized):
+            return
+        if initialized.arrival_bid is not None and initialized.arrival_ask is not None:
+            expected = Paise((int(initialized.arrival_bid) + int(initialized.arrival_ask)) // 2)
+        elif initialized.requested_price is not None:
+            expected = initialized.requested_price
+        else:
+            return  # nothing to compare against — an order from before this was captured
+        # SIGN. `SlippageMonitor.status` treats a positive mean (actual >
+        # expected) as "costlier than modelled" and only ever breaches on
+        # `mean > 0`. That reads correctly for a BUY, where paying MORE is
+        # worse — but it is backwards for a SELL, where receiving LESS is
+        # worse and produces a NEGATIVE difference.
+        #
+        # Left unadjusted, every exit (all of which are SELLs, see
+        # `te.engine.cycle._close_position`) recorded bad execution as
+        # favourable, and entry and exit errors cancelled in the same mean.
+        # The monitor could then never breach, and the live-money gate's
+        # "slippage is clean" condition would pass no matter how bad fills
+        # got. Reflecting the sell around the benchmark makes "worse than
+        # expected" positive on both sides, which is what the mean assumes.
+        adjusted = (
+            report.fill_price
+            if report.side == "BUY"
+            else Paise(2 * int(expected) - int(report.fill_price))
+        )
+        try:
+            with session_scope(self._session_factory) as session:
+                SlippageMonitor(session, instrument=report.symbol).observe(
+                    expected,
+                    adjusted,
+                    ctx=f"{report.side.lower()}_fill",
+                    ts=report.ts,
+                )
+        except Exception:  # noqa: BLE001 — measurement must never break execution
+            logger.exception("slippage observation failed", client_order_id=report.client_order_id)
 
     def check_inflight(self, client_order_id: str, *, window: dt.timedelta = dt.timedelta(seconds=5)) -> None:
         """Periodic in-flight resolution — TODO(Phase 4): wire this into

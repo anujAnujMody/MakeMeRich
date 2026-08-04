@@ -147,6 +147,11 @@ def test_build_scheduler_registers_every_job(tmp_path: Path) -> None:
     job_ids = {job.id for job in scheduler.get_jobs()}
     assert job_ids == {
         "openalgo_relogin",
+        # Clears yesterday's daily-loss halt at 09:05, before the recorder
+        # starts and well before the first entry cycle. Without it the first
+        # session to breach the limit blocks entries forever — see
+        # `tests/execution/test_daily_halt_resets.py`.
+        "daily_loss_halt_reset",
         "ws_recorder_start",
         "ws_recorder_stop",
         "bhavcopy_ingest",

@@ -83,9 +83,11 @@ from te.engine.state import (
     instrument_selections_defaults_from_settings,
 )
 from te.engine.trading_calendar import get_calendar, refresh_calendar
+from te.execution.halt import clear_daily_halt, halt_reason
 from te.execution.manager import build_paper_execution_stack
-from te.persistence.db import make_session_factory
+from te.persistence.db import make_session_factory, session_scope
 from te.persistence.models import OpenPositionRow
+from te.persistence.repos.paper_trading import record_risk_event
 from te.risk.killswitch import KillSwitchTrippedError
 from te.risk.killswitch import check as check_killswitch
 from te.risk.limits import RiskLimitsConfig
@@ -496,6 +498,39 @@ def _run_instrument_sync(rest_client: OpenAlgoRestClient, engine: Engine) -> Non
         except Exception:
             logger.exception("instrument sync failed for one contract", symbol=symbol, exchange=exchange)
     logger.info("instrument sync complete", rows_written=written_total)
+
+
+def reset_daily_loss_halt(session_factory: sessionmaker[Session]) -> bool:
+    """Clears yesterday's daily-loss halt so today can trade. Returns whether
+    anything was cleared.
+
+    The daily loss limit is scoped to one day by definition, but nothing ever
+    unscoped it: `set_halt` persists, and the only caller of `clear_halt` was
+    `POST /api/engine/reset-drawdown-breaker`. So the first session to breach
+    the limit blocked every entry from then on, until a human noticed and
+    clicked a button. On an unattended 1-2 month paper run that quietly costs
+    weeks of data, and — worse — it looks exactly like a strategy that simply
+    found no signals, so nothing about the dashboard would say anything was
+    wrong.
+
+    Narrow on purpose: `clear_daily_halt` refuses to clear a drawdown breach,
+    an overfill, a reconciliation mismatch, or the kill switch. None of those
+    is a per-day condition and every one of them means a human has to look at
+    something. The reset is also RECORDED as a risk event rather than done
+    silently — an engine that un-halts itself overnight with no trace is not
+    something anyone should have to discover by reading logs."""
+    with session_scope(session_factory) as session:
+        previous = halt_reason(session)
+        if not clear_daily_halt(session):
+            return False
+        record_risk_event(
+            session,
+            ts=dt.datetime.now(dt.UTC),
+            kind="daily_loss_halt_reset",
+            detail=f"new session: cleared yesterday's daily-loss halt ({previous})",
+        )
+    logger.info("daily loss halt reset for the new session", previous_reason=previous)
+    return True
 
 
 def run_openalgo_relogin(settings: Settings) -> LoginResult:
@@ -987,6 +1022,17 @@ def build_scheduler(
         args=[settings],
         trigger=CronTrigger(hour=8, minute=40, day_of_week="mon-fri", timezone=IST),
         id="openalgo_relogin",
+        replace_existing=True,
+    )
+    # Before the recorder and well before the first entry cycle: a halt left
+    # over from yesterday's daily loss limit must be gone by the time the
+    # cycle asks whether it may trade. See `reset_daily_loss_halt` — this
+    # clears ONLY that one halt, never a breaker that needs a human.
+    scheduler.add_job(
+        reset_daily_loss_halt,
+        args=[session_factory],
+        trigger=CronTrigger(hour=9, minute=5, day_of_week="mon-fri", timezone=IST),
+        id="daily_loss_halt_reset",
         replace_existing=True,
     )
     scheduler.add_job(

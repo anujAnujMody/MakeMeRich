@@ -18,6 +18,14 @@ meaningful alongside the trial count it was computed against. The two are
 therefore stored together and surfaced together — a deflated score without
 its N is exactly as misleading as a raw one, because the reader cannot tell
 whether it was discounted for 2 trials or 200.
+
+The same rule now applies to money. `net_pnl_paise` travels with the capital
+it was earned on, with the count of signals that were unaffordable, and with
+whether a breaker ended the run early — because a rupee P&L shorn of those is
+the most misleading number this file could publish. Measured 2026-08-04: ORB
+on Rs 30,000 reports -Rs 6,058 over what looks like 636 sessions, but the
+drawdown breaker had stopped it after 17, and 117 of its signals were never
+affordable. The P&L alone tells none of that.
 """
 
 from __future__ import annotations
@@ -59,6 +67,40 @@ class StoredResult:
     strikes_out_of_the_money: int
     run_id: str
     measured_at: str
+    # --- Money. Everything above this line is unit-free ------------------
+    #
+    # Added 2026-08-04. Until then this type was structurally incapable of
+    # carrying a rupee figure, so the Strategies page could only ever show
+    # `mean_r`/`deflated` — research scores that cannot answer "how much
+    # would this have made". Every field below defaults, so results stored
+    # under the older shape still load rather than being dropped by
+    # `load_results`' shape guard.
+    #
+    #: Total realized net P&L over the run.
+    net_pnl_paise: int = 0
+    #: What it was sized against. Stored WITH the P&L because a rupee figure
+    #: alone is unreadable: -Rs 6,000 is a fifth of a Rs 30,000 account and a
+    #: rounding error on a Rs 30,00,000 one.
+    capital_paise: int = 0
+    #: `capital_paise + net_pnl_paise` at the point the run ended.
+    final_equity_paise: int = 0
+    # --- What the strategy was NOT allowed to do -------------------------
+    #
+    # Per `honest-metrics`: a rupee P&L that hides how many signals were
+    # rejected, or that the run was halted early, overstates what the
+    # strategy did. These travel WITH the money figure, never separately.
+    #
+    #: Labelled signals `size_position` could not afford at `capital_paise`.
+    unaffordable: int = 0
+    #: Days cut short by the daily loss limit.
+    halted_days: int = 0
+    #: Days cut short by the consecutive-loss standdown.
+    standdown_days: int = 0
+    #: Whether the max-drawdown breaker (or an account wipe-out) ended the
+    #: run before `last_day`. When True, the P&L above describes a SHORTER
+    #: period than the date range suggests — the single most misleading way
+    #: to read this row, hence a first-class field rather than a footnote.
+    drawdown_halted: bool = False
 
     @property
     def beats_luck(self) -> bool:
@@ -103,6 +145,13 @@ def save_results(
             strikes_out_of_the_money=strikes_out_of_the_money,
             run_id=run_id,
             measured_at=stamp,
+            net_pnl_paise=r.net_pnl_paise,
+            capital_paise=r.capital_paise,
+            final_equity_paise=r.final_equity_paise,
+            unaffordable=r.unaffordable,
+            halted_days=r.halted_days,
+            standdown_days=r.standdown_days,
+            drawdown_halted=r.drawdown_halted,
         )
         for r in results
     ]

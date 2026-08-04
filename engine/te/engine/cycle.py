@@ -37,7 +37,7 @@ from te.domain.money import Paise
 from te.domain.orders import OrderRequest
 from te.domain.pnl import GrossPnl, mark_to_market_pnl, net_pnl
 from te.domain.signal import ExitPlan, Signal
-from te.engine.contract import ContractResolver, OptionContractResolver
+from te.engine.contract import ContractResolver, OptionContractResolver, ResolvedContract
 from te.engine.exits import (
     DEFAULT_MAX_MARK_JUMP_PCT,
     OpenPosition,
@@ -46,6 +46,7 @@ from te.engine.exits import (
     time_exit,
 )
 from te.engine.state import PIPELINE_STAGE_KEYS, PipelineStageTiming, set_last_cycle_pipeline
+from te.execution.halt import is_halted, set_halt
 from te.execution.manager import ExecutionManager
 from te.ml.gates import MLHook, MLInfluence
 from te.persistence.db import session_scope
@@ -530,6 +531,10 @@ def run_entry_cycle(
         #: there is no contract resolver at all, i.e. the symbol is already
         #: an option). Nothing is capped in that case — see the guard below.
         freeze_qty = 0
+        #: Pre-bound alongside the other per-instrument defaults above: the
+        #: index-fallback path (no resolver) never assigns it, and the order
+        #: built below reads it for the arrival bid/ask.
+        contract: ResolvedContract | None = None
         if contract_resolver is not None:
             _tc = time.perf_counter()
             contract = contract_resolver(instrument, signal.direction, as_of)
@@ -659,6 +664,13 @@ def run_entry_cycle(
             quantity=lot_size * lots,
             order_type="LIMIT",
             limit_price=entry_premium,
+            # The real two-sided market this contract was resolved at, so
+            # the fill can later be measured against where the market
+            # actually was — not against our own limit, which would score a
+            # genuine price move as bad execution. `contract` is None only
+            # on the index-fallback path, which has no quote to record.
+            arrival_bid=contract.bid if contract is not None else None,
+            arrival_ask=contract.ask if contract is not None else None,
         )
         client_order_id = execution.submit(request)
 
@@ -777,14 +789,60 @@ def run_exit_cycle(
                 # Never priced since it opened, so not even a stale mark
                 # exists. There is nothing honest to act on: acting on the
                 # entry premium is what made stops undetectable in the first
-                # place. Leave it open and make the gap visible.
-                logger.error("open position has never been priced; exits cannot be evaluated", symbol=row.symbol)
-                record_risk_event(
-                    session,
-                    kind="position_unpriceable",
-                    ts=as_of,
-                    detail=f"{row.symbol}: no quote, no bar and no previous mark — exits not evaluated",
-                )
+                # place, and inventing an exit price here would book a
+                # fabricated P&L into the trade record — the one thing this
+                # engine must never do.
+                #
+                # So the price is still not fabricated. What changed on
+                # 2026-08-04 is what happens NEXT. Previously this branch
+                # just `continue`d, which skipped `time_exit` as well — so
+                # the 15:15 hard exit and the max-hold never fired for an
+                # unpriceable position and it stayed open indefinitely,
+                # carrying real exposure, with only a log line to show for
+                # it. An intraday engine silently holding a position
+                # overnight is a worse failure than the pricing gap itself.
+                #
+                # Past the hard-exit time it therefore stops being a
+                # data-quality note and becomes an operator emergency: HALT.
+                # Note the hard exit still does NOT fire for this position —
+                # there is no honest price to close it at. Escalating to a
+                # human IS the resolution, not a step towards an automatic
+                # one. The position stays open until someone squares it off
+                # with the broker directly.
+                # which blocks all new entries while leaving exits running,
+                # and requires a human to clear. Squaring off automatically
+                # is deliberately NOT done — in paper mode the simulated
+                # broker needs a price to fill against, which is precisely
+                # what we do not have, so an "automatic square-off" would
+                # just be the fabricated price wearing a different hat.
+                past_hard_exit = as_of.astimezone(IST).timetz().replace(tzinfo=None) >= position.exit_plan.hard_exit_by
+                # Once, not once per cycle. Nothing here closes the position,
+                # so without this guard every subsequent cycle re-halted and
+                # wrote another risk event — an operator who cleared the halt
+                # was re-halted seconds later, and `risk_events` grew a row
+                # per cycle for as long as the row stayed open. Caught in
+                # review 2026-08-05.
+                if past_hard_exit and is_halted(session):
+                    continue
+                if past_hard_exit:
+                    reason = (
+                        f"{row.symbol}: still unpriceable at {position.exit_plan.hard_exit_by} — the hard exit "
+                        f"cannot fire, so this position is open past its intended close with no way to "
+                        f"value it. Square it off with the broker directly, then clear this halt."
+                    )
+                    logger.error("unpriceable position past its hard exit; halting", symbol=row.symbol)
+                    record_risk_event(session, kind="position_unpriceable_past_hard_exit", ts=as_of, detail=reason)
+                    # No `kind=DAILY_LOSS_HALT`: this must NOT clear itself
+                    # overnight. It is exactly the case a human has to see.
+                    set_halt(session, reason)
+                else:
+                    logger.error("open position has never been priced; exits cannot be evaluated", symbol=row.symbol)
+                    record_risk_event(
+                        session,
+                        kind="position_unpriceable",
+                        ts=as_of,
+                        detail=f"{row.symbol}: no quote, no bar and no previous mark — exits not evaluated",
+                    )
                 continue
 
             if decision is None:
