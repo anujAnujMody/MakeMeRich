@@ -188,3 +188,87 @@ def test_rejects_a_csv_whose_ticker_contradicts_its_filename(tmp_path: Path, sto
 def test_available_option_symbols_is_empty_for_an_unloaded_base(archive: Path, store: BarStore) -> None:
     load_option_history(archive, store)
     assert available_option_symbols(store, "BANKNIFTY") == []
+
+
+def _csv_with_untraded_prefix(ticker: str, day: dt.date, *, untraded: int, traded: int) -> str:
+    """The real BANKNIFTY archive shape: the file opens with placeholder rows
+    for minutes the contract had not yet traded — every price column AND
+    Volume are blank, OI is published as 0 — then real bars follow."""
+    lines = [HEADER]
+    base = dt.datetime(day.year, day.month, day.day, 9, 15)
+    for i in range(untraded):
+        stamp = base + dt.timedelta(minutes=i)
+        lines.append(f"{day.isoformat()},{stamp.strftime('%d-%m-%Y %H:%M:%S')},,,,,,0,{ticker}")
+    for i in range(traded):
+        stamp = base + dt.timedelta(minutes=untraded + i)
+        lines.append(
+            f"{day.isoformat()},{stamp.strftime('%d-%m-%Y %H:%M:%S')},"
+            f"{100 + i}.0,{102 + i}.0,{99 + i}.0,{101 + i}.0,{500 + i},{1000 + i},{ticker}"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def test_minutes_the_contract_never_traded_are_dropped_not_zero_filled(tmp_path: Path, store: BarStore) -> None:
+    """The BANKNIFTY archive carries a row per session minute whether or not
+    the contract traded, and an untraded minute is blank in every price
+    column and in Volume. Loading it used to die inside pandas'
+    `astype("int64")` with no file name and no row count.
+
+    They must be DROPPED. Filling `v=0` would manufacture a bar with no
+    prices, and would additionally feed ORB's volume-confirmation average —
+    silently dragging the threshold down with minutes that never traded.
+    """
+    inner = _inner_zip(
+        {
+            "20260428/55000CE_20260428.csv": _csv_with_untraded_prefix(
+                "BANKNIFTY28APR26C55000", dt.date(2026, 4, 21), untraded=61, traded=3
+            )
+        }
+    )
+    archive = _archive(tmp_path / "banknifty_all.zip", {"20260428.zip": inner})
+
+    result = load_option_history(archive, store)
+
+    assert result.bars_written == 3, "the 61 untraded minutes were written instead of dropped"
+    frame = store.read(
+        symbol="BANKNIFTY28APR2655000CE",
+        start=dt.datetime(2026, 4, 1, tzinfo=dt.UTC),
+        end=dt.datetime(2026, 5, 1, tzinfo=dt.UTC),
+        interval="1m",
+    )
+    assert len(frame) == 3
+    assert (frame["v"] > 0).all(), "a zero-volume placeholder bar reached the store"
+
+
+def test_a_contract_that_never_traded_at_all_loads_as_empty(tmp_path: Path, store: BarStore) -> None:
+    """The degenerate case of the above — every row a placeholder. Must
+    produce no bars rather than raising, since a strike listed but never
+    traded is ordinary."""
+    inner = _inner_zip(
+        {
+            "20260428/99000CE_20260428.csv": _csv_with_untraded_prefix(
+                "BANKNIFTY28APR26C99000", dt.date(2026, 4, 21), untraded=5, traded=0
+            )
+        }
+    )
+    archive = _archive(tmp_path / "banknifty_all.zip", {"20260428.zip": inner})
+
+    result = load_option_history(archive, store)
+
+    assert result.bars_written == 0
+
+
+def test_a_priced_bar_missing_volume_is_refused_by_name(tmp_path: Path, store: BarStore) -> None:
+    """The boundary check. A row with real OHLC and no Volume is UNKNOWN
+    data, not an absent trade — so it must fail loudly, naming the file and
+    the column, instead of being dropped as a placeholder or filled with a
+    number indistinguishable from a real one downstream."""
+    rows = [
+        HEADER,
+        "2026-04-21,21-04-2026 10:15:00,100.0,102.0,99.0,101.0,,1000,BANKNIFTY28APR26C55000",
+    ]
+    inner = _inner_zip({"20260428/55000CE_20260428.csv": "\n".join(rows) + "\n"})
+    archive = _archive(tmp_path / "banknifty_all.zip", {"20260428.zip": inner})
+
+    with pytest.raises(ValueError, match="have no Volume"):
+        load_option_history(archive, store)

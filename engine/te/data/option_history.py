@@ -173,6 +173,50 @@ def _contract_frame(raw: pd.DataFrame, *, csv_name: str, interval_span: dt.timed
         raise ValueError(f"{csv_name}: ticker {parsed.symbol!r} disagrees with the file name ({from_name})")
 
     symbol = build_option_symbol(parsed.base, parsed.expiry, parsed.strike, parsed.option_type)
+
+    # NO-TRADE PLACEHOLDER ROWS. The archive emits a row per minute of the
+    # session whether or not the contract traded, and an untraded minute
+    # carries NaN for all four prices AND for volume (OI is published as 0).
+    # Found in the BANKNIFTY archive, which the NIFTY one never exercised:
+    # 366 such rows out of 6,268,086, e.g. 61 consecutive minutes from
+    # 14:29 on 2026-04-21 on `BANKNIFTY28APR26C55000` before that contract
+    # first traded.
+    #
+    # Dropped, not filled. `v=0` would manufacture a bar with no prices —
+    # `astype("int64")` is what raised on it, which is the schema refusing
+    # to store a bar that does not exist. A zero-volume bar would also feed
+    # ORB's volume-confirmation average and quietly drag it down.
+    #
+    # Volume is only tolerated as missing when the PRICES are missing too.
+    # A row with real OHLC and no volume would be a genuinely unknown
+    # quantity rather than an absent trade, and is left to raise below
+    # rather than guessed at.
+    priced = raw.dropna(subset=["Open", "High", "Low", "Close"])
+    if priced.empty:
+        return symbol, pd.DataFrame(columns=list(BAR_COLUMNS))
+    raw = priced
+
+    # VALIDATE AT THE INGESTION BOUNDARY, loudly and by name.
+    #
+    # Before this, a supplier file with an unexpected NaN surfaced as
+    # `IntCastingNaNError: Cannot convert non-finite values` thrown from
+    # inside pandas' astype machinery — no file name, no column, no row
+    # count, and a traceback that pointed at pandas rather than at the data.
+    # Diagnosing it meant unzipping the archive by hand.
+    #
+    # Anything still missing here is NOT a no-trade minute (those are gone
+    # above), so it is genuinely unknown data. Refuse it, and say exactly
+    # which file and column, rather than guessing a value that would be
+    # indistinguishable from a real one downstream.
+    for column in ("Volume", "OI"):
+        missing = int(raw[column].isna().sum())
+        if missing:
+            raise ValueError(
+                f"{csv_name}: {missing} of {len(raw)} priced rows have no {column}. "
+                f"A bar with real OHLC and no {column} is unknown data, not an absent "
+                f"trade — refusing rather than substituting a value."
+            )
+
     event_ts = pd.to_datetime(raw["Timestamp"], format=_TIMESTAMP_FORMAT).dt.tz_localize(IST).dt.tz_convert("UTC")
 
     frame = pd.DataFrame(
