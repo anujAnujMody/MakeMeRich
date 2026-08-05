@@ -183,21 +183,39 @@ class Settings(BaseSettings):
     #: Stop/target as a % of the OPTION premium. These take priority over the
     #: absolute `*_distance_paise` values above, which are index-point-scaled
     #: leftovers and mean different things at different premium levels.
-    #: 8%, tightened from 20% on 2026-08-05 for AFFORDABILITY, not for edge.
-    #: Measured the same morning against the real chain: on Rs 30,000 a 20%
-    #: stop on a next-weekly NIFTY ATM (Rs 152.60, lot 65) risks Rs 1,984
-    #: against a 3%-of-capital budget of Rs 900, so `size_position` rejected
-    #: every signal on every day EXCEPT NIFTY's own expiry day, when the ATM
-    #: premium collapses to ~Rs 16. The engine was structurally limited to
-    #: roughly one tradeable day a week and nothing said so.
+    #: REVERTED to 20% the same day it was set to 8% (2026-08-05), because
+    #: 8% failed in live paper trading within eleven minutes.
     #:
-    #: 8% is the value that clears it — 10% still rejects the next-weekly
-    #: NIFTY ATM at 3% risk. This is affordable to trade, not measured to be
-    #: better: the 2026-08-05 parameter sweep put stop size firmly in the
-    #: noise (8% -Rs 1,159/day, 10% -Rs 1,035, 15% -Rs 1,278, 20% -Rs 1,157
-    #: averaged over every other knob), which is precisely why it is safe to
-    #: set on affordability grounds.
-    paper_cycle_stop_pct: Decimal | None = Decimal(8)
+    #: The morning's reasoning was affordability: a 20% stop on a
+    #: next-weekly NIFTY ATM risks more than 3% of Rs 30,000, so most
+    #: signals were rejected. 8% fixed that. What it also did was put the
+    #: stop INSIDE the premium's ordinary noise band — an index option
+    #: moves 8% without the underlying doing anything meaningful. Both of
+    #: the day's first two trades were stopped out almost immediately:
+    #:
+    #:   NIFTY11AUG2624550PE  entry 124.65 -> stop 114.25  -Rs   741  2 min
+    #:   NIFTY11AUG2624600PE  entry 138.10 -> stop 122.05  -Rs 1,110  4 min
+    #:
+    #: Backtested the same morning on the recorded NIFTY history, one knob
+    #: at a time from the old baseline, all at Rs 30,000 with compounding:
+    #:
+    #:   stop20 risk1.5 cap25   38 trades   -Rs   378/day
+    #:   stop20 risk1.5 cap50   38 trades   -Rs   378/day   (cap alone: no effect)
+    #:   stop20 risk3   cap25   40 trades   -Rs   310/day
+    #:   stop 8 risk1.5 cap25   43 trades   -Rs   407/day
+    #:   stop 8 risk3   cap50   11 trades   -Rs 1,502/day   <- what shipped
+    #:
+    #: Neither change is harmful alone; together they are. Every row still
+    #: ends at the 20% drawdown breaker — the geometry does not decide
+    #: WHETHER this loses, only how fast. 8% with 3% risk got there in 11
+    #: trades instead of 38.
+    #:
+    #: The affordability problem is real and is NOT solved by this revert —
+    #: it is solved by sizing off live equity (see `te.engine.cycle`) and,
+    #: properly, by strike selection that picks a contract the account can
+    #: actually carry. Tightening the stop to buy affordability was treating
+    #: a sizing problem with a risk-geometry knob.
+    paper_cycle_stop_pct: Decimal | None = Decimal(20)
     #: 1:1 with the stop. Measured, not chosen: a barrier sweep over 1,192
     #: labelled firings on NIFTY and SENSEX (2026-04-01 onward) found
     #: expectancy strictly monotonic in the reward:risk ratio, on BOTH
@@ -219,11 +237,10 @@ class Settings(BaseSettings):
     #: under pure noise, i.e. indistinguishable from having tried six things.
     #: 1:1 is also the tightest ratio tested, so this is the edge of the
     #: grid rather than a located optimum.
-    #: Moved 20% -> 8% with the stop on 2026-08-05, to KEEP the 1:1 ratio the
-    #: table above measured. The ratio is the finding here, not the absolute
-    #: size — leaving the target at 20% against an 8% stop would have made it
-    #: 2.5:1 silently, which is past the worst ratio in that grid.
-    paper_cycle_target_pct: Decimal | None = Decimal(8)
+    #: Moves WITH the stop, to keep the 1:1 ratio the table above measured.
+    #: The ratio is the finding, not the absolute size — so this went 20 ->
+    #: 8 and back to 20 alongside `paper_cycle_stop_pct`, never on its own.
+    paper_cycle_target_pct: Decimal | None = Decimal(20)
     #: Trailing distance as a % of entry premium. 15% sits between the 20%
     #: stop and the 40% target: it only starts binding once the trade is
     #: meaningfully in profit, rather than clipping winners in the first

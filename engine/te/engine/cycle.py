@@ -348,6 +348,9 @@ def run_entry_cycle(
     # block a later instrument in the same cycle.
     portfolio_blocked_reason: str | None = None
     throttled = False
+    # What the account is ACTUALLY worth for sizing purposes. Falls back to
+    # the configured capital only if the risk block below cannot run.
+    sizing_equity = config.capital
     _t0 = time.perf_counter()
     with session_scope(session_factory) as session:
         try:
@@ -355,7 +358,23 @@ def run_entry_cycle(
             unrealized = unrealized_pnl_paise(
                 session, store=store, cost_model=cost_model, as_of=as_of, current_premium=current_premium
             )
-            equity = Paise(int(config.capital) + int(total_net_pnl_paise(session)) + int(unrealized))
+            realized = total_net_pnl_paise(session)
+            # SIZING equity is realized-only, deliberately — while `equity`
+            # below (for the drawdown breaker) also carries `unrealized`.
+            #
+            # The two want different things. The breaker asks "how far is
+            # the account below its peak RIGHT NOW", which has to include
+            # open positions or a large unrealized loss would be invisible
+            # to it. Sizing asks "what can I actually stake on the next
+            # trade", and marking that to an open position's minute-by-minute
+            # paper profit would resize every new entry off a number that
+            # has not settled and can reverse before it does.
+            #
+            # `max(0, ...)`: a wiped-out account must size to zero lots and
+            # be REJECTED by `size_position` with a real reason, never wrap
+            # into a negative budget.
+            sizing_equity = Paise(max(0, int(config.capital) + int(realized)))
+            equity = Paise(int(config.capital) + int(realized) + int(unrealized))
             check_daily_loss_limit(
                 session, config.risk_limits, on=as_of.date(), now=as_of, unrealized_pnl_paise=unrealized
             )
@@ -562,7 +581,27 @@ def run_entry_cycle(
         stop_premium, target_premium = levels.stop, levels.target
 
         sizing = size_position(
-            capital=config.capital,
+            # LIVE equity, not the static configured capital. Until
+            # 2026-08-05 this passed `config.capital`, which meant the
+            # engine sized every trade off the number a human last typed
+            # into the dashboard and never off what the account was really
+            # worth — while the drawdown breaker three hundred lines up was
+            # already computing the true figure and using it.
+            #
+            # Both directions were wrong, and the losing one is the
+            # dangerous one: after dropping from Rs 30,000 to Rs 25,000 the
+            # engine kept risking 3% of THIRTY thousand, so the real risk
+            # per trade silently grew from 3% to 3.6% exactly while the
+            # account was shrinking. That is how a drawdown accelerates into
+            # a wipe-out. Profits were mirror-imaged: they never raised
+            # buying power, so the account could not compound.
+            #
+            # It also made every backtest in this repo optimistic about the
+            # live engine rather than pessimistic: `run_many`/`sweep.replay`
+            # take `compound_equity=True` and DO re-size off running equity,
+            # so measured results assumed a discipline production did not
+            # have.
+            capital=sizing_equity,
             risk_budget_pct=config.risk_budget_pct,
             premium=entry_premium,
             stop_premium=stop_premium,
