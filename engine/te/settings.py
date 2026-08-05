@@ -183,7 +183,21 @@ class Settings(BaseSettings):
     #: Stop/target as a % of the OPTION premium. These take priority over the
     #: absolute `*_distance_paise` values above, which are index-point-scaled
     #: leftovers and mean different things at different premium levels.
-    paper_cycle_stop_pct: Decimal | None = Decimal(20)
+    #: 8%, tightened from 20% on 2026-08-05 for AFFORDABILITY, not for edge.
+    #: Measured the same morning against the real chain: on Rs 30,000 a 20%
+    #: stop on a next-weekly NIFTY ATM (Rs 152.60, lot 65) risks Rs 1,984
+    #: against a 3%-of-capital budget of Rs 900, so `size_position` rejected
+    #: every signal on every day EXCEPT NIFTY's own expiry day, when the ATM
+    #: premium collapses to ~Rs 16. The engine was structurally limited to
+    #: roughly one tradeable day a week and nothing said so.
+    #:
+    #: 8% is the value that clears it — 10% still rejects the next-weekly
+    #: NIFTY ATM at 3% risk. This is affordable to trade, not measured to be
+    #: better: the 2026-08-05 parameter sweep put stop size firmly in the
+    #: noise (8% -Rs 1,159/day, 10% -Rs 1,035, 15% -Rs 1,278, 20% -Rs 1,157
+    #: averaged over every other knob), which is precisely why it is safe to
+    #: set on affordability grounds.
+    paper_cycle_stop_pct: Decimal | None = Decimal(8)
     #: 1:1 with the stop. Measured, not chosen: a barrier sweep over 1,192
     #: labelled firings on NIFTY and SENSEX (2026-04-01 onward) found
     #: expectancy strictly monotonic in the reward:risk ratio, on BOTH
@@ -205,7 +219,11 @@ class Settings(BaseSettings):
     #: under pure noise, i.e. indistinguishable from having tried six things.
     #: 1:1 is also the tightest ratio tested, so this is the edge of the
     #: grid rather than a located optimum.
-    paper_cycle_target_pct: Decimal | None = Decimal(20)
+    #: Moved 20% -> 8% with the stop on 2026-08-05, to KEEP the 1:1 ratio the
+    #: table above measured. The ratio is the finding here, not the absolute
+    #: size — leaving the target at 20% against an 8% stop would have made it
+    #: 2.5:1 silently, which is past the worst ratio in that grid.
+    paper_cycle_target_pct: Decimal | None = Decimal(8)
     #: Trailing distance as a % of entry premium. 15% sits between the 20%
     #: stop and the 40% target: it only starts binding once the trade is
     #: meaningfully in profit, rather than clipping winners in the first
@@ -241,8 +259,23 @@ class Settings(BaseSettings):
     #: expectancy, and does not fix the underlying strategy's slightly
     #: negative edge. `None` disables the rule (must be set together with
     #: `paper_cycle_profit_lock_buffer_pct`).
-    paper_cycle_profit_lock_activation_pct: Decimal | None = Decimal(15)
-    paper_cycle_profit_lock_buffer_pct: Decimal | None = Decimal(5)
+    #: DISABLED 2026-08-05, and the reason matters more than the value.
+    #:
+    #: It was +15% against a 20% target. When stop/target moved to 8%/8% for
+    #: affordability, +15% became UNREACHABLE — the target fires at +8%, so
+    #: the lock could never activate. Left at 15 it would have been a rule
+    #: that reads as enabled, is displayed as enabled, and can never fire
+    #: once; that is exactly the kind of thing `honest-metrics` exists to
+    #: refuse.
+    #:
+    #: Not simply rescaled to +5%/2%, because the 15%/5% pair is not an
+    #: arbitrary shape — it is what was backtested against 1,305 real NIFTY
+    #: ORB trades. Scaled-down numbers have never been measured, and
+    #: shipping them would quietly claim that study's result for a rule it
+    #: never tested. Re-enable only after re-running that backtest at the
+    #: new geometry.
+    paper_cycle_profit_lock_activation_pct: Decimal | None = None
+    paper_cycle_profit_lock_buffer_pct: Decimal | None = None
     #: Reject a resolved contract whose bid-ask spread exceeds this % of LTP.
     #: Live NIFTY chain (2026-07-31) runs 0.1-0.4% through OTM5 and widens to
     #: ~1.1% by OTM8, so 1.0% admits the liquid band and excludes the rest.

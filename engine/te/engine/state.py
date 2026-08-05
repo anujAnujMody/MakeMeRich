@@ -101,7 +101,18 @@ MAX_RISK_PER_TRADE_PCT = Decimal(5)
 #: round number that would quietly permit Rs 3,000.
 MAX_DAILY_LOSS_PCT_OF_CAPITAL = Decimal(7)
 MAX_DRAWDOWN_PCT_CEILING = Decimal(20)
-MAX_POSITION_SIZE_PCT_CEILING = Decimal(25)
+#: 50, raised from 25 on 2026-08-05 by the owner, for the same affordability
+#: reason as the risk ceiling above and measured the same morning: one
+#: next-weekly NIFTY ATM lot costs ~Rs 9,919, and 25% of Rs 30,000 is
+#: Rs 7,500 — so the cap alone rejected every non-expiry-day signal even
+#: after the stop was tightened. Both constraints had to move; fixing either
+#: one on its own changed nothing.
+#:
+#: The cost is real and is not hidden: at 50% a single position can hold half
+#: the account. On Rs 30,000 that is what buying ONE index-option lot means —
+#: the lot is indivisible, so the alternative is not a smaller position, it is
+#: no position at all.
+MAX_POSITION_SIZE_PCT_CEILING = Decimal(50)
 
 
 def _daily_loss_ceiling(capital: Paise) -> Paise:
