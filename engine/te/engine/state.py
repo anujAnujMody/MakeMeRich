@@ -216,6 +216,41 @@ def _read_decimal(session: Session, key: str, default: Decimal) -> Decimal:
         return default
 
 
+_LAST_BROKER_RELOGIN_DAY_KEY = "last_broker_relogin_day"
+
+
+def get_last_broker_relogin_day(session: Session) -> dt.date | None:
+    """The IST date of the last SUCCESSFUL Angel/OpenAlgo relogin, or `None`
+    if there has never been one.
+
+    Exists so a mid-morning engine restart can tell "today's login already
+    happened" from "today's login was missed", which is the difference
+    between a harmless no-op and a session where every quote returns HTTP
+    500. A cron trigger cannot answer that: `BackgroundScheduler` has no
+    memory across processes, so after a restart it neither knows the job
+    already ran nor that it did not.
+
+    A DATE, not a timestamp. The broker session expires nightly, so "has
+    today's login happened" is the only question worth asking, and storing a
+    time would invite a staleness rule nobody has measured.
+
+    Unparseable values read as `None` — the same lenient convention as the
+    other readers here. The cost of re-running a login is one extra request;
+    the cost of skipping one is the whole trading day.
+    """
+    row = session.get(EngineState, _LAST_BROKER_RELOGIN_DAY_KEY)
+    if row is None or not row.value:
+        return None
+    try:
+        return dt.date.fromisoformat(row.value)
+    except ValueError:
+        return None
+
+
+def set_last_broker_relogin_day(session: Session, day: dt.date) -> None:
+    upsert_engine_state(session, _LAST_BROKER_RELOGIN_DAY_KEY, day.isoformat())
+
+
 _PEAK_EQUITY_PAISE_KEY = "peak_equity_paise"
 
 

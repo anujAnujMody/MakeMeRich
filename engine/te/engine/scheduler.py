@@ -21,12 +21,17 @@ the end of those phases (nothing previously called `te.engine.cycle`'s
   sizes/expiries are current before the session's first bar.
 - OpenAlgo relogin: 08:40 IST daily, before instrument sync — Angel expires
   its broker session nightly (a real Angel-platform behaviour, not an
-  OpenAlgo bug); see `te.broker.openalgo_login`. Deliberately NOT retried on
-  every process restart the way the WS recorder catch-up is — a login
-  replays real credentials against the live broker, so re-running it on
-  every `--reload` during backend dev work would hit Angel's own rate
-  limiter for no reason. `POST /api/engine/relogin-broker` covers the
-  same-day ad-hoc case (e.g. recovering from an unplanned outage) instead.
+  OpenAlgo bug); see `te.broker.openalgo_login`. It IS retried on process
+  restart, the way the WS recorder catch-up is — see `relogin_catchup_due`.
+  This paragraph used to say the opposite, on the grounds that a login
+  replays real credentials and a dev `--reload` loop would hit Angel's rate
+  limiter. That objection was right about the mechanism and wrong about the
+  conclusion: on 2026-08-05 the 08:40 cron did not fire, every quote
+  returned HTTP 500 "Failed to fetch LTP" through the pre-open, and recovery
+  needed a hand-run `POST /api/engine/relogin-broker` at 08:55. Recording
+  the date of the last SUCCESSFUL login removes the objection instead of
+  accepting it — the second and every later restart on the same day is a
+  no-op. That endpoint still covers the ad-hoc case.
 - paper cycle: every `Settings.paper_cycle_interval_minutes` (default 1,
   matching this intraday ORB strategy), during `te.domain.clock`'s session
   window, calls `run_entry_cycle`/`run_exit_cycle` — see
@@ -51,6 +56,7 @@ import structlog
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from sqlalchemy import Engine
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
 from te.broker.instrument_sync import fetch_instruments, sync_instruments
@@ -81,12 +87,14 @@ from te.engine.contract import UNDERLYING_INDEX_EXCHANGES, ContractResolver, Opt
 from te.engine.cycle import CycleConfig, InstrumentConfig, run_entry_cycle, run_exit_cycle
 from te.engine.state import (
     get_capital_set_at,
+    get_last_broker_relogin_day,
     get_guardrails,
     get_instrument_selections,
     get_mode,
     get_run_state,
     guardrails_defaults_from_settings,
     instrument_selections_defaults_from_settings,
+    set_last_broker_relogin_day,
 )
 from te.engine.trading_calendar import get_calendar, refresh_calendar
 from te.execution.halt import clear_daily_halt, halt_reason
@@ -576,12 +584,84 @@ def run_nightly_training_job(
     )
 
 
-def run_openalgo_relogin(settings: Settings) -> LoginResult:
+#: The relogin is due from its 08:40 cron time, and stays due until the
+#: session ends — a login at 11:00 still saves the rest of the day, and the
+#: alternative is every quote failing until someone notices by hand.
+_RELOGIN_WINDOW = SessionWindow(start=dt.time(8, 40), end=dt.time(15, 30))
+
+
+def relogin_is_overdue(now: dt.datetime, last_success: dt.date | None) -> bool:
+    """True when today's broker login is DUE and has not happened.
+
+    The catch-up check the FastAPI lifespan runs after `scheduler.start()`,
+    and the fix for a failure that already cost a live session: on
+    2026-08-05 the 08:40 cron did not fire, quotes returned HTTP 500 "Failed
+    to fetch LTP" all morning, and it took a hand-run `POST /api/engine/
+    relogin-broker` at 08:55 to recover. `should_start_recorder_now` above
+    exists for exactly the same reason, found on 2026-07-30 — a once-a-day
+    cron plus a process that restarts is a job that silently never runs.
+
+    Two distinct ways the cron loses:
+
+    * the process was not up at 08:40 (a redeploy, a crash, a laptop asleep),
+      so nothing fired and `BackgroundScheduler` will not revisit it until
+      tomorrow
+    * the scheduler was busy at 08:40 and APScheduler dropped the run as a
+      misfire — its default grace is one second
+
+    `last_success` is what keeps this from becoming the thing the original
+    design refused to build. The module docstring's objection to a
+    restart-triggered relogin was that a dev `--reload` loop would replay
+    real credentials against Angel's rate limiter on every reload; gating on
+    "a login already succeeded today" means the second and every later
+    restart is a no-op, so that objection no longer applies.
+    """
+    ist_now = now.astimezone(IST)
+    if ist_now.weekday() >= 5:  # no session, no broker to log in to
+        return False
+    if last_success == ist_now.date():
+        return False
+    return is_market_open(ist_now, _RELOGIN_WINDOW)
+
+
+def relogin_catchup_due(session_factory: sessionmaker[Session], now: dt.datetime) -> bool:
+    """`relogin_is_overdue`, with the stored last-success read for you and a
+    missing table treated as "do not act".
+
+    The lifespan runs before/independently of migrations, against a DB whose
+    tables the API's own `create_all` has not necessarily touched — the same
+    situation `te.engine.trading_calendar.get_calendar` documents and
+    handles. Reading a bookkeeping key must never stop the app booting.
+
+    Answering FALSE on an unreadable table is the safe direction, and not
+    merely the convenient one: if `engine_state` cannot be read then success
+    cannot be WRITTEN either, so a login fired here would be un-recordable
+    and would therefore fire again on the very next restart. That is the
+    credential-replay loop this whole design is built to avoid. The 08:40
+    cron still covers the normal case.
+    """
+    try:
+        with session_factory() as session:
+            last_success = get_last_broker_relogin_day(session)
+    except OperationalError:
+        logger.warning("engine_state is not queryable yet — skipping the broker-relogin catch-up")
+        return False
+    return relogin_is_overdue(now, last_success)
+
+
+def run_openalgo_relogin(settings: Settings, session_factory: sessionmaker[Session] | None = None) -> LoginResult:
     """The daily OpenAlgo-app + Angel-broker relogin (see
     `te.broker.openalgo_login`). Returns a `LoginResult` rather than raising
     — matches `_run_instrument_sync`'s isolated-failure convention, and lets
     `POST /api/engine/relogin-broker` (the ad-hoc same-day trigger) report
-    the real reason back to the caller instead of a bare 500."""
+    the real reason back to the caller instead of a bare 500.
+
+    `session_factory` is optional so every existing caller and test keeps
+    working untouched; when given, a SUCCESSFUL login stamps today's date via
+    `set_last_broker_relogin_day`, which is what `relogin_is_overdue` reads.
+    Only success is recorded — a failed attempt must leave the job still due,
+    or one transport error would suppress every retry for the rest of the
+    day."""
     app_username = settings.openalgo_app_username
     app_password = settings.openalgo_app_password
     angel_client_id = settings.angel_client_id
@@ -611,6 +691,9 @@ def run_openalgo_relogin(settings: Settings) -> LoginResult:
 
     if result.ok:
         logger.info("openalgo relogin succeeded")
+        if session_factory is not None:
+            with session_scope(session_factory) as session:
+                set_last_broker_relogin_day(session, dt.datetime.now(IST).date())
     else:
         logger.warning("openalgo relogin failed", stage=result.stage, message=result.message)
     return result
@@ -1094,10 +1177,17 @@ def build_scheduler(
     scheduler = BackgroundScheduler(timezone=IST)
     scheduler.add_job(
         run_openalgo_relogin,
-        args=[settings],
+        args=[settings, session_factory],
         trigger=CronTrigger(hour=8, minute=40, day_of_week="mon-fri", timezone=IST),
         id="openalgo_relogin",
         replace_existing=True,
+        # APScheduler's default grace is ONE SECOND: if the scheduler thread
+        # is busy at 08:40 the run is dropped and not revisited until
+        # tomorrow. That is one of the two ways 2026-08-05's login was lost.
+        # 25 minutes keeps a late fire useful (instrument sync is 09:05) and
+        # still refuses one so late it would race the session.
+        misfire_grace_time=25 * 60,
+        coalesce=True,
     )
     # Before the recorder and well before the first entry cycle: a halt left
     # over from yesterday's daily loss limit must be gone by the time the
