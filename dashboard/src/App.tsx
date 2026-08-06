@@ -1,6 +1,17 @@
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { ErrorBoundary } from '@/components/ErrorBoundary'
 import { Layout } from '@/components/layout'
+
+import { DashboardHome } from '@/pages/DashboardHome'
+import { ApprovePage } from '@/pages/ApprovePage'
+import { StrategiesPage } from '@/pages/StrategiesPage'
+import { TradesPage } from '@/pages/TradesPage'
+import { PerformancePage } from '@/pages/PerformancePage'
+import { JournalPage } from '@/pages/JournalPage'
+import { OpsPage } from '@/pages/OpsPage'
+import { LearningPage } from '@/pages/LearningPage'
+import { SettingsPage } from '@/pages/SettingsPage'
 
 const queryClient = new QueryClient()
 
@@ -9,13 +20,16 @@ function App() {
     <QueryClientProvider client={queryClient}>
       <BrowserRouter>
         <Routes>
-          <Route element={<Layout />}>
-            <Route path="/" element={<div className="p-6"><h1 className="text-2xl font-bold">Dashboard</h1></div>} />
-            <Route path="/strategies" element={<div className="p-6"><h1 className="text-2xl font-bold">Strategies</h1></div>} />
-            <Route path="/orders" element={<div className="p-6"><h1 className="text-2xl font-bold">Orders</h1></div>} />
-            <Route path="/positions" element={<div className="p-6"><h1 className="text-2xl font-bold">Positions</h1></div>} />
-            <Route path="/insights" element={<div className="p-6"><h1 className="text-2xl font-bold">Insights</h1></div>} />
-            <Route path="/learn" element={<div className="p-6"><h1 className="text-2xl font-bold">Learn</h1></div>} />
+          <Route element={<ErrorBoundary><Layout /></ErrorBoundary>}>
+            <Route path="/" element={<DashboardHome />} />
+            <Route path="/approve" element={<ApprovePage />} />
+            <Route path="/strategies" element={<StrategiesPage />} />
+            <Route path="/trades" element={<TradesPage />} />
+            <Route path="/performance" element={<PerformancePage />} />
+            <Route path="/journal" element={<JournalPage />} />
+            <Route path="/ops" element={<OpsPage />} />
+            <Route path="/learn" element={<LearningPage />} />
+            <Route path="/settings" element={<SettingsPage />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Route>
         </Routes>

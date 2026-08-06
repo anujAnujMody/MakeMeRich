@@ -102,6 +102,44 @@ export function GreetForm() {
 }
 ```
 
+### React 19: Ref as Prop (No `forwardRef`)
+
+In React 19, `forwardRef` is deprecated. `ref` is a regular prop — pass it directly.
+
+```tsx
+// ✅ React 19 — ref as prop, no forwardRef
+function MyInput({ placeholder, ...props }: React.ComponentProps<"input">) {
+  return <input placeholder={placeholder} {...props} />
+}
+
+// For Radix/wrapper components:
+function SelectTrigger({ className, children, ...props }: React.ComponentProps<typeof SelectPrimitive.Trigger>) {
+  return <SelectPrimitive.Trigger className={cn(...)} {...props}>{children}</SelectPrimitive.Trigger>
+}
+
+// With custom props + asChild (Slot):
+function Button({ className, variant, size, asChild = false, ...props }: React.ComponentProps<"button"> & { variant?: ... }) {
+  const Comp = asChild ? Slot : "button"
+  return <Comp className={cn(...)} {...props} />
+}
+```
+
+`ref` stays inside `props` and passes through via `{...props}`. No `forwardRef`, no `ref={ref}`, no `React.ElementRef` (use `React.ComponentProps` instead).
+
+Before (React 18 — deprecated):
+```tsx
+const Card = React.forwardRef<HTMLDivElement, React.HTMLAttributes<HTMLDivElement>>(
+  ({ className, ...props }, ref) => <div ref={ref} className={cn(...)} {...props} />
+)
+```
+
+After (React 19):
+```tsx
+function Card({ className, ...props }: React.ComponentProps<"div">) {
+  return <div className={cn(...)} {...props} />
+}
+```
+
 ### Custom Hook with Cleanup
 ```tsx
 import { useState, useEffect } from 'react';
@@ -131,6 +169,8 @@ function useWindowWidth(): number {
 - Use Suspense boundaries for async operations
 
 ### MUST NOT DO
+- Use `forwardRef` in React 19 code — `ref` is a regular prop now
+- Use `React.ElementRef` — use `React.ComponentProps<typeof Component>` instead
 - Mutate state directly
 - Use array index as key for dynamic lists
 - Create functions inside JSX (causes re-renders)
@@ -147,4 +187,4 @@ When implementing React features, provide:
 
 ## Knowledge Reference
 
-React 19, Server Components, use() hook, Suspense, TypeScript, TanStack Query, Zustand, Redux Toolkit, React Router, React Testing Library, Vitest/Jest, Next.js App Router, accessibility (WCAG)
+React 19, forwardRef deprecation, ref-as-prop pattern, React.ComponentProps, Server Components, use() hook, Suspense, TypeScript, TanStack Query, Zustand, Redux Toolkit, React Router, React Testing Library, Vitest/Jest, Next.js App Router, accessibility (WCAG)

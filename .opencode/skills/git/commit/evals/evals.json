@@ -1,0 +1,23 @@
+{
+  "skill_name": "git-commit",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "commit my changes",
+      "expected_output": "Shows git status table → auto-stages all (skipping .env, node_modules) → runs code-simplifier → runs 5-axis review → generates commit message → shows approval board → waits for Y before committing",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "commit only src/hooks/* and src/services/*.ts",
+      "expected_output": "Shows git status table → stages only matching paths (not full auto-stage) → runs simplify on those files → reviews them → generates message scoped to changed area → approval board",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "commit changes - includes a blocking security issue",
+      "expected_output": "Shows status → stages → simplifies → review finds blocking security issue → STOPS and reports → does NOT proceed to approval board until user overrides",
+      "files": []
+    }
+  ]
+}

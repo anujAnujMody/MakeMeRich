@@ -3,7 +3,38 @@ dist/
 .env
 .env.local
 *.log
+package-lock.json
 data/raw/
 __pycache__/
 *.pyc
 .venv/
+data/*.db
+.mypy_cache/
+# Contains the OpenAlgo API key (see Phase 0 report) — never commit.
+opencode.json
+
+# Personal/local overrides — see .claude skills' update-config guidance.
+.claude/settings.local.json
+
+# OpenAlgo runtime state (mounted volumes; regenerated on container start).
+db/
+log/
+
+# Python build/test artifacts.
+.pytest_cache/
+.coverage
+*.egg-info/
+
+# Leftover data/model artifacts from the pre-rewrite engine.
+# ANCHORED to the repo root. A bare `data/` matches a directory of that name
+# at ANY depth, which silently untracked all 16 modules of the `te.data`
+# SOURCE package — the bar store, the recorder, the bhavcopy ingest and the
+# point-in-time gate — for as long as this rule has existed. Found on
+# 2026-08-03 when a new function in `te/data/ingest_log.py` failed to show
+# up in `git status`. Keep the leading slash.
+/data/
+engine/data/
+
+# Bare-host dev engine's isolated dev DB/bar store (yarn dev:engine / dev:all)
+# — see engine/.env.
+engine/data-local/

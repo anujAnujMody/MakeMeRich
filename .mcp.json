@@ -1,0 +1,26 @@
+{
+  "mcpServers": {
+    "openalgo": {
+      "command": "docker",
+      "args": [
+        "exec",
+        "-i",
+        "trading-openalgo-1",
+        "/app/.venv/bin/python",
+        "/app/mcp/mcpserver.py",
+        "${OPENALGO_API_KEY}",
+        "http://127.0.0.1:5000"
+      ],
+      "_comment": "Point OPENALGO_API_KEY at a dry-run / analyzer-mode OpenAlgo instance only. This server exposes place_order/cancel_all_orders — never point it at a live-money instance. Set OPENALGO_API_KEY in your shell environment before launching Claude Code; it is intentionally not hardcoded here."
+    },
+    "trading-db-readonly": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-sqlite",
+        "engine/data/dev_copy.db"
+      ],
+      "_comment": "Read-only inspection of a COPY of the trading DB, never the live prod file. Before use: run `python engine/scripts/refresh_dev_db.py` (once Phase 2's dev/prod split lands) or manually `sqlite3 engine/data/trades.db \".backup engine/data/dev_copy.db\"` to produce engine/data/dev_copy.db. Do not point this at engine/data/trades.db directly."
+    }
+  }
+}
