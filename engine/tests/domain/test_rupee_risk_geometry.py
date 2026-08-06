@@ -175,6 +175,55 @@ def test_the_profit_lock_survives_the_new_geometry() -> None:
     assert levels.profit_lock_buffer_pct == Decimal(5)
 
 
+def test_a_lock_that_could_never_fire_is_reported_as_off() -> None:
+    """Found 2026-08-06 by `scripts/stop_level_report.py`, which crashed on
+    `ExitPlan.__post_init__` at a Rs 300 stop:
+
+        profit_lock_activation (37622) must sit between stop (32315) and
+        target (36715)
+
+    The lock is a percentage of PREMIUM; the target is a multiple of a RUPEE
+    risk. They scale differently, so a small enough rupee stop pulls the
+    target in NEARER than the +15% trigger — and a lock the target pre-empts
+    can never fire once.
+
+    That validator was right to refuse the plan. The bug was building one.
+    Reporting the rule as off is both the honest answer (`honest-metrics`
+    forbids a rule that reads as enabled and cannot fire) and the safe one:
+    the alternative is a ValueError inside the entry cycle at the exact
+    moment a position was meant to open.
+
+    Live is under this threshold today only because the 50%-of-capital cap
+    keeps notional below Rs 25,000 against a Rs 46,667 limit — the position
+    cap protecting a different rule by coincidence. At Rs 1,00,000 of capital
+    that cap moves to Rs 50,000 and a real signal crosses it.
+    """
+    premium, lot_size = Paise(32_715), 65
+    levels = _geometry(
+        max_loss_paise=30_000,  # Rs 300 — the stop that crashed the sweep
+        profit_lock_activation_pct=Decimal(15),
+        profit_lock_buffer_pct=Decimal(5),
+    ).levels(premium, quantity=lot_size)
+
+    assert int(premium) + int(premium) * 15 // 100 >= int(levels.target), (
+        "premise: at this stop the +15% trigger sits at or beyond the target"
+    )
+    assert levels.profit_lock_activation is None
+    assert levels.profit_lock_buffer_pct is None, "both halves off together, or ExitPlan rejects the pair"
+
+
+def test_the_lock_survives_whenever_it_can_actually_fire() -> None:
+    """The guard above must not quietly disable the rule in the normal case —
+    that would be the same class of bug in the opposite direction, and it is
+    the case every live trade takes."""
+    premium, lot_size = NIFTY
+    levels = _geometry(
+        profit_lock_activation_pct=Decimal(15), profit_lock_buffer_pct=Decimal(5)
+    ).levels(premium, quantity=lot_size)
+    assert levels.profit_lock_activation is not None
+    assert int(levels.profit_lock_activation) < int(levels.target)
+
+
 @pytest.mark.parametrize(
     ("kwargs", "match"),
     [

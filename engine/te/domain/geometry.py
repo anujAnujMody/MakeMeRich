@@ -260,16 +260,44 @@ class RupeeRiskGeometry:
             # premium, which is not a price.
             stop_distance = int(entry_premium)
         target_distance = int(Decimal(stop_distance) * self.target_multiple)
+        target = Paise(int(entry_premium) + target_distance)
+
+        # The profit lock is a PERCENTAGE of premium while the target is a
+        # multiple of a RUPEE risk, so the two scale differently and the lock
+        # can land beyond the target — at which point the target closes the
+        # trade first and the lock could never fire once.
+        #
+        #     unreachable when  premium x lot_size > (multiple / activation%) x max_loss
+        #
+        # At the 2026-08-06 live values (Rs 700, 10x, +15%) that is a
+        # position notional above Rs 46,667. Today the 50%-of-capital cap
+        # holds notional under Rs 25,000, so it cannot happen — but that is
+        # the position cap protecting a different rule by coincidence, and
+        # raising capital to Rs 1,00,000 moves the cap to Rs 50,000 and puts
+        # a real signal over the line.
+        #
+        # Found 2026-08-06 by `scripts/stop_level_report.py`, which crashed
+        # on `ExitPlan.__post_init__` at a Rs 300 stop. That validator was
+        # right to refuse the plan; the bug was constructing one. Reporting
+        # the rule as OFF is the honest answer per `honest-metrics` — a lock
+        # that cannot fire must never read as enabled — and it is also the
+        # safe one, since the alternative is an exception inside the entry
+        # cycle at the moment a position was meant to open.
+        activation: Paise | None = None
+        buffer_pct = self.profit_lock_buffer_pct
+        if self.profit_lock_activation_pct is not None:
+            candidate = Paise(entry_premium + pct_of(entry_premium, self.profit_lock_activation_pct))
+            if int(candidate) < int(target):
+                activation = candidate
+            else:
+                buffer_pct = None
+
         return ExitLevels(
             stop=Paise(int(entry_premium) - stop_distance),
-            target=Paise(int(entry_premium) + target_distance),
+            target=target,
             trailing_distance=None if self.trailing_pct is None else pct_of(entry_premium, self.trailing_pct),
-            profit_lock_activation=(
-                None
-                if self.profit_lock_activation_pct is None
-                else Paise(entry_premium + pct_of(entry_premium, self.profit_lock_activation_pct))
-            ),
-            profit_lock_buffer_pct=self.profit_lock_buffer_pct,
+            profit_lock_activation=activation,
+            profit_lock_buffer_pct=buffer_pct,
         )
 
 
