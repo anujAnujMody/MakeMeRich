@@ -240,19 +240,94 @@ class TestProfitLock:
         assert decision.exit_premium == Paise(2_150)
         assert int(decision.exit_premium) > int(Paise(2_000))  # a real profit above entry, not breakeven
 
-    def test_the_lock_is_one_time_it_does_not_keep_ratcheting_on_new_highs(self) -> None:
-        """The defining difference from a real trailing stop: once engaged,
-        further favorable moves do NOT raise the stop again."""
-        position = _position(exit_plan=self._plan_with_lock())
+    def test_the_lock_steps_up_again_at_each_further_gain(self) -> None:
+        """Changed 2026-08-06 from "fires once and freezes" to a RATCHET.
+
+        The old behaviour protected the first rung of profit and nothing
+        above it: a position up 15% locked the stop at +9.25% and then, no
+        matter how far the trade ran, could still hand back every rupee above
+        that one level. On a Rs 2,000 entry that is roughly Rs 1,000 of
+        protected profit whether the option finished at Rs 2,300 or
+        Rs 6,000.
+
+        Each rung is another `activation` step (here +15%) above the price
+        that set the previous one:
+
+            2,000 entry
+            2,300  (+15%)  -> stop 2,185
+            2,645  (+15%)  -> stop 2,512
+            3,042  (+15%)  -> stop 2,889
+        """
+        position = _position(exit_plan=self._plan_with_lock(target=Paise(10_000)))
         t1 = OPENED_AT + dt.timedelta(minutes=5)
         position, decision = evaluate_position(position, current_premium=Paise(2_300), now=t1)
+        assert decision is None
         assert position.current_stop == Paise(2_185)
 
         t2 = OPENED_AT + dt.timedelta(minutes=10)
         position, decision = evaluate_position(position, current_premium=Paise(2_800), now=t2)
-
         assert decision is None
-        assert position.current_stop == Paise(2_185), "must not move again after the one-time lock fired"
+        assert position.current_stop == Paise(2_660), "the second rung must raise the floor, not hold it"
+
+        t3 = OPENED_AT + dt.timedelta(minutes=15)
+        position, decision = evaluate_position(position, current_premium=Paise(3_500), now=t3)
+        assert decision is None
+        assert position.current_stop == Paise(3_325)
+
+    def test_the_stop_does_not_move_between_rungs(self) -> None:
+        """The property that makes this SAFE, and the reason it is stepped
+        rather than continuous.
+
+        The Rs 3 continuous trail this project ran before closed 14 of 14
+        trades on `trailing_stop` at a 3.1-minute average hold, because it
+        moved on every tick and ordinary noise walked it into the price.
+        Between rungs this must not move at all — so a wobble that does not
+        clear a full further step cannot tighten the position.
+        """
+        position = _position(exit_plan=self._plan_with_lock(target=Paise(10_000)))
+        position, _ = evaluate_position(
+            position, current_premium=Paise(2_300), now=OPENED_AT + dt.timedelta(minutes=5)
+        )
+        assert position.current_stop == Paise(2_185)
+
+        # Next rung is 2,645. Everything below it leaves the stop alone,
+        # however many times it is evaluated.
+        for i, premium in enumerate((2_400, 2_600, 2_644, 2_500), start=6):
+            position, decision = evaluate_position(
+                position, current_premium=Paise(premium), now=OPENED_AT + dt.timedelta(minutes=i)
+            )
+            assert decision is None
+            assert position.current_stop == Paise(2_185), f"moved at {premium}, below the next rung"
+
+    def test_the_ratcheted_stop_never_moves_down(self) -> None:
+        """A rung fires on the price at that MOMENT, so a lower price
+        clearing an older rung must never lower an already-higher floor.
+        `max()` is what guarantees it; this asserts the guarantee rather than
+        trusting the call site."""
+        position = _position(exit_plan=self._plan_with_lock(target=Paise(10_000)))
+        for i, premium in enumerate((2_300, 3_500, 2_700, 3_000), start=5):
+            position, _ = evaluate_position(
+                position, current_premium=Paise(premium), now=OPENED_AT + dt.timedelta(minutes=i)
+            )
+        assert position.current_stop == Paise(3_325), "the floor set by the highest rung must survive"
+
+    def test_a_ratcheted_stop_that_is_hit_still_reports_profit_lock(self) -> None:
+        """Attribution has to survive the change: an elevated stop reached
+        after several rungs is still the lock's doing, not a `stop` and not a
+        `trailing_stop`."""
+        position = _position(exit_plan=self._plan_with_lock(target=Paise(10_000)))
+        position, _ = evaluate_position(
+            position, current_premium=Paise(2_300), now=OPENED_AT + dt.timedelta(minutes=5)
+        )
+        position, _ = evaluate_position(
+            position, current_premium=Paise(2_800), now=OPENED_AT + dt.timedelta(minutes=10)
+        )
+        _, decision = evaluate_position(
+            position, current_premium=Paise(2_660), now=OPENED_AT + dt.timedelta(minutes=15)
+        )
+        assert decision is not None
+        assert decision.reason == "profit_lock"
+        assert int(decision.exit_premium) > 2_000, "and it is an exit in PROFIT, which is the whole point"
 
     def test_never_loosens_the_original_stop(self) -> None:
         """A degenerate buffer_pct that would compute a lock BELOW the

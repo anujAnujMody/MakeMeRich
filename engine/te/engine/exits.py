@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import datetime as dt
 from dataclasses import dataclass, replace
+from decimal import Decimal
 from typing import Literal
 
 from te.domain.clock import DEFAULT_SESSION, IST, SessionWindow
@@ -72,6 +73,37 @@ class OpenPosition:
 class ExitDecision:
     reason: ExitReason
     exit_premium: Paise
+
+
+def _next_profit_lock_rung(plan: ExitPlan, position: OpenPosition) -> Paise:
+    """The premium at which the profit lock next steps up.
+
+    DERIVED rather than stored, which is what lets the one-time lock become
+    a ratchet without a schema change or a new persisted column:
+
+    * before the first rung, it is simply `plan.profit_lock_activation`
+    * after a rung has fired, the price that fired it is recoverable from
+      the stop it set (`stop = price x (1 - buffer%)`), and the next rung is
+      that price grown by the same step ratio the first rung used
+      (`activation / entry`, e.g. 1.15 for a +15% step)
+
+    Both inputs are already on the plan, so the sequence of rungs is a pure
+    function of stored state and cannot drift from it.
+
+    If a continuous TRAIL is also running it may have raised `current_stop`
+    above the last locked level. The derived rung is then higher than a
+    stored one would be, so the lock fires LESS often — the safe direction,
+    and never a stop that moves down. In practice this project runs at most
+    one of the two mechanisms at a time.
+    """
+    activation, buffer = plan.profit_lock_activation, plan.profit_lock_buffer_pct
+    if activation is None or buffer is None:
+        raise ValueError("no profit lock configured — callers must check before asking for a rung")
+    if not position.profit_lock_engaged:
+        return activation
+    last_locked_at = Decimal(int(position.current_stop)) * Decimal(100) / (Decimal(100) - buffer)
+    step_ratio = Decimal(int(activation)) / Decimal(int(plan.entry_premium))
+    return Paise(int(last_locked_at * step_ratio))
 
 
 def open_position(
@@ -228,23 +260,33 @@ def evaluate_position(
             position.current_stop, current_premium, plan.trailing_distance, position.direction
         )
 
-    # The profit lock is a SEPARATE, ONE-TIME mechanism from trailing — see
-    # `ExitPlan.profit_lock_activation`'s docstring. It engages once (never
-    # re-engages), locks the stop `profit_lock_buffer_pct` below the price
-    # AT ACTIVATION (not below entry — a real profit floor), and then never
-    # moves again on its own account. Combined with any trailing ratchet via
-    # `max()` so whichever mechanism is more protective wins on any given
-    # cycle; in practice this project runs at most one of the two at a time.
+    # The profit lock is a STEPPED ratchet, distinct from the continuous
+    # trail above — see `ExitPlan.profit_lock_activation`'s docstring. Each
+    # time the premium gains another `activation` step it locks the stop
+    # `profit_lock_buffer_pct` below the price AT THAT MOMENT (not below
+    # entry — a real profit floor), then holds still until the next step.
+    #
+    # It fired exactly ONCE and froze until 2026-08-06. That protected the
+    # first rung of profit and nothing above it: a position up 15% locked
+    # roughly Rs 1,000 and then, however far it ran, could still hand back
+    # everything above that one level. Asked for by the owner, who spotted
+    # the gap directly: "move SL after every +15%".
+    #
+    # Stepped rather than continuous ON PURPOSE. The continuous Rs 3 trail
+    # this project ran before closed 14 of 14 trades on `trailing_stop` at a
+    # 3.1-minute average hold, because it moved on every tick and ordinary
+    # noise dragged it into the price. This moves only when the trade gains
+    # a further full step, so nothing between rungs can touch it.
+    #
+    # Combined with any trailing ratchet via `max()` so whichever mechanism
+    # is more protective wins; in practice at most one of the two runs.
     profit_lock_engaged = position.profit_lock_engaged
-    if (
-        not profit_lock_engaged
-        and plan.profit_lock_activation is not None
-        and plan.profit_lock_buffer_pct is not None
-        and current_premium >= plan.profit_lock_activation
-    ):
-        lock_stop = Paise(current_premium - pct_of(current_premium, plan.profit_lock_buffer_pct))
-        new_stop = Paise(max(new_stop, lock_stop))
-        profit_lock_engaged = True
+    if plan.profit_lock_activation is not None and plan.profit_lock_buffer_pct is not None:
+        activation = _next_profit_lock_rung(plan, position)
+        if current_premium >= activation:
+            lock_stop = Paise(current_premium - pct_of(current_premium, plan.profit_lock_buffer_pct))
+            new_stop = Paise(max(new_stop, lock_stop))
+            profit_lock_engaged = True
 
     updated = replace(position, current_stop=new_stop, profit_lock_engaged=profit_lock_engaged)
 

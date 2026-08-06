@@ -26,9 +26,18 @@ unrepresentable rather than merely discouraged:
   nothing to fall back to.
 * `AbsolutePointGeometry` — index-point distances, for backtests replayed
   from `option_bhav` and for every test written before percentages existed.
+* `RupeeRiskGeometry` — the RUPEE loss the owner is prepared to take on one
+  trade, converted into a premium distance using the position's own
+  quantity. Added 2026-08-06 because neither variant above could express
+  "cap my loss at Rs 700": a percentage of premium is a different rupee
+  amount on every contract (20% of NIFTY's Rs 166.80 premium is Rs 2,169 at
+  65 units; 20% of SENSEX's Rs 283.80 is Rs 1,135 at 20), and an absolute
+  premium distance is a different rupee amount for every lot size.
 
-Both answer one question, `levels(entry_premium)`, so callers never branch on
-which form is in use.
+All three answer one question, `levels(entry_premium, quantity=...)`, so
+callers never branch on which form is in use. `quantity` is ignored by the
+two percentage/point variants and required by `RupeeRiskGeometry` — the one
+form whose answer genuinely depends on how many units are being bought.
 
 Lives in `te.domain` (pure, no I/O) because both `te.engine.cycle` and
 `te.backtest.engine` must hold the SAME object — the backtest is meant to
@@ -111,7 +120,8 @@ class PremiumPercentGeometry:
         if self.profit_lock_buffer_pct is not None and not (0 < self.profit_lock_buffer_pct < 100):
             raise ValueError(f"profit_lock_buffer_pct must be in (0, 100), got {self.profit_lock_buffer_pct}")
 
-    def levels(self, entry_premium: Paise) -> ExitLevels:
+    def levels(self, entry_premium: Paise, *, quantity: int | None = None) -> ExitLevels:
+        del quantity  # percentages of premium do not depend on how many units are bought
         return ExitLevels(
             stop=Paise(entry_premium - pct_of(entry_premium, self.stop_pct)),
             target=Paise(entry_premium + pct_of(entry_premium, self.target_pct)),
@@ -144,7 +154,8 @@ class AbsolutePointGeometry:
         if self.trailing_distance is not None and self.trailing_distance <= 0:
             raise ValueError(f"trailing_distance must be positive when set, got {self.trailing_distance}")
 
-    def levels(self, entry_premium: Paise) -> ExitLevels:
+    def levels(self, entry_premium: Paise, *, quantity: int | None = None) -> ExitLevels:
+        del quantity  # an absolute premium distance does not depend on quantity either
         # The one-time profit lock (see `ExitLevels.profit_lock_activation`)
         # is a `PremiumPercentGeometry`-only feature — this type is used for
         # backtests replayed from `option_bhav` and pre-percentage tests,
@@ -158,7 +169,111 @@ class AbsolutePointGeometry:
         )
 
 
-#: Either variant. A union rather than a base class: there are exactly two
-#: ways to express this and both are closed, so a `Protocol` would only add
-#: the ability to define a third somewhere unreviewed.
-type ExitGeometry = PremiumPercentGeometry | AbsolutePointGeometry
+@dataclass(frozen=True)
+class RupeeRiskGeometry:
+    """The stop is a RUPEE amount for the whole position; everything else is
+    derived from it.
+
+    Asked for directly by the owner on 2026-08-06, after a NIFTY trade lost
+    Rs 2,272 on a Rs 50,000 account (4.5% in one trade) under a 20% premium
+    stop. The request was "buy what the signal picks, but cap my loss at
+    Rs 600-700", and neither existing variant can express it:
+
+    * a percentage of premium is a different rupee loss on every contract
+    * an absolute premium distance is a different rupee loss on every lot
+      size (Rs 10.77 is Rs 700 at NIFTY's 65, Rs 215 at SENSEX's 20)
+
+    So the rupee figure is the INPUT and the premium distance is computed
+    from it:
+
+        stop_distance = max_loss_paise // quantity
+
+    `quantity` is `lots x lot_size`, which makes the guarantee exact only if
+    the lot count cannot grow — see `te.risk.sizing.size_position`'s
+    `max_lots`, which is what pins it. Without that cap the engine divides
+    the risk budget by this (now much smaller) per-lot risk and buys MORE
+    lots, restoring the original rupee loss under a different name. The two
+    changes are one change; neither is correct alone.
+
+    ### The target is a MULTIPLE of the risk, not a percentage of premium
+
+    A 20% stop against a 20% target is 1:1 — every winner is cut at exactly
+    the size of every loser, which caps profit by construction. Here the
+    target is `target_multiple` x the rupee risk, so raising it is how the
+    profit ceiling is lifted without the number ever becoming a fiction: at
+    `target_multiple=10` on a Rs 166.80 premium the target is +65% of
+    premium, which real intraday options do reach.
+
+    NOT expressed as "no target at all". `ExitLevels.target` is non-optional
+    and persisted `NOT NULL`, and a truly uncapped position needs a TRAILING
+    stop to protect it — the one exit rule this project has never backtested
+    (the last live trail closed 14 of 14 trades at a 3.1-minute average
+    hold). A distant real target is the honest interim: it does not claim a
+    measurement nobody has made.
+    """
+
+    #: What one trade is allowed to lose, in paise, across the whole
+    #: position. This is the number the owner set; everything else bends to
+    #: keep it true.
+    max_loss_paise: int
+    #: Target distance as a multiple of the rupee risk. `10` means "risk
+    #: Rs 700 to make Rs 7,000".
+    target_multiple: Decimal
+    trailing_pct: Decimal | None = None
+    #: See `ExitLevels.profit_lock_activation`. Both together or neither.
+    profit_lock_activation_pct: Decimal | None = None
+    profit_lock_buffer_pct: Decimal | None = None
+
+    def __post_init__(self) -> None:
+        if self.max_loss_paise <= 0:
+            raise ValueError(f"max_loss_paise must be positive, got {self.max_loss_paise}")
+        if self.target_multiple <= 0:
+            raise ValueError(f"target_multiple must be positive, got {self.target_multiple}")
+        if self.trailing_pct is not None and self.trailing_pct <= 0:
+            raise ValueError(f"trailing_pct must be positive when set, got {self.trailing_pct}")
+        if (self.profit_lock_activation_pct is None) != (self.profit_lock_buffer_pct is None):
+            raise ValueError("profit_lock_activation_pct and profit_lock_buffer_pct must be set together")
+        if self.profit_lock_activation_pct is not None and self.profit_lock_activation_pct <= 0:
+            raise ValueError(f"profit_lock_activation_pct must be positive, got {self.profit_lock_activation_pct}")
+        if self.profit_lock_buffer_pct is not None and not (0 < self.profit_lock_buffer_pct < 100):
+            raise ValueError(f"profit_lock_buffer_pct must be in (0, 100), got {self.profit_lock_buffer_pct}")
+
+    def levels(self, entry_premium: Paise, *, quantity: int | None = None) -> ExitLevels:
+        if quantity is None or quantity <= 0:
+            raise ValueError(
+                f"RupeeRiskGeometry needs a positive quantity to convert Rs {self.max_loss_paise / 100:.2f} "
+                f"of risk into a premium distance, got {quantity!r}"
+            )
+        # Truncating DOWN is deliberate and is the safe direction: a smaller
+        # premium distance means the stop sits closer to entry, so the
+        # realised loss lands at or below `max_loss_paise`, never above it.
+        stop_distance = self.max_loss_paise // quantity
+        if stop_distance <= 0:
+            raise ValueError(
+                f"Rs {self.max_loss_paise / 100:.2f} spread over {quantity} units is less than one paise "
+                f"per unit — no stop can express this risk at this position size"
+            )
+        if stop_distance >= int(entry_premium):
+            # The premium is worth less than the loss being budgeted for, so
+            # the whole position is already inside the risk cap: the option
+            # cannot fall below zero. Stop at zero rather than at a negative
+            # premium, which is not a price.
+            stop_distance = int(entry_premium)
+        target_distance = int(Decimal(stop_distance) * self.target_multiple)
+        return ExitLevels(
+            stop=Paise(int(entry_premium) - stop_distance),
+            target=Paise(int(entry_premium) + target_distance),
+            trailing_distance=None if self.trailing_pct is None else pct_of(entry_premium, self.trailing_pct),
+            profit_lock_activation=(
+                None
+                if self.profit_lock_activation_pct is None
+                else Paise(entry_premium + pct_of(entry_premium, self.profit_lock_activation_pct))
+            ),
+            profit_lock_buffer_pct=self.profit_lock_buffer_pct,
+        )
+
+
+#: Any variant. A union rather than a base class: there are exactly three
+#: ways to express this and all are closed, so a `Protocol` would only add
+#: the ability to define a fourth somewhere unreviewed.
+type ExitGeometry = PremiumPercentGeometry | AbsolutePointGeometry | RupeeRiskGeometry

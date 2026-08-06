@@ -69,12 +69,18 @@ from te.data.recorder import BarRecorder
 from te.domain.calendar import TradingCalendar
 from te.domain.clock import DEFAULT_SESSION, IST, SessionWindow, is_market_open
 from te.domain.costs import ChargeRateTable, CostModel
-from te.domain.geometry import AbsolutePointGeometry, ExitGeometry, PremiumPercentGeometry
+from te.domain.geometry import (
+    AbsolutePointGeometry,
+    ExitGeometry,
+    PremiumPercentGeometry,
+    RupeeRiskGeometry,
+)
 from te.domain.money import Paise
 from te.domain.symbols import FNO_UNDERLYING_EXCHANGES, build_future_symbol, next_monthly_expiry
 from te.engine.contract import UNDERLYING_INDEX_EXCHANGES, ContractResolver, OptionContractResolver
 from te.engine.cycle import CycleConfig, InstrumentConfig, run_entry_cycle, run_exit_cycle
 from te.engine.state import (
+    get_capital_set_at,
     get_guardrails,
     get_instrument_selections,
     get_mode,
@@ -704,6 +710,18 @@ def _exit_geometry(settings: Settings) -> ExitGeometry:
     absolute trail, 3.68% of that day's Rs 81.50 NIFTY premium, and the same
     trail that had closed 14 of 14 trades on `trailing_stop` at a 3.1-minute
     average hold."""
+    # Rupee risk wins when set: it is the most specific statement of intent
+    # available (an exact rupee figure, not a percentage that resolves to a
+    # different rupee figure per contract), so a config carrying both should
+    # honour the exact one rather than the derived one.
+    if settings.paper_cycle_max_loss_per_trade_paise is not None:
+        return RupeeRiskGeometry(
+            max_loss_paise=settings.paper_cycle_max_loss_per_trade_paise,
+            target_multiple=settings.paper_cycle_target_risk_multiple,
+            trailing_pct=settings.paper_cycle_trailing_pct,
+            profit_lock_activation_pct=settings.paper_cycle_profit_lock_activation_pct,
+            profit_lock_buffer_pct=settings.paper_cycle_profit_lock_buffer_pct,
+        )
     if settings.paper_cycle_stop_pct is not None and settings.paper_cycle_target_pct is not None:
         return PremiumPercentGeometry(
             stop_pct=settings.paper_cycle_stop_pct,
@@ -749,6 +767,7 @@ def _default_cycle_config(settings: Settings) -> CycleConfig:
             max_consecutive_losses=settings.paper_cycle_max_consecutive_losses,
         ),
         max_entries_per_underlying_per_day=settings.paper_cycle_max_entries_per_underlying_per_day,
+        max_lots=settings.paper_cycle_max_lots,
     )
 
 
@@ -939,6 +958,10 @@ class PaperCycleRunner:
 
         with self.session_factory() as session:
             guardrails = get_guardrails(session, defaults=guardrails_defaults_from_settings(self.settings))
+            # Read in the SAME session as the guardrails so the capital and
+            # the anchor it is paired with can never come from either side
+            # of a concurrent save.
+            capital_set_at = get_capital_set_at(session)
             selections = get_instrument_selections(
                 session, defaults=instrument_selections_defaults_from_settings(self.settings)
             )
@@ -948,6 +971,7 @@ class PaperCycleRunner:
         config = replace(
             self.config,
             capital=guardrails.capital,
+            capital_set_at=capital_set_at,
             risk_budget_pct=guardrails.risk_per_trade_pct,
             max_position_size_pct=guardrails.max_position_size_pct,
             risk_limits=RiskLimitsConfig(

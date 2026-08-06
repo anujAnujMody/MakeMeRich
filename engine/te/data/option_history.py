@@ -51,6 +51,7 @@ import logging
 import os
 import re
 import zipfile
+from collections import Counter
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from decimal import Decimal
@@ -444,6 +445,31 @@ class OptionContractIndex:
     def expiries(self) -> list[dt.date]:
         return list(self._expiries)
 
+    def strike_step(self, *, expiry: dt.date, option_type: OptionType) -> Decimal | None:
+        """The chain's real strike interval, or `None` if fewer than two
+        strikes are listed.
+
+        The MODE of the gaps between consecutive listed strikes, not the
+        minimum and not the mean. Measured on this archive 2026-08-05, the
+        chains are mostly regular but not entirely — NIFTY 2024-01-04 runs
+        85 gaps of 50 alongside 100/150/200, and BANKNIFTY 2026-03-30 runs
+        157 gaps of 100 alongside 200/300/700/1000. Those wide gaps are
+        strikes the archive simply does not hold. The mean would be dragged
+        upwards by them and the minimum would miss a chain listed at a
+        genuinely coarser interval, while the mode reports the interval the
+        exchange actually lists at."""
+        contracts = self._by_expiry.get((expiry, option_type))
+        if contracts is None or len(contracts) < 2:
+            return None
+        strikes = sorted(c.strike for c in contracts)
+        gaps = Counter(b - a for a, b in zip(strikes, strikes[1:], strict=False) if b > a)
+        if not gaps:
+            return None
+        # Ties broken towards the SMALLER gap: on a chain where two widths
+        # are equally common the finer one is the listed interval and the
+        # wider one is that interval with a hole in it.
+        return min(gap for gap, count in gaps.items() if count == max(gaps.values()))
+
     def nearest(
         self,
         *,
@@ -451,7 +477,9 @@ class OptionContractIndex:
         index_level: Decimal,
         option_type: OptionType,
         max_days_to_expiry: int = 7,
+        min_days_to_expiry: int = 0,
         strikes_out_of_the_money: int = 0,
+        otm_points: Decimal | None = None,
     ) -> ParsedOptionSymbol | None:
         """The nearest-expiry contract at the requested distance from spot,
         or `None` if the archive covers nothing usable there.
@@ -481,16 +509,79 @@ class OptionContractIndex:
         strike step differs by underlying (50 on NIFTY, 100 on BANKNIFTY),
         and stepping through the strikes that actually exist in the archive
         means the result cannot land on a strike nobody listed.
+
+        `otm_points` — mutually exclusive with `strikes_out_of_the_money` —
+        asks for a distance in INDEX POINTS instead, and exists because
+        counting archive positions is only equivalent to counting distance
+        while the chain is complete, and ours is not. Measured 2026-08-05:
+        NIFTY 2024-01-04 lists 85 gaps of 50 points but also gaps of 100,
+        150 and 200; BANKNIFTY 2026-03-30 lists 157 gaps of 100 alongside
+        one of 700 and two of 1,000. So "3 strikes out" is 150 points on a
+        complete chain and can be 1,200 on a holed one — a materially
+        different option wearing the same label, pooled into the same
+        average by every sweep that has run so far.
+
+        With `otm_points` the target is `spot ± points`, resolved to the
+        listed strike nearest it, and REFUSED (`None`) if the nearest listed
+        strike is more than half a `strike_step` away — i.e. if the strike
+        that distance implies is one the archive does not hold. Refusing is
+        the point: the caller counts an unresolved signal instead of
+        silently trading a strike several hundred points from the one
+        requested.
         """
+        # `!= 0`, not truthiness: `strikes_out_of_the_money=0` is a real
+        # ATM request and used to slip past this check silently, taking
+        # the points path instead. The two disagree at zero — counting 0
+        # strikes returns the nearest listed strike unconditionally,
+        # while 0 points REFUSES when the nearest strike is more than
+        # half a step away — so the caller got a different contract than
+        # either argument asked for.
+        if otm_points is not None and strikes_out_of_the_money != 0:
+            raise ValueError(
+                "pass either strikes_out_of_the_money or otm_points, not both — they are two "
+                f"different ways of naming one distance (got {strikes_out_of_the_money} and {otm_points})"
+            )
         for expiry in self._expiries:
             if expiry < on:
                 continue
             if (expiry - on).days > max_days_to_expiry:
                 return None
+            # SKIPPED, not refused — and the difference is the whole point
+            # of putting this here rather than in the caller.
+            #
+            # Both `spread_lab._resolve_legs` and the buying lab used to
+            # apply their lower bound AFTER this method returned. But this
+            # loop stops at the FIRST expiry inside the upper bound, so on a
+            # day with a contract expiring tomorrow, a caller asking for
+            # "5-7 days" got tomorrow's contract back, rejected it, and
+            # recorded no trade — instead of the 6-day contract that was
+            # sitting right behind it in the chain. The band therefore did
+            # not select a later expiry, it mostly selected NOTHING, and
+            # every "3-7 days" row measured only the minority of days that
+            # happened to have no nearer expiry listed.
+            if (expiry - on).days < min_days_to_expiry:
+                continue
             candidates = self._by_expiry.get((expiry, option_type))
             if not candidates:
                 continue
             ordered = sorted(candidates, key=lambda c: c.strike)
+            if otm_points is not None:
+                # Away from spot: UP for a call, DOWN for a put — the same
+                # convention `strikes_out_of_the_money` uses below.
+                target_strike = index_level + (otm_points if option_type == "CE" else -otm_points)
+                best = min(ordered, key=lambda c: (abs(c.strike - target_strike), c.strike))
+                step = self.strike_step(expiry=expiry, option_type=option_type)
+                # No step means a single-strike chain: nothing to be
+                # "near enough" to, so the only honest answer is a refusal.
+                if step is None:
+                    return None
+                # `>=`, so an exactly-half-a-step target is refused
+                # rather than resolved by the tie-break — which picks
+                # the LOWER strike, narrowing a call wing and widening
+                # a put wing by half a step from the same request.
+                if abs(best.strike - target_strike) >= step / 2:
+                    return None
+                return best
             atm_index = min(
                 range(len(ordered)), key=lambda i: (abs(ordered[i].strike - index_level), ordered[i].strike)
             )

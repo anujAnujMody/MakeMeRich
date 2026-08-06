@@ -110,11 +110,19 @@ def test_guardrails_round_trip(session_factory) -> None:  # noqa: ANN001
         assert get_guardrails(session, defaults=_DEFAULTS) == changed
 
 
-def test_lowering_capital_rebases_the_peak_equity_watermark_instead_of_looking_like_a_loss(session_factory) -> None:  # noqa: ANN001
+def test_lowering_capital_clears_the_peak_equity_watermark(session_factory) -> None:  # noqa: ANN001
     """Regression, found by review: `te.risk.limits.check_max_drawdown`'s
     peak-equity watermark tracks capital + P&L. Editing capital down with
     no rebase would make the edit itself look like a real trading loss and
-    could halt the engine with zero money actually lost."""
+    could halt the engine with zero money actually lost.
+
+    CLEARED, not rewritten. Two earlier rules were both wrong: shifting the
+    peak by the capital delta assumed equity still carried lifetime P&L, and
+    writing the new capital assumed the book was flat. Only the trading loop
+    can compute equity — it needs unrealized P&L, which needs a `BarStore`
+    this module sits below — so `check_max_drawdown` seeds the watermark
+    from real equity on the next cycle instead. See
+    `te.engine.state.clear_peak_equity_paise`."""
     import dataclasses
 
     from te.engine.state import get_peak_equity_paise, set_peak_equity_paise
@@ -136,12 +144,15 @@ def test_lowering_capital_rebases_the_peak_equity_watermark_instead_of_looking_l
         session.commit()
 
     with session_factory() as session:
-        # The peak must shift by the SAME delta as the capital cut, not
-        # stay frozen at the old (now unreachable) higher capital level.
-        assert get_peak_equity_paise(session) == Paise(1_400_000)
+        # Gone, not frozen at the old (now unreachable) higher level and
+        # not rewritten from a layer that cannot see open positions.
+        assert get_peak_equity_paise(session) is None
 
 
-def test_raising_capital_also_rebases_the_peak_equity_watermark(session_factory) -> None:  # noqa: ANN001
+def test_raising_capital_also_clears_the_peak_equity_watermark(session_factory) -> None:  # noqa: ANN001
+    """Same rule in the other direction — and the direction that matters
+    more, because a stale HIGH peak makes the account look permanently
+    underwater after a top-up."""
     import dataclasses
 
     from te.engine.state import get_peak_equity_paise, set_peak_equity_paise
@@ -157,7 +168,7 @@ def test_raising_capital_also_rebases_the_peak_equity_watermark(session_factory)
         session.commit()
 
     with session_factory() as session:
-        assert get_peak_equity_paise(session) == Paise(2_500_000)
+        assert get_peak_equity_paise(session) is None
 
 
 def test_setting_guardrails_with_no_prior_peak_leaves_the_watermark_unset(session_factory) -> None:  # noqa: ANN001

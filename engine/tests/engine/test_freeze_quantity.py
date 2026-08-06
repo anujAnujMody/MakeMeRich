@@ -60,10 +60,20 @@ def test_the_cap_arithmetic_floors_to_whole_lots() -> None:
     assert capped * contract.lot_size <= contract.freeze_qty
 
 
-def test_a_contract_whose_single_lot_exceeds_the_freeze_is_untradeable() -> None:
-    """Degenerate but real: if one lot is already over the limit there is no
-    tradeable size at all, and the engine must skip with that reason rather
-    than place an order it knows will be rejected."""
+def test_a_freeze_below_one_lot_floors_to_zero_lots() -> None:
+    """The arithmetic that made the 2026-08-06 outage possible: a freeze
+    quantity under the lot size floors to ZERO tradeable lots.
+
+    Kept as a statement of the arithmetic only. The engine no longer acts on
+    it — `te.engine.cycle` filters sub-lot freeze quantities out as missing
+    values BEFORE this division, because a cap below one lot cannot be real:
+    it would mean the exchange quotes a contract on which no legal order
+    exists. Every observed instance was a lookup miss answering `1`.
+
+    See `tests/engine/test_cycle.py::
+    test_a_freeze_quantity_below_one_lot_is_treated_as_unreported` for the
+    behaviour this arithmetic no longer drives.
+    """
     contract = _contract(lot_size=900, freeze_qty=600)
     assert contract.freeze_qty // contract.lot_size == 0
 

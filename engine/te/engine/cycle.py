@@ -32,7 +32,7 @@ from te.data.barstore import BarStore
 from te.domain.clock import IST
 from te.domain.clock import assume_utc as _as_utc
 from te.domain.costs import CostModel
-from te.domain.geometry import ExitGeometry
+from te.domain.geometry import ExitGeometry, RupeeRiskGeometry
 from te.domain.money import Paise
 from te.domain.orders import OrderRequest
 from te.domain.pnl import GrossPnl, mark_to_market_pnl, net_pnl
@@ -148,6 +148,34 @@ class CycleConfig:
     #: measured time-to-target distribution, never guessed — see
     #: `Settings.paper_cycle_min_minutes_before_hard_exit`.
     min_minutes_before_hard_exit: int = 0
+    #: When `capital` above was last CHANGED. Realized P&L is counted from
+    #: this moment on, so equity is `capital + P&L SINCE the capital was
+    #: set` rather than `capital + lifetime P&L` — see
+    #: `te.engine.state.get_capital_set_at` and
+    #: `te.persistence.repos.paper_trading.total_net_pnl_paise`. `None`
+    #: (the default, and the only value any test or pre-existing call site
+    #: passes) means "never changed", which keeps the lifetime behaviour.
+    capital_set_at: dt.datetime | None = None
+    #: Hard ceiling on lots per position, applied after every computed sizing
+    #: cap. `None` means no ceiling (the historic behaviour).
+    #:
+    #: MANDATORY when `exit_geometry` is a `RupeeRiskGeometry`, and
+    #: `__post_init__` refuses the combination otherwise. That geometry
+    #: converts a rupee loss into a per-unit premium distance, and the
+    #: conversion needs to know how many units the position can reach. Left
+    #: unset, sizing divides the risk budget by the (now small) per-lot risk,
+    #: buys more lots, and multiplies the loss straight back up — a
+    #: "Rs 700 stop" that loses Rs 2,100. See `te.risk.sizing.size_position`.
+    max_lots: int | None = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.exit_geometry, RupeeRiskGeometry) and self.max_lots is None:
+            raise ValueError(
+                "RupeeRiskGeometry requires max_lots — without a lot ceiling the risk budget "
+                "buys extra lots and the rupee cap is silently multiplied"
+            )
+        if self.max_lots is not None and self.max_lots < 1:
+            raise ValueError(f"max_lots must be at least 1 when set, got {self.max_lots}")
 
 
 def _resolve_instruments(config: CycleConfig) -> list[InstrumentConfig]:
@@ -358,7 +386,7 @@ def run_entry_cycle(
             unrealized = unrealized_pnl_paise(
                 session, store=store, cost_model=cost_model, as_of=as_of, current_premium=current_premium
             )
-            realized = total_net_pnl_paise(session)
+            realized = total_net_pnl_paise(session, since=config.capital_set_at)
             # SIZING equity is realized-only, deliberately — while `equity`
             # below (for the drawdown breaker) also carries `unrealized`.
             #
@@ -577,7 +605,17 @@ def run_entry_cycle(
             entry_premium = contract.ask
             freeze_qty = contract.freeze_qty
 
-        levels = config.exit_geometry.levels(entry_premium)
+        # Sized against the LARGEST position this config can take, not the
+        # one sizing is about to choose — which is the only order that works,
+        # since `size_position` needs the stop before it can pick a lot count.
+        #
+        # Erring high is the safe direction: the rupee cap is spread over
+        # `max_lots` lots, so if sizing lands on fewer the realised loss comes
+        # in UNDER the cap, never over it. Erring the other way (assuming one
+        # lot and then buying three) is the exact multiplication `max_lots`
+        # exists to prevent.
+        max_quantity = lot_size * (config.max_lots or 1)
+        levels = config.exit_geometry.levels(entry_premium, quantity=max_quantity)
         stop_premium, target_premium = levels.stop, levels.target
 
         sizing = size_position(
@@ -612,6 +650,7 @@ def run_entry_cycle(
             on=as_of.date(),
             min_edge_multiple=config.min_edge_multiple,
             max_position_size_pct=config.max_position_size_pct,
+            max_lots=config.max_lots,
         )
         stage_ms["risk"] += (time.perf_counter() - _t2) * 1000
         if sizing.lots == 0:
@@ -687,8 +726,56 @@ def run_entry_cycle(
         # disagree across sources (BANKNIFTY is quoted as both 600 and 900)
         # and they change. `0` means the broker did not report one, and
         # nothing is capped — inventing a limit is worse than not having it.
+        #
+        # A value BELOW one lot is the SAME "did not report one", wearing a
+        # number. It cannot be a real cap: a listed contract always permits
+        # at least one lot, so a limit under the lot size would mean no legal
+        # order exists in any size — which is never true of a contract the
+        # exchange is quoting. Treating it as real is what silently made
+        # every BSE index untradeable.
+        #
+        # Measured 2026-08-06, straight from OpenAlgo's own `qty_freeze`
+        # table: 213 rows, ALL of them `NFO`, none below 600. There is no BFO
+        # row at all, so every BSE lookup misses and the service answers `1`.
+        # The real BSE limits are published and are nothing like it — SENSEX
+        # 1,000 (50 lots of 20), BANKEX 900 (30 lots of 30) — but they are
+        # deliberately NOT hardcoded here, for the same reason the NSE ones
+        # are not: they drift, and a stale table that looks authoritative is
+        # worse than an absent one. Falling back to "no cap known" matches
+        # what `0` already does, and the sizes this engine takes (1-2 lots)
+        # are orders of magnitude below any real freeze.
+        if 0 < freeze_qty < lot_size:
+            logger.warning(
+                "freeze quantity below one lot — treating as not reported",
+                symbol=trade_symbol,
+                freeze_qty=freeze_qty,
+                lot_size=lot_size,
+            )
+            with session_scope(session_factory) as session:
+                record_risk_event(
+                    session,
+                    ts=as_of,
+                    kind="freeze_qty_unusable",
+                    detail=(
+                        f"{trade_symbol}: broker reported freeze quantity {freeze_qty}, below one lot "
+                        f"({lot_size}); no exchange caps a listed contract below a lot, so this is a "
+                        f"missing value and no cap was applied"
+                    ),
+                )
+            freeze_qty = 0
         if freeze_qty > 0 and lot_size * lots > freeze_qty:
             capped = freeze_qty // lot_size
+            # Unreachable given the filter above (`freeze_qty >= lot_size`
+            # forces `capped >= 1`), and kept anyway as a floor on ORDER
+            # QUANTITY rather than as a branch anyone expects to take.
+            #
+            # A mutation audit on 2026-08-06 removed the filter and found
+            # that `capped = 0` flows all the way through: an order is
+            # submitted for zero quantity and a ZERO-LOT position is written
+            # to `open_positions`. Nothing downstream — sizing, the execution
+            # manager, the position store — refuses it. So the cost of this
+            # branch is three lines, and the cost of trusting the invariant
+            # is a phantom position that can never be exited for a real P&L.
             if capped < 1:
                 skip(
                     instrument,

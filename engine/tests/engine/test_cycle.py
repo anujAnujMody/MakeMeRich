@@ -584,20 +584,35 @@ def test_a_downstream_block_corrects_the_persisted_traded_verdict(
     tmp_path: Path,  # noqa: ANN001
 ) -> None:
     """Found live on 2026-08-04: a SENSEX signal fired, `record_evaluation`
-    persisted `verdict="traded"` immediately, and the exchange freeze-
-    quantity guard rejected it two dozen lines later — no position ever
-    opened. `GET /api/decisions/today` kept showing "traded" for the rest of
-    the day because nothing had gone back to correct that row: a real
-    `SkippedSignal` was recorded with the real reason, but in a different
-    table the dashboard doesn't read. The persisted evaluation itself must
-    end up honest, not just a second, disconnected record of the truth."""
+    persisted `verdict="traded"` immediately, and a guard rejected it two
+    dozen lines later — no position ever opened. `GET /api/decisions/today`
+    kept showing "traded" for the rest of the day because nothing had gone
+    back to correct that row: a real `SkippedSignal` was recorded with the
+    real reason, but in a different table the dashboard doesn't read. The
+    persisted evaluation itself must end up honest, not just a second,
+    disconnected record of the truth.
+
+    The original block was the exchange freeze-quantity guard, reproducing
+    that day's `freeze_qty=1` against a lot of 20. That value turned out to
+    be a MISSING value rather than a real cap (OpenAlgo's `qty_freeze` table
+    holds NFO rows only, so every BSE lookup misses and the service answers
+    `1`), and since 2026-08-06 the guard filters it out instead of blocking
+    on it — so the freeze guard can no longer produce a skip at all, only a
+    cap. See `te.engine.cycle`'s freeze-quantity comment.
+
+    Sizing rejection replaces it here, which is a BETTER example than the
+    one it retires: it is the block this account hits in real trading (every
+    BANKNIFTY signal, whose risk-per-lot exceeds the whole risk budget), and
+    it sits downstream of `record_evaluation` in exactly the same way.
+    """
     store = _breakout_store(tmp_path)
-    config = _config()
+    # 0.1% of Rs 25,000 = Rs 25 of risk budget, against a risk-per-lot of
+    # 700p x 65 = Rs 455. One lot is unaffordable, so `size_position` rejects
+    # AFTER the "traded" verdict has already been persisted.
+    config = _config(risk_budget_pct=Decimal("0.1"))
     entry_at = _open(61)
 
-    def _unresolvable_size(instrument: str, direction: object, as_of: dt.datetime) -> ResolvedContract:
-        # One lot already exceeds the freeze quantity — the exact 2026-08-04
-        # shape (SENSEX06AUG2678700PE, lot 20 vs freeze qty 1).
+    def _resolver(instrument: str, direction: object, as_of: dt.datetime) -> ResolvedContract:
         return ResolvedContract(
             symbol="SENSEX06AUG2678700PE",
             exchange="BFO",
@@ -606,7 +621,7 @@ def test_a_downstream_block_corrects_the_persisted_traded_verdict(
             bid=Paise(3_580),
             ask=Paise(3_600),
             underlying_ltp=30.0,
-            freeze_qty=10,
+            freeze_qty=0,
         )
 
     run_entry_cycle(
@@ -616,17 +631,88 @@ def test_a_downstream_block_corrects_the_persisted_traded_verdict(
         cost_model=cost_model,
         config=config,
         as_of=entry_at,
-        contract_resolver=_unresolvable_size,
+        contract_resolver=_resolver,
     )
 
     with session_factory() as session:
-        assert session.query(OpenPositionRow).count() == 0, "the freeze-quantity guard must still block the trade"
+        assert session.query(OpenPositionRow).count() == 0, "the sizing guard must still block the trade"
         skip = session.query(SkippedSignalRow).one()
-        assert "freeze quantity" in skip.reason
+        assert "risk budget" in skip.reason
 
         evaluation = session.query(CycleEvaluationRow).filter(CycleEvaluationRow.instrument == INSTRUMENT).one()
         assert evaluation.verdict == "skipped", "the persisted verdict must not still say 'traded'"
-        assert "freeze quantity" in evaluation.reason, "the real block reason, not the strategy's original one"
+        assert "risk budget" in evaluation.reason, "the real block reason, not the strategy's original one"
+
+
+@pytest.mark.parametrize(
+    "freeze_qty",
+    [
+        pytest.param(1, id="the-live-value"),
+        # The BOUNDARY, and it is load-bearing. A mutation audit weakened the
+        # threshold from `lot_size` to `lot_size // 2` and the `1` case alone
+        # could not tell the difference — 1 is below both. 19-against-20 pins
+        # the rule at "below ONE LOT", which is the only threshold with a
+        # justification behind it.
+        pytest.param(19, id="one-below-a-lot"),
+    ],
+)
+def test_a_freeze_quantity_below_one_lot_is_treated_as_unreported(
+    session_factory,
+    execution,
+    cost_model: CostModel,
+    tmp_path: Path,  # noqa: ANN001
+    freeze_qty: int,
+) -> None:
+    """The 2026-08-06 fix, asserted end to end.
+
+    OpenAlgo's `qty_freeze` table has 213 rows and every one is `NFO` — no
+    BFO row exists, so every BSE index lookup misses and `optionsymbol`
+    answers `freeze_qty=1`. The guard trusted it, and `1 // 20 = 0` lots made
+    SENSEX and BANKEX untradeable in ANY size: six real signals were rejected
+    on 2026-08-06 alone, all of them tradeable.
+
+    A cap below one lot cannot be real — a listed contract the exchange is
+    quoting always permits at least one lot — so the only correct reading is
+    "not reported", the same as `0`. The trade must go through.
+    """
+    store = _breakout_store(tmp_path)
+    config = _config()
+    entry_at = _open(61)
+
+    def _sub_lot_freeze(instrument: str, direction: object, as_of: dt.datetime) -> ResolvedContract:
+        return ResolvedContract(
+            symbol="SENSEX06AUG2678700PE",
+            exchange="BFO",
+            lot_size=20,
+            premium=Paise(3_600),
+            bid=Paise(3_580),
+            ask=Paise(3_600),
+            underlying_ltp=30.0,
+            freeze_qty=freeze_qty,
+        )
+
+    run_entry_cycle(
+        session_factory=session_factory,
+        store=store,
+        execution=execution,
+        cost_model=cost_model,
+        config=config,
+        as_of=entry_at,
+        contract_resolver=_sub_lot_freeze,
+    )
+
+    with session_factory() as session:
+        assert session.query(SkippedSignalRow).count() == 0
+        position = session.query(OpenPositionRow).one()
+        # `lots`, not just "a row exists". A mutation audit caught this: with
+        # the filter removed the cap still ran, `1 // 20` floored to 0, and a
+        # ZERO-lot position was opened — which a bare `count() == 1` happily
+        # accepted. The bug being tested changes the SIZE, so the size is
+        # what has to be asserted.
+        assert position.lots >= 1, "sized to zero lots — the sub-lot freeze quantity was applied as a real cap"
+        assert position.lots * position.lot_size > 0
+        evaluation = session.query(CycleEvaluationRow).filter(CycleEvaluationRow.instrument == INSTRUMENT).one()
+        assert evaluation.verdict == "traded"
 
 
 def test_a_single_spike_quote_does_not_close_a_position(

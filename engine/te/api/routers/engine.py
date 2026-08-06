@@ -21,6 +21,7 @@ from te.engine.scheduler import run_openalgo_relogin
 from te.engine.state import (
     AccountGuardrails,
     InstrumentSelection,
+    get_capital_set_at,
     get_guardrails,
     get_instrument_selections,
     get_peak_equity_paise,
@@ -101,7 +102,10 @@ def _current_drawdown_pct(session: Session, *, capital: Paise, as_of: dt.datetim
         # value its own exit checks fall back to.
         current_premium=lambda row: Paise(row.last_mark_paise) if row.last_mark_paise is not None else None,
     )
-    equity = int(capital) + int(total_net_pnl_paise(session)) + int(unrealized)
+    # Same anchor the trading loop sizes and halts off (`te.engine.cycle`,
+    # via `CycleConfig.capital_set_at`) — the dashboard must not report a
+    # drawdown computed from a different equity than the breaker enforces.
+    equity = int(capital) + int(total_net_pnl_paise(session, since=get_capital_set_at(session))) + int(unrealized)
     if equity >= int(peak):
         return 0.0
     return float(Decimal(int(peak) - equity) / Decimal(int(peak)) * Decimal(100))

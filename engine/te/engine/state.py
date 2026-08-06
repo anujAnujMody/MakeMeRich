@@ -43,6 +43,10 @@ _MAX_DRAWDOWN_PCT_KEY = "max_drawdown_pct"
 _MAX_TRADES_PER_DAY_KEY = "max_trades_per_day"
 _MAX_CONCURRENT_POSITIONS_KEY = "max_concurrent_positions"
 _RISK_PER_TRADE_PCT_KEY = "risk_per_trade_pct"
+#: When `capital_paise` was last CHANGED (not merely re-saved). This is the
+#: anchor the sizing/drawdown equity counts realized P&L from — see
+#: `get_capital_set_at`.
+_CAPITAL_SET_AT_KEY = "capital_set_at"
 
 
 @dataclass(frozen=True)
@@ -233,6 +237,71 @@ def set_peak_equity_paise(session: Session, value: Paise) -> None:
     upsert_engine_state(session, _PEAK_EQUITY_PAISE_KEY, str(int(value)))
 
 
+def clear_peak_equity_paise(session: Session) -> None:
+    """Forget the watermark, so `check_max_drawdown` re-seeds it from real
+    equity on the next cycle.
+
+    Deletes the row rather than writing a value, because ONLY the trading
+    loop can compute equity correctly: it is `capital + realized-since-anchor
+    + unrealized`, and `unrealized` needs a `BarStore` and a `CostModel` that
+    this module sits below in the layer rule. Any value written from here is
+    a guess about open positions.
+
+    That guess was wrong. Writing `capital` assumed equity equalled capital
+    right after a re-base — true only with a flat book. With a position open
+    and Rs 10,000 underwater, equity is Rs 40,000 against a watermark of
+    Rs 50,000: an instant 20% drawdown, a halt, and a manual clear, all from
+    a config edit that lost nothing. `check_max_drawdown` already handles
+    `None` by seeding from whatever equity actually is, so deleting hands the
+    decision to the one caller that can make it."""
+    row = session.get(EngineState, _PEAK_EQUITY_PAISE_KEY)
+    if row is not None:
+        session.delete(row)
+
+
+def get_capital_set_at(session: Session) -> dt.datetime | None:
+    """When the account's capital was last CHANGED, or `None` if it has
+    never been changed from the `Settings` default.
+
+    This exists because account equity is `capital + realized P&L`, and
+    without an anchor "realized P&L" means *lifetime* P&L — including
+    trades taken back when capital was a different number. Raising capital
+    from Rs 30,000 to Rs 50,000 on 2026-08-05 with Rs 11,837 of older paper
+    profit on the books would have sized the very next trade off Rs 61,837,
+    a balance that never existed under either setting.
+
+    Re-saving the SAME capital deliberately does not move this anchor: an
+    operator changing the daily-loss limit is not restating what the account
+    is worth, and treating it as such would silently discard the running
+    P&L that the drawdown breaker depends on.
+
+    `None` means "never changed", and ONLY that. An unreadable stored value
+    RAISES instead of returning `None`, because the two are opposites in
+    effect: `None` restores lifetime P&L, which is exactly the bug this
+    field exists to prevent, and it would do so silently on an account whose
+    watermark was cleared for a re-base that then did not take effect. A
+    tz-naive value is rejected here for the same reason — it parses fine but
+    `to_utc` raises later, inside the entry cycle, aborting every instrument
+    with a traceback that names the clock rather than this row."""
+    row = session.get(EngineState, _CAPITAL_SET_AT_KEY)
+    if row is None or not row.value:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(row.value)
+    except ValueError as exc:
+        raise ValueError(
+            f"engine_state[{_CAPITAL_SET_AT_KEY}] is not a valid ISO timestamp: {row.value!r}. "
+            "Position sizing cannot be trusted until this is corrected — equity would silently "
+            "revert to lifetime P&L across a capital change."
+        ) from exc
+    if parsed.tzinfo is None:
+        raise ValueError(
+            f"engine_state[{_CAPITAL_SET_AT_KEY}] is tz-naive ({row.value!r}); it is written as UTC "
+            "and must stay tz-aware."
+        )
+    return parsed
+
+
 def get_guardrails(session: Session, *, defaults: AccountGuardrails) -> AccountGuardrails:
     """Reads each of the 7 guardrail keys independently, falling back to the
     corresponding field on `defaults` for any key that is missing or fails
@@ -310,20 +379,53 @@ def set_guardrails(session: Session, guardrails: AccountGuardrails) -> None:
             f"capital ({ceiling}p)"
         )
 
-    # `te.risk.limits.check_max_drawdown`'s peak-equity watermark tracks
-    # capital + P&L — so an editable `capital` field is itself an input to
-    # a check that's supposed to measure trading LOSSES only. Found by
-    # review: lowering capital here without rebasing the watermark makes
-    # `check_max_drawdown` see the edit as a loss and can halt the engine
-    # on a config change with zero real money lost. Shifting the stored
-    # peak by the same delta keeps drawdown-from-trading-performance
-    # unaffected by a capital edit either direction.
-    old_capital = _read_int(session, _CAPITAL_PAISE_KEY, int(guardrails.capital))
-    capital_delta = int(guardrails.capital) - old_capital
-    if capital_delta != 0:
-        stored_peak = get_peak_equity_paise(session)
-        if stored_peak is not None:
-            set_peak_equity_paise(session, Paise(int(stored_peak) + capital_delta))
+    # A CHANGE to capital re-bases the account, and two stored numbers
+    # depend on that base:
+    #
+    # 1. `_CAPITAL_SET_AT_KEY` — the anchor equity counts realized P&L
+    #    from. Without it, `capital + lifetime P&L` mixes a new balance
+    #    with profit earned under an old one (see `get_capital_set_at`).
+    # 2. `check_max_drawdown`'s peak-equity watermark, which tracks
+    #    capital + P&L — so an editable `capital` is itself an input to a
+    #    check meant to measure trading LOSSES only. Leaving a stale peak
+    #    behind lets a config edit read as a drawdown and halt the engine
+    #    with zero real money lost.
+    #
+    # The peak is CLEARED rather than shifted by the delta or written as
+    # the new capital. The delta rule was correct only while equity carried
+    # lifetime P&L. Writing `capital` was the first replacement and was
+    # also wrong: it assumed equity equals capital right after the re-base,
+    # which holds only with no position open — see `clear_peak_equity_paise`
+    # for the halt that assumption causes. Clearing defers to
+    # `check_max_drawdown`, which seeds the watermark from real equity
+    # (including unrealized) on the very next cycle.
+    #
+    # Both are conditional on the value actually CHANGING: re-saving an
+    # unchanged capital (the common case — editing the daily-loss limit)
+    # must not discard the running P&L or the real drawdown history.
+    #
+    # The FIRST save is deliberately NOT a change: with no stored value
+    # there is no previous account to separate the new one from, so there
+    # is nothing to re-base and an anchor would only discard history for
+    # no reason. Such an account keeps the lifetime behaviour, exactly as
+    # before this was added.
+    #
+    # Read the row DIRECTLY rather than through `_read_int`. That helper
+    # returns its default on a parse failure, and the default here is the
+    # value being written — so an unparseable stored capital made
+    # `old == new` unconditionally, and NO capital change would ever stamp
+    # an anchor or clear the watermark. Silently, on every save. An
+    # unreadable stored value is treated as a change, which is the safe
+    # direction: re-basing an account that did not move costs nothing,
+    # while missing a re-base is the Rs 61,837 bug.
+    stored = session.get(EngineState, _CAPITAL_PAISE_KEY)
+    try:
+        old_capital = int(stored.value) if stored is not None else int(guardrails.capital)
+    except ValueError:
+        old_capital = None
+    if old_capital != int(guardrails.capital):
+        upsert_engine_state(session, _CAPITAL_SET_AT_KEY, dt.datetime.now(dt.UTC).isoformat())
+        clear_peak_equity_paise(session)
 
     upsert_engine_state(session, _CAPITAL_PAISE_KEY, str(int(guardrails.capital)))
     upsert_engine_state(session, _MAX_DAILY_LOSS_PAISE_KEY, str(int(guardrails.max_daily_loss)))

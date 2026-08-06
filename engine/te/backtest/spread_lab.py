@@ -103,10 +103,17 @@ class SpreadGeometry:
     max_hold: dt.timedelta
     #: Days-to-expiry band the trade must fall inside, INCLUSIVE.
     #:
-    #: Uncontrolled until 2026-08-02, and that was a real confound rather
-    #: than a detail: `nearest()` simply took whatever weekly expiry was
-    #: within 7 days, so a single reported result averaged eight different
-    #: instruments. Measured over 574 sessions, entries landed at 0 days
+    #: Uncontrolled until 2026-08-02, and NOT ACTUALLY CONTROLLED until
+    #: 2026-08-05 — the first attempt applied this bound after calling
+    #: `nearest`, which stops at the first expiry inside the upper bound,
+    #: so a later band mostly selected NOTHING rather than a later expiry.
+    #: Banded results produced between those dates are drawn from the
+    #: minority of days with no nearer expiry listed and should not be
+    #: trusted. The original confound was real either way: `nearest()`
+    #: simply took whatever weekly expiry was within 7 days, so a single
+    #: reported result averaged eight different instruments.
+    #:
+    #: Measured over 574 sessions, entries landed at 0 days
     #: (21%), 1 day (19%), 2 (15%), 3 (14%), 4 (6%), 5 (6%) and 6 (18%).
     #: A credit spread expiring today and one expiring in six days have
     #: almost nothing in common — decay, gamma and breach probability all
@@ -187,6 +194,7 @@ def _resolve_legs(
         option_type=option_type,
         strikes_out_of_the_money=geometry.short_otm,
         max_days_to_expiry=geometry.max_days_to_expiry,
+        min_days_to_expiry=geometry.min_days_to_expiry,
     )
     long = contracts.nearest(
         on=on,
@@ -194,13 +202,9 @@ def _resolve_legs(
         option_type=option_type,
         strikes_out_of_the_money=geometry.short_otm + geometry.width_strikes,
         max_days_to_expiry=geometry.max_days_to_expiry,
+        min_days_to_expiry=geometry.min_days_to_expiry,
     )
     if short is None or long is None:
-        return None
-    # `nearest` enforces only the UPPER bound; the lower one is applied here
-    # so a band like "5-7 days" genuinely excludes the near-expiry trades
-    # rather than silently including every 0-day one as well.
-    if (short.expiry - on).days < geometry.min_days_to_expiry:
         return None
     # Both legs must sit on the SAME expiry. A spread whose legs expire on
     # different days is not a spread — it is two unrelated positions, with

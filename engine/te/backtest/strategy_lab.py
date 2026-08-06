@@ -316,6 +316,13 @@ def run_many(
     target_pct: Decimal = Decimal(20),
     max_hold: dt.timedelta = dt.timedelta(hours=3),
     strikes_out_of_the_money: int = 0,
+    #: Days-to-expiry band, INCLUSIVE. The defaults reproduce the previous
+    #: behaviour exactly (`nearest`'s own 0..7), so every existing caller
+    #: and every recorded regression result is unchanged — but the band is
+    #: now something a caller can CHOOSE rather than inherit. See `_label`
+    #: for why pooling expiries was a confound rather than a detail.
+    min_days_to_expiry: int = 0,
+    max_days_to_expiry: int = 7,
     capital: Paise = _UNLIMITED_SIZING_CAPITAL,
     risk_budget_pct: Decimal = _UNLIMITED_SIZING_RISK_BUDGET_PCT,
     max_position_size_pct: Decimal = _UNLIMITED_SIZING_MAX_POSITION_PCT,
@@ -537,6 +544,8 @@ def run_many(
                     target_pct=target_pct,
                     max_hold=max_hold,
                     strikes_out_of_the_money=strikes_out_of_the_money,
+                    min_days_to_expiry=min_days_to_expiry,
+                    max_days_to_expiry=max_days_to_expiry,
                     capital=trade_capital,
                     risk_budget_pct=risk_budget_pct,
                     max_position_size_pct=max_position_size_pct,
@@ -652,6 +661,8 @@ def _label(
     target_pct: Decimal,
     max_hold: dt.timedelta,
     strikes_out_of_the_money: int,
+    min_days_to_expiry: int = 0,
+    max_days_to_expiry: int = 7,
     capital: Paise = _UNLIMITED_SIZING_CAPITAL,
     risk_budget_pct: Decimal = _UNLIMITED_SIZING_RISK_BUDGET_PCT,
     max_position_size_pct: Decimal = _UNLIMITED_SIZING_MAX_POSITION_PCT,
@@ -667,11 +678,29 @@ def _label(
     a rejected trade, and must not be counted as either a trade or an
     unaffordable signal.
     """
+    # DAYS TO EXPIRY, controlled rather than inherited.
+    #
+    # Until 2026-08-05 this called `nearest` with its defaults, so every
+    # buying result ever produced by this lab pooled whatever expiry
+    # happened to be nearest — 0 days on expiry day, 6 the morning after
+    # one. Those are not the same instrument: an option a day from expiry
+    # has almost no time value left to lose and costs a third as much per
+    # lot, and one six days out has plenty of both. Measured on the real
+    # trade history, the same NIFTY lot cost Rs 2,746 on its expiry day and
+    # Rs 8,976 six days out, and the two winning trades in the account were
+    # both expiry-day.
+    #
+    # Pooling them produced an average that describes no tradeable
+    # instrument — the same confound `SpreadGeometry.min_days_to_expiry`
+    # documents for credit spreads, which the buying side never got.
+    on = entry_ts.astimezone(IST).date()
     contract = contracts.nearest(
-        on=entry_ts.astimezone(IST).date(),
+        on=on,
         index_level=index_level,
         option_type="CE" if direction == "long_call" else "PE",
         strikes_out_of_the_money=strikes_out_of_the_money,
+        max_days_to_expiry=max_days_to_expiry,
+        min_days_to_expiry=min_days_to_expiry,
     )
     if contract is None:
         return None, False

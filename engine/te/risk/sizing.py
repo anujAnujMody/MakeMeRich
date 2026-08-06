@@ -72,6 +72,7 @@ def size_position(
     on: date,
     min_edge_multiple: Decimal,
     max_position_size_pct: Decimal = Decimal(100),
+    max_lots: int | None = None,
 ) -> SizingResult:
     """Rejects (lots=0, rejected_reason set) when the gross edge per lot is
     below `round_trip_cost x min_edge_multiple`, when the risk budget can't
@@ -86,7 +87,23 @@ def size_position(
     budget yet still tie up an outsized share of capital in one bet if the
     stop is close to premium. Defaults to `100` (capital-affordability is
     already the effective ceiling, unchanged from before this parameter
-    existed) so every pre-existing call site behaves identically."""
+    existed) so every pre-existing call site behaves identically.
+
+    `max_lots` is a HARD ceiling applied after the three computed caps, and
+    it exists because the others are all divisions by risk-per-lot. Tighten
+    the stop and `lots_by_risk = risk_budget // risk_per_lot` grows: a
+    Rs 700 per-lot stop against a Rs 2,500 budget buys three lots and loses
+    Rs 2,100, so a "Rs 700 stop-loss" silently means "Rs 700 per lot".
+
+    That is not a hypothetical — it is the exact interaction that makes
+    `te.domain.geometry.RupeeRiskGeometry` meaningless without this. A rupee
+    risk cap and a lot cap are one feature in two files; shipping the first
+    alone would produce a setting that reads as a Rs 700 limit and delivers
+    a multiple of it.
+
+    `None` (the default) means no ceiling, so every pre-existing call site is
+    unchanged. Never rejects on its own: a cap can only reduce a size that
+    was already >= 1, so it cannot turn a tradeable signal into a skip."""
     per_lot_round_trip = costs.round_trip(
         entry_premium=premium, exit_premium=target_premium, qty=lot_size, exchange=exchange, on=on
     ).total
@@ -157,6 +174,17 @@ def size_position(
                 "and max-position-size caps"
             ),
         )
+    # AFTER the `< 1` check, never inside the `min` above: the three computed
+    # caps can each legitimately reject a signal, and their reasons name the
+    # constraint that bound. `max_lots` is an owner-set ceiling, not a
+    # constraint discovered from the account, so it must never be the thing
+    # that turns a tradeable signal into a skip — folding it into the `min`
+    # would let `max_lots=0` produce a rejection whose message blames the
+    # risk budget.
+    if max_lots is not None:
+        if max_lots < 1:
+            raise ValueError(f"max_lots must be at least 1 when set, got {max_lots}")
+        lots = min(lots, max_lots)
 
     risk_paise = Paise(risk_per_lot * lots)
     total_round_trip = costs.round_trip(

@@ -399,13 +399,28 @@ def daily_net_pnl_paise(session: Session, on: dt.date) -> Paise:
     return Paise(int(total))
 
 
-def total_net_pnl_paise(session: Session) -> Paise:
-    """Lifetime realized net P&L across every closed trade ever, no date
-    filter — unlike `daily_net_pnl_paise`. Feeds account equity
-    (`capital + total_net_pnl_paise + unrealized`) for the max-drawdown
-    guardrail (`te.risk.limits.check_max_drawdown`), which tracks
-    peak-to-current equity across the whole account, not just today."""
-    total = session.execute(select(func.coalesce(func.sum(TradeRow.net_pnl_paise), 0))).scalar_one()
+def total_net_pnl_paise(session: Session, *, since: dt.datetime | None = None) -> Paise:
+    """Realized net P&L across closed trades. Feeds account equity
+    (`capital + total_net_pnl_paise + unrealized`) for both position sizing
+    and the max-drawdown guardrail (`te.risk.limits.check_max_drawdown`),
+    which tracks peak-to-current equity across the whole account, not just
+    today (unlike `daily_net_pnl_paise`).
+
+    `since` is the moment `capital` was last changed
+    (`te.engine.state.get_capital_set_at`). Trades that CLOSED before it
+    are excluded, because they were earned against a different balance and
+    adding them to the new one describes an account that never existed —
+    on 2026-08-05, raising capital from Rs 30,000 to Rs 50,000 would
+    otherwise have sized the next trade off Rs 61,837. `None` (never
+    changed) keeps the lifetime behaviour exactly.
+
+    Filtered on `closed_at`, not `opened_at`: `net_pnl_paise` is only known
+    at close, so a trade straddling the change belongs to the period it
+    settled in — the same instant its P&L became real."""
+    query = select(func.coalesce(func.sum(TradeRow.net_pnl_paise), 0))
+    if since is not None:
+        query = query.where(TradeRow.closed_at >= _utc(since, name="since"))
+    total = session.execute(query).scalar_one()
     return Paise(int(total))
 
 

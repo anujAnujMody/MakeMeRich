@@ -83,7 +83,22 @@ class Settings(BaseSettings):
     #: constraint that actually governs. Measured the same day: at this
     #: capital `size_position` rejects roughly 85% of ORB's signals as
     #: unaffordable — that is the honest picture, not a bug to size around.
-    paper_cycle_capital_paise: int = 3_000_000
+    #: RAISED to Rs 50,000 on 2026-08-05 by the owner. Everything downstream
+    #: is a PERCENTAGE of this number, so the rupee figures move with it and
+    #: the risk shape does not: at this file's own 5% risk default one trade
+    #: risks Rs 1,500 -> Rs 2,500, the position cap stays 50%
+    #: (Rs 15,000 -> Rs 25,000) and the drawdown halt stays 20%
+    #: (Rs 6,000 -> Rs 10,000, measured against PEAK EQUITY, which equals
+    #: capital only at the moment of a re-base). The stop and target are
+    #: percentages of the PREMIUM, not of capital, so they do not move at
+    #: all. `paper_cycle_max_daily_loss_paise` is the one absolute figure —
+    #: see its own comment, which this change forced a re-derivation of.
+    #:
+    #: The live DB may hold a different risk percentage than this default;
+    #: `get_guardrails` prefers the stored value, and on 2026-08-05 that was
+    #: 3% (Rs 1,500) against this file's 5%. Read the API, not this line,
+    #: for what is actually in force.
+    paper_cycle_capital_paise: int = 5_000_000
     #: Capped by `te.engine.state.MAX_RISK_PER_TRADE_PCT` — see the ceilings
     #: comment there for the risk-of-ruin arithmetic. Shipping a default
     #: above the ceiling would mean the very first read clamped it, which
@@ -133,21 +148,34 @@ class Settings(BaseSettings):
     #: entire loss. Its stop never fired; the clock closed it. It carried full
     #: downside while its upside was arithmetically unreachable.
     paper_cycle_min_minutes_before_hard_exit: int = 40
-    #: Rs 2,000 — chosen by the owner on 2026-08-05, not derived. Against the
-    #: Rs 30,000 capital above it is 6.67%, just under the 7% ceiling in
-    #: `te.engine.state.MAX_DAILY_LOSS_PCT_OF_CAPITAL`, so it is a real limit
-    #: rather than one the clamp imposes.
+    #: Rs 2,500 — DERIVED, not chosen: it is exactly one full stop-out at the
+    #: capital and risk percentage in force, which is the rule this limit has
+    #: always encoded ("one full stop-out, then stand down").
     #:
-    #: It is sized against the STOP, and must be re-derived whenever
-    #: `paper_cycle_risk_budget_pct` changes: at 5% risk one trade can lose
-    #: ~Rs 1,500, so Rs 2,000 permits ONE full stop-out and then stands the
-    #: day down. Raised from Rs 1,000 for exactly that reason — at Rs 1,000
-    #: the first losing trade would already have breached the day's limit,
-    #: which over a 1-2 month paper run collects almost no sample.
+    #:     risk_budget_pct x capital = 5% x Rs 50,000 = Rs 2,500
     #:
-    #: Still kept in step with `paper_cycle_capital_paise` — if capital ever
-    #: falls, re-check this against the 7% ceiling or the first read clamps it.
-    paper_cycle_max_daily_loss_paise: int = 200_000
+    #: So it must be re-derived whenever `paper_cycle_risk_budget_pct` OR
+    #: `paper_cycle_capital_paise` changes. It did not track either of them
+    #: through two such changes, and the resulting mismatch is why this
+    #: comment spells the derivation out rather than stating a number:
+    #:
+    #: * Rs 30,000 @ 5% -> Rs 1,500 risk, and Rs 2,000 left room for one
+    #:   loser. The rule held.
+    #: * Rs 50,000 @ 5% -> Rs 2,500 risk against an UNCHANGED Rs 2,000 cap.
+    #:   One losing trade now exceeded the whole day's budget, so the first
+    #:   loser breached the halt before it had even finished losing. The
+    #:   engine was effectively capped at one trade a day, which is not what
+    #:   `paper_cycle_max_trades_per_day = 20` says.
+    #:
+    #: Raised to Rs 2,500 by the owner on 2026-08-06, restoring the rule.
+    #: Against Rs 50,000 that is 5%, inside the 7% ceiling in
+    #: `te.engine.state.MAX_DAILY_LOSS_PCT_OF_CAPITAL` (Rs 3,500), so it is a
+    #: real limit rather than one the clamp imposes.
+    #:
+    #: The live DB is authoritative and may differ from this default —
+    #: `get_guardrails` prefers the stored value. Read `GET
+    #: /api/engine/guardrails`, not this line, for what is actually in force.
+    paper_cycle_max_daily_loss_paise: int = 250_000
     paper_cycle_max_concurrent_positions: int = 5
     #: Stand down from NEW entries for the rest of the day after this many
     #: consecutive losing trades (`0` disables). Three is the conventional
@@ -157,7 +185,73 @@ class Settings(BaseSettings):
     #: exits; only new entries stop. See `te.risk.limits.
     #: check_consecutive_losses`.
     paper_cycle_max_consecutive_losses: int = 3
-    paper_cycle_max_trades_per_day: int = 20
+    #: 3, matching `te.backtest.strategy_lab.MAX_ENTRIES_PER_DAY` exactly.
+    #:
+    #: Was 20, with no comment and no derivation — the only bare number in
+    #: this block. Three things were wrong with it, found 2026-08-06:
+    #:
+    #: 1. Every backtest result this project has ever produced was measured
+    #:    with a cap of THREE entries per day. Live ran at 20, so live was
+    #:    not the thing that was measured.
+    #: 2. Measured cost per round trip across all 22 real trades averages
+    #:    Rs 100.95 (min 65.12, max 210.63). Twenty trades is Rs 2,019/day of
+    #:    charges against a Rs 500-1,000/day income target — the ceiling cost
+    #:    twice the best case.
+    #: 3. It could never bind anyway. With `paper_cycle_max_daily_loss_paise`
+    #:    at one full stop-out, a single loser ends the day, so no path
+    #:    through the code reaches trade 20. It was a number on a dashboard
+    #:    that no execution could produce.
+    #:
+    #: The backtest cap is per strategy per day on ONE instrument, and live
+    #: runs three; 9 would be the like-for-like reading. 3 is chosen instead
+    #: because 9 has never been measured and 3 has.
+    paper_cycle_max_trades_per_day: int = 3
+    #: Hard ceiling on lots per position, applied after every computed sizing
+    #: cap (`te.risk.sizing.size_position`). `None` = no ceiling.
+    #:
+    #: 1, and it is not a preference — it is what makes
+    #: `paper_cycle_max_loss_per_trade_paise` below mean what it says. Sizing
+    #: computes `lots = risk_budget // risk_per_lot`, so capping the per-lot
+    #: risk at Rs 700 against a Rs 2,500 budget buys THREE lots and loses
+    #: Rs 2,100. The rupee cap and the lot cap are one feature.
+    #:
+    #: It also matches how this account actually trades: every real trade so
+    #: far has been 1 lot, because affordability rejected anything larger.
+    paper_cycle_max_lots: int | None = 1
+    #: The rupee loss ONE trade may take, in paise. `None` falls back to the
+    #: percentage geometry above.
+    #:
+    #: Rs 700, set by the owner on 2026-08-06 after a NIFTY trade lost
+    #: Rs 2,272 — 4.5% of a Rs 50,000 account in one trade — under a 20%
+    #: premium stop. The ask was "buy what the signal picks, cap my loss",
+    #: which neither percentage-of-premium nor absolute-premium-distance can
+    #: express across instruments with different lot sizes. See
+    #: `te.domain.geometry.RupeeRiskGeometry`.
+    #:
+    #: It also composes with `paper_cycle_max_trades_per_day = 3` and
+    #: `paper_cycle_max_daily_loss_paise = Rs 2,500`: three full stop-outs is
+    #: Rs 2,100, inside the daily halt, so the day's limits are reachable in
+    #: the intended order rather than one rule pre-empting the others.
+    #:
+    #: What this DOES NOT do is make the strategy profitable. ORB scores the
+    #: same as random entry; this changes the size of a loss, not its
+    #: likelihood.
+    paper_cycle_max_loss_per_trade_paise: int | None = 70_000
+    #: Target distance as a MULTIPLE of the rupee risk, used only when
+    #: `paper_cycle_max_loss_per_trade_paise` is set.
+    #:
+    #: 10 = risk Rs 700 to make Rs 7,000. Deliberately far, because the
+    #: previous 1:1 geometry (20% stop, 20% target) capped every winner at
+    #: exactly the size of every loser — profit was limited by configuration,
+    #: not by the market.
+    #:
+    #: A distant target rather than NO target: a genuinely uncapped position
+    #: needs a TRAILING stop to protect it, and the trail is the one exit
+    #: rule never backtested here (the last live trail closed 14 of 14 trades
+    #: at a 3.1-minute average hold). 10x is reachable — on a Rs 166.80
+    #: premium it is +65%, which real intraday options do print — so this is
+    #: a real ceiling, not a sentinel dressed up as one.
+    paper_cycle_target_risk_multiple: Decimal = Decimal(10)
 
     # --- Option contract resolution (see te/engine/contract.py) ---
     #: Strike offset handed to OpenAlgo's `optionsymbol` service: `ATM`,
@@ -276,23 +370,38 @@ class Settings(BaseSettings):
     #: expectancy, and does not fix the underlying strategy's slightly
     #: negative edge. `None` disables the rule (must be set together with
     #: `paper_cycle_profit_lock_buffer_pct`).
-    #: DISABLED 2026-08-05, and the reason matters more than the value.
+    #: RE-ENABLED 2026-08-06 at the values it was measured with, and the
+    #: history is kept here because the disable was a mistake in process even
+    #: where it was right on the merits.
     #:
-    #: It was +15% against a 20% target. When stop/target moved to 8%/8% for
-    #: affordability, +15% became UNREACHABLE — the target fires at +8%, so
-    #: the lock could never activate. Left at 15 it would have been a rule
-    #: that reads as enabled, is displayed as enabled, and can never fire
-    #: once; that is exactly the kind of thing `honest-metrics` exists to
-    #: refuse.
+    #: It was disabled on 2026-08-05 inside `af4d53e` ("let a Rs 30,000
+    #: account actually buy a lot on a normal day"), which moved stop/target
+    #: to 8%/8% for affordability. At an 8% target a +15% activation is
+    #: UNREACHABLE — the target closes the trade first — so the lock would
+    #: have read as enabled, displayed as enabled, and been structurally
+    #: incapable of firing even once. Turning it off was the honest response
+    #: to that; bundling a live risk-behaviour change into an unrelated
+    #: affordability commit, without surfacing it as its own decision, was
+    #: not.
     #:
-    #: Not simply rescaled to +5%/2%, because the 15%/5% pair is not an
-    #: arbitrary shape — it is what was backtested against 1,305 real NIFTY
-    #: ORB trades. Scaled-down numbers have never been measured, and
-    #: shipping them would quietly claim that study's result for a rule it
-    #: never tested. Re-enable only after re-running that backtest at the
-    #: new geometry.
-    paper_cycle_profit_lock_activation_pct: Decimal | None = None
-    paper_cycle_profit_lock_buffer_pct: Decimal | None = None
+    #: It was NOT rescaled to +5%/2% at the time, and that call stands: the
+    #: 15%/5% pair is not an arbitrary shape, it is what was backtested
+    #: against 1,305 real NIFTY ORB trades. Scaled-down numbers have never
+    #: been measured, and shipping them would quietly claim that study's
+    #: result for a rule it never tested.
+    #:
+    #: The precondition is now gone — stop/target are back at 20%/20%, which
+    #: is exactly the geometry the 1,305-trade study used, so +15% is
+    #: reachable again and these values describe a rule that was actually
+    #: measured. Measured cost of the ten days it spent disabled: ZERO. All
+    #: three trades in that window (ids 20-22) peaked at -4.0%, -1.3% and
+    #: +2.5% against a +15% trigger, so none would have activated it.
+    #:
+    #: If stop/target ever move away from 20%/20% again, this pair must move
+    #: with them or be disabled again — the activation percentage is only
+    #: meaningful relative to the target that can pre-empt it.
+    paper_cycle_profit_lock_activation_pct: Decimal | None = Decimal(15)
+    paper_cycle_profit_lock_buffer_pct: Decimal | None = Decimal(5)
     #: Reject a resolved contract whose bid-ask spread exceeds this % of LTP.
     #: Live NIFTY chain (2026-07-31) runs 0.1-0.4% through OTM5 and widens to
     #: ~1.1% by OTM8, so 1.0% admits the liquid band and excludes the rest.
