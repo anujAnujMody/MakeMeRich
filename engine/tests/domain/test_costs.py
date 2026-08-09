@@ -71,6 +71,34 @@ def test_worked_example(model: CostModel) -> None:
     assert breakdown.total == 6511  # ₹65.11 — the plan's ground truth
 
 
+def test_worked_example_bfo(model: CostModel) -> None:
+    """The BFO twin of `test_worked_example` — SENSEX lot 20, priced at BSE's
+    3.25 bps exchange_txn rate rather than NFO's 3.553. Pinned entirely by
+    hand so the two exchanges can never collapse into the same number (see
+    `round_trip`/`leg`'s `rates.exchange_txn_bps[exchange]` lookup)."""
+    qty = 20  # SENSEX lot size
+    entry_premium = Paise(10_000)  # ₹100
+    exit_premium = Paise(12_000)  # ₹120
+
+    breakdown = model.round_trip(
+        entry_premium=entry_premium, exit_premium=exit_premium, qty=qty, exchange="BFO", on=ON
+    )
+    #   brokerage      = 2000 * 2                                       = 4000
+    #   STT (sell only)= 0.15% * (12000 * 20)         = 0.0015*240000   = 360
+    #   exchange_txn   = 0.0325% * ((10000+12000)*20) = 0.000325*440000 = 143.0 -> 143
+    #   sebi           = 0.0001% * 440000              = 0.000001*440000= 0.044 -> 0
+    #   gst            = 18% * (4000+143+0) = 18%*4143                  = 745.74 -> 746
+    #   stamp (buy only)=0.003% * (10000*20)=0.00003*200000             = 6.0   -> 6
+    #   total = 4000+360+143+0+746+6 = 5255
+    assert breakdown.brokerage == 4000
+    assert breakdown.stt == 360
+    assert breakdown.exchange_txn == 143
+    assert breakdown.sebi == 0
+    assert breakdown.gst == 746
+    assert breakdown.stamp == 6
+    assert breakdown.total == 5255
+
+
 def test_fixed_brokerage_is_regressive(model: CostModel) -> None:
     """At ₹20 premium, brokerage+GST dominates total round-trip cost —
     the exact trap that makes far-cheap strikes a bad idea regardless of

@@ -21,6 +21,13 @@ HISTORY = [10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0, 21.
 def test_vix_terciles_split_history_into_thirds() -> None:
     lo, hi = vix_terciles(HISTORY)
     assert lo < hi
+    # The literal 33rd/66th percentile of HISTORY via
+    # `statistics.quantiles(HISTORY, n=3, method="inclusive")` — every other
+    # test in this file only probes RELATIVE to whatever `vix_terciles()`
+    # itself returns, so `lo, hi = min(history), max(history)` (full-range,
+    # not terciles) would still satisfy every assertion except this one.
+    assert lo == pytest.approx(13.666666666666666)
+    assert hi == pytest.approx(17.333333333333332)
 
 
 def test_vix_terciles_empty_history_raises() -> None:

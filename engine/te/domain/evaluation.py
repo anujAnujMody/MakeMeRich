@@ -79,6 +79,12 @@ class ConditionResult:
                 f'evaluated=False requires actual == "{_NOT_REACHED}" (short-circuited) or a '
                 f'"{NOT_EVALUATED_PREFIX}<why>" explanation (reached, but unmeasurable), got {self.actual!r}'
             )
+        if not self.evaluated and self.passed:
+            raise ValueError(
+                "evaluated=False cannot carry passed=True — an unevaluated condition has no honest claim to "
+                "having passed. Use passed=False and read `.outcome` (which reports 'unmeasurable' or "
+                "'not_reached') instead of the raw `passed` flag."
+            )
 
 
 @dataclass(frozen=True)

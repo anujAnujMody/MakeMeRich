@@ -228,3 +228,12 @@ def test_endpoint_returns_honest_zero_state(
     assert "X-TE-Provenance" in response.headers
     assert "X-TE-Sample-Size" in response.headers
     assert "X-TE-Not-Ready-Reason" in response.headers
+
+    # A header whose VALUE is never checked is not a check — a route could
+    # claim `X-TE-Sample-Size: 1` on every honest zero-state body, or drop
+    # its not-ready reason entirely, and this test would still pass without
+    # the assertions below. Pin both whenever a route says it has nothing
+    # real to show.
+    if response.headers["X-TE-Provenance"] == "none":
+        assert response.headers["X-TE-Sample-Size"] == "0"
+        assert response.headers["X-TE-Not-Ready-Reason"] != ""

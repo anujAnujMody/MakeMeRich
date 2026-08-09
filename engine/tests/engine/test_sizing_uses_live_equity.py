@@ -39,7 +39,7 @@ from te.domain.clock import IST
 from te.domain.costs import CostModel, select_rates
 from te.domain.geometry import AbsolutePointGeometry
 from te.domain.money import Paise
-from te.engine.cycle import CycleConfig, run_entry_cycle
+from te.engine.cycle import CycleConfig, run_entry_cycle, run_exit_cycle
 from te.execution.manager import ExecutionManager
 from te.execution.store import OrderEventStore
 from te.persistence.db import make_engine, make_session_factory
@@ -161,18 +161,28 @@ def _lots_taken(  # noqa: ANN001
 
 def test_a_realised_profit_increases_buying_power(session_factory, store, cost_model) -> None:  # noqa: ANN001
     """The behaviour the owner expected and the engine did not have: make
-    money, and the next trade may be larger."""
+    money, and the next trade may be larger.
+
+    Rs 10,000 capital at 10% risk budget = Rs 1,000; risk per lot is
+    `stop_distance 700p x lot 65` = Rs 455, so `100_000 // 45_500 = 2` lots.
+    A profit small enough to leave the budget under Rs 1,820 (4 lots'
+    worth) sizes IDENTICALLY whether or not it ever reaches sizing at all —
+    `2 >= 2` is true by construction and would pass even if profits were
+    silently discarded. +Rs 9,000 crosses a real lot boundary: equity
+    Rs 19,000 gives a Rs 1,900 budget, `190_000 // 45_500 = 4` lots — a
+    STRICT increase that can only happen if the profit reached sizing."""
     flat = _lots_taken(session_factory, store, cost_model, Paise(1_000_000))
+    assert flat == 2, "fixture assumption changed — recompute the boundary-crossing profit"
 
     fresh = session_factory
-    _settle(fresh, 1_000_00)  # +Rs 1,000 realised
+    _settle(fresh, 9_000_00)  # +Rs 9,000 realised
     with fresh() as session:
         session.query(OpenPositionRow).delete()
         session.commit()
     after_profit = _lots_taken(fresh, store, cost_model, Paise(1_000_000), minute=63)
 
-    assert after_profit >= flat
-    assert after_profit > 0
+    assert after_profit > flat, "a real profit must strictly increase buying power"
+    assert after_profit == 4
 
 
 def test_a_realised_loss_reduces_buying_power(session_factory, store, cost_model) -> None:  # noqa: ANN001
@@ -205,19 +215,111 @@ def test_a_wiped_out_account_takes_no_trade(session_factory, store, cost_model) 
     assert _lots_taken(session_factory, store, cost_model, Paise(100_000)) == 0
 
 
-def test_open_position_marks_do_not_resize_the_next_entry(session_factory, store, cost_model) -> None:  # noqa: ANN001
+_SECOND_INSTRUMENT = "BANKNIFTY30JUL2652000CE"
+
+
+def _second_instrument_store(tmp_path: Path) -> BarStore:
+    """The same clean 60-minute-range-then-breakout shape as `store`, for a
+    SECOND, independent underlying — needed so the second entry cycle below
+    does not collide with the first instrument's per-session entry cap."""
+    s = BarStore(tmp_path / "bars2")
+    rows = [_bar(_open(i), o=30, h=31, low=29, c=30, v=1_000) for i in range(60)]
+    rows.append(_bar(_open(61), o=30, h=38, low=30, c=36, v=5_000))
+    for row in rows:
+        row = dict(row)
+        row["symbol"] = _SECOND_INSTRUMENT
+        s.append(pd.DataFrame([row], columns=list(BAR_COLUMNS)))
+    return s
+
+
+def test_open_position_marks_do_not_resize_the_next_entry(
+    session_factory, store, cost_model, tmp_path: Path
+) -> None:  # noqa: ANN001
     """Sizing equity is REALISED-only, while the drawdown breaker's equity
     also carries unrealised. An open position's minute-by-minute paper
     profit must not change what the next entry stakes — it has not settled
-    and can reverse before it does."""
-    first = _lots_taken(session_factory, store, cost_model, Paise(1_000_000))
-    # The position from that call is still OPEN and carries a mark; nothing
-    # has been realised, so a second identical cycle must size identically.
+    and can reverse before it does.
+
+    The position from the first call is left OPEN and carrying a real
+    unrealised mark (previously this test DELETED that row before the
+    second cycle ran, which made the deliberate realised/unrealised split
+    this test exists to protect impossible to observe — with no open
+    position, `unrealized_pnl_paise` returns exactly 0 no matter what the
+    code does with it). The second entry is on a DIFFERENT underlying so
+    the per-session entry cap on the FIRST symbol cannot mask the result.
+
+    Rs 30,000 capital, so the first position sizes to several lots and the
+    unrealised profit below (~Rs 5,265 on 6 lots) is big enough to cross a
+    real lot boundary on the SECOND entry's own sizing (budget Rs 3,000 ->
+    Rs 3,526, 6 lots -> 7) if it ever leaked in — a smaller profit would size
+    identically either way and prove nothing, the same gap finding 6 closes."""
+    capital = Paise(3_000_000)
+    first = _lots_taken(session_factory, store, cost_model, capital)
+    assert first > 0
     with session_factory() as session:
         assert session.query(OpenPositionRow).count() == 1
-        session.query(OpenPositionRow).delete()
-        session.commit()
+        open_row = session.query(OpenPositionRow).one()
+        entry_premium = open_row.entry_premium_paise
+        target = open_row.target_paise
 
-    again = _lots_taken(session_factory, store, cost_model, Paise(1_000_000), minute=63)
+    # A REAL, large paper profit on the still-open NIFTY position — short of
+    # target so it stays open, comfortably above the trailing activation so
+    # the ratchet doesn't accidentally close it either.
+    profit_mark = Paise(entry_premium + (target - entry_premium) * 9 // 10)
+    closed = run_exit_cycle(
+        session_factory=session_factory,
+        execution=ExecutionManager(
+            session_factory, OrderEventStore(session_factory), SimulatedBroker(cost_model=cost_model, on=ON), _NoLimiter()
+        ),
+        cost_model=cost_model,
+        current_premium=lambda row: profit_mark,
+        as_of=_open(62),
+    )
+    assert closed == [], "the position must still be open, carrying a real unrealised profit"
+    with session_factory() as session:
+        assert session.query(OpenPositionRow).filter(OpenPositionRow.closed_at.is_(None)).count() == 1
 
-    assert again == first
+    second_store = _second_instrument_store(tmp_path)
+    second_config = CycleConfig(
+        mode="paper",
+        strategy_name="orb",
+        instruments=(_SECOND_INSTRUMENT,),
+        exchange=EXCHANGE,
+        lot_size=65,
+        capital=capital,
+        risk_budget_pct=Decimal(10),
+        min_edge_multiple=Decimal("1.2"),
+        exit_geometry=AbsolutePointGeometry(
+            stop_distance=Paise(700), target_distance=Paise(1_500), trailing_distance=Paise(300)
+        ),
+        max_hold=dt.timedelta(hours=3),
+        hard_exit_by=dt.time(15, 20),
+        risk_limits=RiskLimitsConfig(
+            max_daily_loss_paise=Paise(100_000_00), max_concurrent_positions=5, max_trades_per_day=20
+        ),
+    )
+    broker = SimulatedBroker(cost_model=cost_model, on=ON)
+    execution = ExecutionManager(session_factory, OrderEventStore(session_factory), broker, _NoLimiter())
+    run_entry_cycle(
+        session_factory=session_factory,
+        store=second_store,
+        execution=execution,
+        cost_model=cost_model,
+        config=second_config,
+        as_of=_open(63),
+        # The open NIFTY position's mark, fed through explicitly so the
+        # entry cycle's own `unrealized_pnl_paise` call actually sees the
+        # real paper profit rather than falling back to a bar-derived price
+        # near entry (which would barely exercise the guard).
+        current_premium=lambda row: profit_mark if row.symbol == INSTRUMENT else None,
+    )
+
+    with session_factory() as session:
+        second_row = (
+            session.query(OpenPositionRow)
+            .filter(OpenPositionRow.symbol == _SECOND_INSTRUMENT)
+            .order_by(OpenPositionRow.id.desc())
+            .first()
+        )
+    assert second_row is not None, "the second underlying's entry must not have been blocked"
+    assert second_row.lots == first, "an unsettled open-position mark must not resize the next entry"

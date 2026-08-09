@@ -80,12 +80,20 @@ def _open(minute: int) -> dt.datetime:
 
 
 def _breakout_store(tmp_path: Path) -> BarStore:
+    # Matches `tests/engine/test_cycle.py`'s `_breakout_store`: `OrbStrategy`
+    # defaults to a 60-minute opening range, so the breakout bar must sit at
+    # `_open(60)` (10:15) or later. The previous `_open(15)` breakout bar sat
+    # INSIDE the opening range window, so `breakout_bars` was always empty and
+    # every run below — rule-only, forced-p, and exploding-hook alike —
+    # skipped identically on "opening range not yet formed". Both tests in
+    # this file compared `(0, 1) == (0, 1)`, which is true no matter what the
+    # ML block actually does; see `test_a_trade_actually_fires_here_precondition`.
     store = BarStore(tmp_path / "bars")
     rows = [
         _bar(_open(0), o=30, h=32, low=28, c=30, v=1_000),
         _bar(_open(1), o=30, h=31, low=29, c=30.2, v=1_000),
         _bar(_open(2), o=30, h=31, low=29, c=30.1, v=1_000),
-        _bar(_open(15), o=30, h=38, low=30, c=36, v=2_000),
+        _bar(_open(60), o=30, h=38, low=30, c=36, v=2_000),
     ]
     store.append(pd.DataFrame(rows, columns=list(BAR_COLUMNS)))
     return store
@@ -136,13 +144,17 @@ def _set_stage(session_factory, stage: Stage) -> None:  # noqa: ANN001
     MaturityGate(session_factory).set_stage(stage, actor="test")
 
 
-def _decision(session_factory) -> tuple[int, int]:  # noqa: ANN001
-    """`(open_positions_count, skipped_signals_count)` — the observable
-    "trading decision" this test asserts is byte-identical across stage x p."""
+def _decision(session_factory) -> tuple[int, int, tuple[str, ...]]:  # noqa: ANN001
+    """`(open_positions_count, skipped_signals_count, skip_reasons)` — the
+    observable "trading decision" this test asserts is byte-identical across
+    stage x p. Skip reasons are included (not just their count) so a mutation
+    that changes WHY a signal skipped, without changing the counts, is still
+    caught."""
     with session_factory() as session:
         return (
             session.query(OpenPositionRow).count(),
             session.query(SkippedSignalRow).count(),
+            tuple(sorted(row.reason for row in session.query(SkippedSignalRow).all())),
         )
 
 
@@ -154,7 +166,7 @@ def _run(session_factory, execution, cost_model, tmp_path, *, ml_hook):  # noqa:
         execution=execution,
         cost_model=cost_model,
         config=_config(),
-        as_of=_open(16),
+        as_of=_open(61),
         ml_hook=ml_hook,
     )
     return _decision(session_factory)
@@ -174,6 +186,14 @@ def test_ml_cannot_affect_decisions_below_gating(
     advisory stages, at p=0.0, 0.5, and 1.0, produces a trading decision
     byte-identical to the rule-only decision (no `ml_hook` at all)."""
     rule_only_decision = _run(session_factory, execution, cost_model, tmp_path, ml_hook=None)
+    # A precondition, not the real assertion: proves this fixture actually
+    # trades before the rest of the test relies on that. Without it, a
+    # stale/broken fixture that always skips makes `ml_decision ==
+    # rule_only_decision` vacuously true for ANY ML behaviour — the exact
+    # failure mode this test previously had (see `_breakout_store`).
+    assert rule_only_decision[:2] == (1, 0), (
+        f"fixture did not trade as expected — got {rule_only_decision}, so the comparison below would be vacuous"
+    )
 
     # Fresh DB for the ML-influenced run so both runs start from the same
     # empty state and are directly comparable.
@@ -229,6 +249,9 @@ def test_a_failing_ml_hook_cannot_stop_the_cycle_trading(
     wired into production.
     """
     rule_only_decision = _run(session_factory, execution, cost_model, tmp_path, ml_hook=None)
+    assert rule_only_decision[:2] == (1, 0), (
+        f"fixture did not trade as expected — got {rule_only_decision}, so the comparison below would be vacuous"
+    )
 
     fresh_engine = make_engine(f"sqlite:///{tmp_path / 'exploding.db'}")
     Base.metadata.create_all(fresh_engine)

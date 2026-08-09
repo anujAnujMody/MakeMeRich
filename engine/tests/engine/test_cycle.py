@@ -21,6 +21,7 @@ from te.domain.clock import IST
 from te.domain.costs import CostModel, select_rates
 from te.domain.geometry import AbsolutePointGeometry, PremiumPercentGeometry
 from te.domain.money import Paise
+from te.domain.signal import ExitPlan
 from te.engine.contract import ResolvedContract
 from te.engine.cycle import CycleConfig, InstrumentConfig, run_entry_cycle, run_exit_cycle, unrealized_pnl_paise
 from te.engine.state import get_last_cycle_pipeline
@@ -188,6 +189,12 @@ def test_entry_cycle_records_real_pipeline_timing_when_a_trade_fires(
         stage = pipeline.stages[key]
         assert stage.reached is True, f"{key} should have reached on a real trade"
         assert stage.elapsed_ms >= 0
+    # `>= 0` alone is satisfied by a hardcoded constant (including 0) on
+    # every stage, which would fabricate the dashboard's "Current cycle"
+    # strip rather than measure it. The SUM across a real cycle that did
+    # genuine I/O/DB work must be strictly positive.
+    total_elapsed_ms = sum(pipeline.stages[key].elapsed_ms for key in ("fetch", "analyze", "risk", "decide", "act"))
+    assert total_elapsed_ms > 0, "pipeline timing looks fabricated — a real cycle must take measurable time"
 
 
 def test_entry_cycle_leaves_decide_and_act_unreached_when_every_instrument_skips(
@@ -411,6 +418,80 @@ def test_a_daily_loss_breach_is_caught_even_when_no_instrument_has_a_signal(
         assert is_halted(session) is True
 
 
+def test_the_daily_loss_limit_sees_an_open_loss_with_no_closed_trades_at_all(
+    session_factory,
+    execution,
+    cost_model: CostModel,
+    tmp_path: Path,  # noqa: ANN001
+) -> None:
+    """The sibling `unrealized_pnl_paise` is a function is tested at
+    `tests/engine/test_unpriceable_positions.py::
+    test_the_daily_loss_limit_can_see_an_open_loss`, but that never proves
+    `run_entry_cycle` actually feeds its result to the halt — every
+    `RiskLimitsConfig` in this file's OTHER daily-loss test seeds a CLOSED
+    `TradeRow` (net_pnl alone already breaches), so `unrealized` is never
+    load-bearing there. Here there is no closed trade at all — realized P&L
+    is exactly zero — so only a real open, underwater position can trip the
+    halt."""
+    store = _no_signal_store(tmp_path)  # no bars at all -> no instrument can ever fire a signal
+    config = _config(
+        instruments=("NIFTY", "BANKNIFTY"),
+        risk_limits=RiskLimitsConfig(
+            max_daily_loss_paise=Paise(2_000_00), max_concurrent_positions=5, max_trades_per_day=20
+        ),
+    )
+    as_of = _open(1)
+
+    entry_premium = Paise(5_000)
+    with session_factory() as session:
+        from te.persistence.repos.paper_trading import insert_open_position
+
+        insert_open_position(
+            session,
+            client_order_id="c-open-underwater",
+            symbol=INSTRUMENT,
+            exchange=EXCHANGE,
+            strategy="orb",
+            direction="long_call",
+            lots=1,
+            lot_size=65,
+            entry_premium=entry_premium,
+            exit_plan=ExitPlan(
+                entry_premium=entry_premium,
+                stop=Paise(3_500),
+                trailing_distance=None,
+                target=Paise(8_000),
+                max_hold=dt.timedelta(hours=3),
+                hard_exit_by=dt.time(15, 20),
+            ),
+            opened_at=as_of - dt.timedelta(hours=1),
+        )
+        session.commit()
+
+    from te.execution.halt import is_halted
+
+    with session_factory() as session:
+        assert is_halted(session) is False, "must not already be halted before the cycle runs"
+
+    run_entry_cycle(
+        session_factory=session_factory,
+        store=store,
+        execution=execution,
+        cost_model=cost_model,
+        config=config,
+        as_of=as_of,
+        # Deep underwater: Rs 45 lost per unit x 65 qty = Rs 2,925 gross,
+        # well past the Rs 2,000 cap, and realized P&L is exactly 0.
+        current_premium=lambda row: Paise(500),
+    )
+
+    with session_factory() as session:
+        assert is_halted(session) is True
+        skips = session.query(SkippedSignalRow).all()
+        assert {s.instrument for s in skips} == {"NIFTY", "BANKNIFTY"}
+        assert all("daily loss limit" in s.reason for s in skips)
+
+
 def test_skipped_signal_persisted_when_sizing_rejects_zero_lots(
     session_factory,
     execution,
@@ -506,6 +587,55 @@ def test_paper_trade_pnl_is_net(
     # actually risking?" is unanswerable from the trade record alone.
     assert trade.stop_paise == opened_stop_paise
     assert trade.target_paise == opened_target_paise
+
+
+def test_max_hold_exit_books_the_last_real_mark_not_the_entry_premium(
+    session_factory,
+    execution,
+    cost_model: CostModel,
+    tmp_path: Path,  # noqa: ANN001
+) -> None:
+    """End-to-end proof that a max-hold close writes a real, live mark into
+    `trades`, not the position's own entry premium — the calibration bug
+    that would otherwise record a fabricated gross P&L of exactly zero on
+    every max-hold exit. `test_exits.py::test_max_hold_time_exit_fires`
+    pins the same thing at the pure-function level; this drives it through
+    the real persisted cycle."""
+    store = _breakout_store(tmp_path)
+    config = _config()
+    entry_at = _open(61)
+
+    run_entry_cycle(
+        session_factory=session_factory,
+        store=store,
+        execution=execution,
+        cost_model=cost_model,
+        config=config,
+        as_of=entry_at,
+    )
+    with session_factory() as session:
+        open_row = session.query(OpenPositionRow).one()
+        entry_premium = open_row.entry_premium_paise
+
+    # Neither the stop nor the target — a real live mark distinct from
+    # entry, so a mutation that books entry instead is observable.
+    live_mark = Paise(entry_premium + 50)
+    past_max_hold = entry_at + config.max_hold + dt.timedelta(minutes=1)
+
+    closed = run_exit_cycle(
+        session_factory=session_factory,
+        execution=execution,
+        cost_model=cost_model,
+        current_premium=lambda row: live_mark,
+        as_of=past_max_hold,
+    )
+
+    assert len(closed) == 1
+    with session_factory() as session:
+        trade = session.query(TradeRow).one()
+    assert trade.exit_reason == "time"
+    assert trade.exit_premium_paise == int(live_mark)
+    assert trade.exit_premium_paise != entry_premium, "must not have booked the entry premium as the exit"
 
 
 def test_the_profit_lock_engages_then_exits_at_a_real_locked_profit(
@@ -642,6 +772,155 @@ def test_a_downstream_block_corrects_the_persisted_traded_verdict(
         evaluation = session.query(CycleEvaluationRow).filter(CycleEvaluationRow.instrument == INSTRUMENT).one()
         assert evaluation.verdict == "skipped", "the persisted verdict must not still say 'traded'"
         assert "risk budget" in evaluation.reason, "the real block reason, not the strategy's original one"
+
+
+def test_max_concurrent_positions_binds_on_the_second_cycle(
+    session_factory,
+    execution,
+    cost_model: CostModel,
+    tmp_path: Path,  # noqa: ANN001
+) -> None:
+    """Proves `run_entry_cycle` actually CALLS `check_max_concurrent_positions`
+    (cycle.py:553), not merely that the predicate is correct in isolation
+    (`tests/risk/test_limits.py` covers that). A predicate that is correct
+    and never invoked is indistinguishable from a wrong one — the exact
+    live shape from 2026-08-07."""
+    store = _breakout_store(tmp_path)
+    config = _config(
+        risk_limits=RiskLimitsConfig(
+            max_daily_loss_paise=Paise(100_000_00), max_concurrent_positions=1, max_trades_per_day=20
+        )
+    )
+
+    run_entry_cycle(
+        session_factory=session_factory,
+        store=store,
+        execution=execution,
+        cost_model=cost_model,
+        config=config,
+        as_of=_open(61),
+    )
+    with session_factory() as session:
+        assert session.query(OpenPositionRow).count() == 1
+
+    run_entry_cycle(
+        session_factory=session_factory,
+        store=store,
+        execution=execution,
+        cost_model=cost_model,
+        config=config,
+        as_of=_open(62),
+    )
+
+    with session_factory() as session:
+        assert session.query(OpenPositionRow).count() == 1, "a second position must not have opened"
+        reasons = [s.reason for s in session.query(SkippedSignalRow).all()]
+    assert any("already open" in r and "1" in r for r in reasons), reasons
+
+
+def test_max_trades_per_day_binds_on_the_second_cycle(
+    session_factory,
+    execution,
+    cost_model: CostModel,
+    tmp_path: Path,  # noqa: ANN001
+) -> None:
+    """Proves `run_entry_cycle` actually CALLS `check_max_trades_per_day`
+    (cycle.py:554). `max_concurrent_positions` is left generous so this
+    fires on its own, not as a side effect of the other guard."""
+    store = _breakout_store(tmp_path)
+    config = _config(
+        risk_limits=RiskLimitsConfig(
+            max_daily_loss_paise=Paise(100_000_00), max_concurrent_positions=5, max_trades_per_day=1
+        )
+    )
+
+    run_entry_cycle(
+        session_factory=session_factory,
+        store=store,
+        execution=execution,
+        cost_model=cost_model,
+        config=config,
+        as_of=_open(61),
+    )
+    with session_factory() as session:
+        assert session.query(OpenPositionRow).count() == 1
+
+    run_entry_cycle(
+        session_factory=session_factory,
+        store=store,
+        execution=execution,
+        cost_model=cost_model,
+        config=config,
+        as_of=_open(62),
+    )
+
+    with session_factory() as session:
+        assert session.query(OpenPositionRow).count() == 1, "a second position must not have opened"
+        reasons = [s.reason for s in session.query(SkippedSignalRow).all()]
+    assert any("already placed" in r and "1" in r for r in reasons), reasons
+
+
+def test_consecutive_losses_binds_on_the_second_cycle(
+    session_factory,
+    execution,
+    cost_model: CostModel,
+    tmp_path: Path,  # noqa: ANN001
+) -> None:
+    """Proves `run_entry_cycle` actually CALLS `check_consecutive_losses`
+    (cycle.py:558) — 6 straight losses against a stand-down of 3 is the exact
+    live incident this guards against. `max_concurrent_positions`/
+    `max_trades_per_day` are left generous so this fires on its own."""
+    store = _breakout_store(tmp_path)
+    config = _config(
+        risk_limits=RiskLimitsConfig(
+            max_daily_loss_paise=Paise(100_000_00),
+            max_concurrent_positions=5,
+            max_trades_per_day=20,
+            max_consecutive_losses=1,
+        )
+    )
+    entry_at = _open(61)
+
+    run_entry_cycle(
+        session_factory=session_factory,
+        store=store,
+        execution=execution,
+        cost_model=cost_model,
+        config=config,
+        as_of=entry_at,
+    )
+    with session_factory() as session:
+        open_row = session.query(OpenPositionRow).one()
+        stop_paise = open_row.stop_paise
+
+    # Close it at the stop -> a real, recorded LOSS.
+    closed = run_exit_cycle(
+        session_factory=session_factory,
+        execution=execution,
+        cost_model=cost_model,
+        current_premium=lambda row: Paise(stop_paise),
+        as_of=entry_at + dt.timedelta(minutes=1),
+    )
+    assert len(closed) == 1
+    with session_factory() as session:
+        trade = session.query(TradeRow).one()
+        assert trade.net_pnl_paise < 0, "fixture must produce a real loss or the streak is never observed"
+
+    run_entry_cycle(
+        session_factory=session_factory,
+        store=store,
+        execution=execution,
+        cost_model=cost_model,
+        config=config,
+        as_of=entry_at + dt.timedelta(minutes=2),
+    )
+
+    with session_factory() as session:
+        assert (
+            session.query(OpenPositionRow).filter(OpenPositionRow.closed_at.is_(None)).count() == 0
+        ), "a second position must not have opened after the losing streak"
+        reasons = [s.reason for s in session.query(SkippedSignalRow).all()]
+    assert any("consecutive losing trade" in r for r in reasons), reasons
 
 
 @pytest.mark.parametrize(
@@ -1110,6 +1389,34 @@ def test_no_entry_without_enough_runway_before_the_hard_exit(
     store = _breakout_store(tmp_path)
     # 15:05 IST, with a 15:20 hard exit: 15 minutes of runway.
     as_of = dt.datetime(2026, 7, 29, 15, 5, tzinfo=IST)
+    config = _config(hard_exit_by=dt.time(15, 20), min_minutes_before_hard_exit=30)
+
+    run_entry_cycle(
+        session_factory=session_factory,
+        store=store,
+        execution=execution,
+        cost_model=cost_model,
+        config=config,
+        as_of=as_of,
+    )
+
+    with session_factory() as session:
+        assert session.query(OpenPositionRow).count() == 0
+        reasons = [r.reason for r in session.query(SkippedSignalRow).all()]
+    assert any("before the hard exit" in r for r in reasons), reasons
+
+
+def test_no_entry_exactly_at_the_runway_boundary(
+    session_factory,  # noqa: ANN001
+    execution,  # noqa: ANN001
+    cost_model: CostModel,
+    tmp_path: Path,
+) -> None:
+    """The sibling above uses 15:05 against a 14:50 boundary (`hard_exit_by
+    15:20 - min_minutes_before_hard_exit 30`), well past the edge — `>`
+    would pass identically. This pins the boundary minute itself."""
+    store = _breakout_store(tmp_path)
+    as_of = dt.datetime(2026, 7, 29, 14, 50, tzinfo=IST)  # exactly the runway boundary
     config = _config(hard_exit_by=dt.time(15, 20), min_minutes_before_hard_exit=30)
 
     run_entry_cycle(

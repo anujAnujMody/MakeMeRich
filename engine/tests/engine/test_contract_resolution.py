@@ -386,6 +386,55 @@ def test_a_stopped_out_position_does_not_reenter_the_same_underlying_same_day(
     assert any("per-session limit" in r for r in reasons), reasons
 
 
+def test_a_still_open_position_alone_also_blocks_reentry_on_the_same_underlying(
+    session_factory, execution, cost_model: CostModel, index_store: BarStore
+) -> None:  # noqa: ANN001
+    """The sibling of `test_a_stopped_out_position_does_not_reenter_the_same_
+    underlying_same_day`, which only exercises the CLOSED half of
+    `underlying_entries_today` (`open_count + closed_count`). This leaves the
+    first position OPEN — no `closed_at`, no `TradeRow` — so only the
+    `open_count` half can be doing the blocking. `check_max_concurrent_
+    positions` is set generous (5) so it cannot be the guard that actually
+    fires here."""
+    config = _config(
+        max_entries_per_underlying_per_day=1,
+        risk_limits=RiskLimitsConfig(
+            max_daily_loss_paise=Paise(10_000_00), max_concurrent_positions=5, max_trades_per_day=20
+        ),
+    )
+
+    cycle_id_1 = run_entry_cycle(
+        session_factory=session_factory,
+        store=index_store,
+        execution=execution,
+        cost_model=cost_model,
+        config=config,
+        as_of=_open(61),
+        contract_resolver=_resolver,
+    )
+    with session_factory() as session:
+        assert session.query(OpenPositionRow).filter(OpenPositionRow.closed_at.is_(None)).count() == 1
+
+    cycle_id_2 = run_entry_cycle(
+        session_factory=session_factory,
+        store=index_store,
+        execution=execution,
+        cost_model=cost_model,
+        config=config,
+        as_of=_open(63),
+        contract_resolver=_resolver,
+    )
+    assert cycle_id_2 != cycle_id_1
+
+    with session_factory() as session:
+        open_count = session.query(OpenPositionRow).filter(OpenPositionRow.closed_at.is_(None)).count()
+        reasons = [
+            s.reason for s in session.query(SkippedSignalRow).filter(SkippedSignalRow.instrument == UNDERLYING)
+        ]
+    assert open_count == 1, "must not have opened a second position on the same underlying"
+    assert any("per-session limit" in r for r in reasons), reasons
+
+
 def test_unresolvable_contract_skips_with_a_real_reason_instead_of_trading_the_index(
     session_factory, execution, cost_model: CostModel, index_store: BarStore
 ) -> None:  # noqa: ANN001
