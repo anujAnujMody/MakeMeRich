@@ -109,6 +109,40 @@ def test_the_daily_loss_limit_stops_taking_trades_that_day(cost_model: CostModel
     assert sum(limited.daily_net_paise.values()) > sum(unlimited.daily_net_paise.values())
 
 
+def test_halted_days_counts_the_day_once_even_with_two_overlapping_losers(cost_model: CostModel) -> None:
+    """`replay()` has no `not day_loss_halted` guard on its `halted_days`
+    increment (unlike `strategy_lab._settle`'s `not day_loss_halted[name]`),
+    so a second breaching resolution on an already-halted day double-counts
+    it. `test_the_daily_loss_limit_stops_taking_trades_that_day`'s fixture
+    holds 5 minutes and enters 10 apart, so no two trades are ever open at
+    once and a second breaching resolution on a halted day can never occur
+    -- the one arrangement under which the missing guard is invisible.
+
+    Here the second trade is entered ONE minute after the first (while it is
+    still open, so both are taken before either resolves) and both are real
+    losses big enough to breach the limit on their own -- so the day
+    breaches TWICE (once at each trade's resolution) if nothing is
+    guarding the counter."""
+    overlapping = [
+        _trade(minutes=0, net_per_unit=-2_000, hold_minutes=5),  # resolves at minute 5
+        _trade(minutes=1, net_per_unit=-2_000, hold_minutes=5),  # resolves at minute 6, day already halted
+        # A second day's own breach, so this test ALSO catches the sibling
+        # mutation `halted_days = 1` (a plain assignment instead of `+= 1`):
+        # with the guard in place that mutation is invisible on a single
+        # day (both would land on exactly 1), but it silently overwrites
+        # rather than accumulates across days.
+        _trade(minutes=24 * 60, net_per_unit=-2_000, hold_minutes=5),  # day 2
+    ]
+
+    result = _replay(overlapping, max_daily_loss_paise=1)  # any loss breaches
+
+    assert result.halted_days == 2, (
+        "expected exactly one halted day per day (2 days, each with a breach) -- either a second "
+        "breaching resolution on an already-halted day was double-counted, or a later day's count "
+        "overwrote an earlier day's instead of accumulating"
+    )
+
+
 def test_a_standdown_resets_the_next_day(cost_model: CostModel) -> None:
     """Mirrors live (`check_consecutive_losses` resets daily). A standdown
     that carried over would silently shrink every later day's sample."""

@@ -155,7 +155,9 @@ def collect_firings(
         entries_today = dict.fromkeys(strategy_names, 0)
 
         as_of = first
-        while as_of <= last:
+        # `<`, not `<=` -- see `te.backtest.strategy_lab.run_many`'s identical
+        # fix for why the boundary minute itself must be excluded.
+        while as_of < last:
             ctx.as_of = as_of
             for name, strategy in strategies.items():
                 if entries_today[name] >= MAX_ENTRIES_PER_DAY:
@@ -339,13 +341,17 @@ def replay(
         daily[day] = daily.get(day, 0) + net_total
         recent_nets.insert(0, net_total)
 
-        if max_daily_loss_paise is not None and daily_loss_breached(
-            net_paise=day_net, max_daily_loss_paise=max_daily_loss_paise
+        if (
+            max_daily_loss_paise is not None
+            and not day_loss_halted
+            and daily_loss_breached(net_paise=day_net, max_daily_loss_paise=max_daily_loss_paise)
         ):
             day_loss_halted = True
             halted_days += 1
-        if max_consecutive_losses is not None and consecutive_losses_breached(
-            recent_trade_nets=recent_nets, limit=max_consecutive_losses
+        if (
+            max_consecutive_losses is not None
+            and not day_standdown
+            and consecutive_losses_breached(recent_trade_nets=recent_nets, limit=max_consecutive_losses)
         ):
             day_standdown = True
             standdown_days += 1

@@ -131,6 +131,27 @@ def test_padding_the_library_with_losers_cannot_inflate_a_winner(tmp_path: Path)
     )
 
 
+def test_scoring_reports_the_real_ledger_trial_count(tmp_path: Path) -> None:
+    """`n_trials_at_scoring` is a separate number from the ledger's own row
+    count (`test_every_run_is_recorded_and_the_count_only_grows` only pins
+    the latter), and every `n_trials`-shaped assertion elsewhere in this
+    file is RELATIVE, so a mutation that shrinks the count while preserving
+    monotonicity (e.g. `n_trials // 4`) survives them all. Pin the exact
+    number directly against the ledger it should equal."""
+    ledger = _ledger(tmp_path)
+    winner = _trades([1.0 if i % 3 else -1.0 for i in range(200)])
+
+    first = _result(winner, ledger, strategy="w1")
+    assert first.n_trials_at_scoring == ledger.n_trials(TRIAL_SCOPE) == 1, (
+        "the very first score ever recorded must report exactly 1 trial, not 0"
+    )
+
+    for i in range(5):
+        _result(winner, ledger, strategy=f"filler{i}")
+    later = _result(winner, ledger, strategy="w2")
+    assert later.n_trials_at_scoring == ledger.n_trials(TRIAL_SCOPE)
+
+
 def test_every_run_is_recorded_and_the_count_only_grows(tmp_path: Path) -> None:
     """The ledger has no delete path by design — resetting trials to make a
     score look better is the prior failure mode this structurally blocks."""

@@ -26,8 +26,9 @@ from decimal import Decimal
 from te.backtest.fills import BacktestFillEngine
 from te.data.asof import bars_asof
 from te.data.barstore import BarStore
+from te.domain.clock import IST
 from te.domain.costs import CostBreakdown, CostModel
-from te.domain.geometry import ExitGeometry
+from te.domain.geometry import ExitGeometry, RupeeRiskGeometry
 from te.domain.money import Paise
 from te.domain.orders import OrderIntent
 from te.domain.pnl import GrossPnl, NetPnl, net_pnl
@@ -62,6 +63,20 @@ class BacktestConfig:
     min_minutes_before_hard_exit: int = 0
     #: Mirrors `CycleConfig`'s over-trading guard.
     max_entries_per_underlying_per_day: int = 2
+
+    def __post_init__(self) -> None:
+        if isinstance(self.exit_geometry, RupeeRiskGeometry):
+            # Unlike `CycleConfig`, this class has no `max_lots` field, so
+            # `_step_entry`/`_step_exit` below call `exit_geometry.levels()`
+            # with NO `quantity=` at all. `RupeeRiskGeometry.levels()`
+            # requires a positive quantity and would raise immediately on
+            # the first entry it evaluates — refused here, at construction,
+            # with a clear reason instead of a confusing crash mid-backtest.
+            raise ValueError(
+                "BacktestConfig does not support RupeeRiskGeometry — this backtest has no max_lots/quantity "
+                "concept to convert a rupee cap into a premium distance the way te.engine.cycle.CycleConfig "
+                "does; use PremiumPercentGeometry or AbsolutePointGeometry here instead"
+            )
 
 
 @dataclass(frozen=True)
@@ -118,6 +133,12 @@ def run_backtest(
     that closes after `timestamps[k]` — the zero-lookahead guarantee."""
     trades: list[ClosedTrade] = []
     open_pos: OpenPosition | None = None
+    # Mirrors `underlying_entries_today` (`te/persistence/repos/paper_trading.py`)
+    # for the `max_entries_per_underlying_per_day` guard below — a backtest
+    # has no DB session in this phase, so the count is kept in memory here,
+    # keyed on the IST calendar date, and never reset except by moving to a
+    # new day.
+    entries_today_by_date: dict[dt.date, int] = {}
 
     for as_of in timestamps:
         if open_pos is not None:
@@ -129,10 +150,14 @@ def run_backtest(
                 trades.append(closed)
             continue
 
+        day = as_of.astimezone(IST).date()
         open_pos = _step_entry(
             store=store, instrument=instrument, exchange=exchange, strategy=strategy, as_of=as_of,
             interval=interval, cost_model=cost_model, fills=fills, config=config,
+            entries_today=entries_today_by_date.get(day, 0),
         )
+        if open_pos is not None:
+            entries_today_by_date[day] = entries_today_by_date.get(day, 0) + 1
 
     return BacktestResult(trades=tuple(trades))
 
@@ -195,7 +220,21 @@ def _step_entry(
     cost_model: CostModel,
     fills: BacktestFillEngine,
     config: BacktestConfig,
+    entries_today: int,
 ) -> OpenPosition | None:
+    # Mirrors `te.engine.cycle.run_once`'s `min_minutes_before_hard_exit`
+    # portfolio gate (`te/engine/cycle.py:436-447`) exactly, including the
+    # `>=` boundary: a firing too close to the hard exit carries full
+    # downside against upside that is unreachable by construction. Checked
+    # BEFORE the strategy is even evaluated, same as live.
+    now_ist_time = as_of.astimezone(IST).timetz().replace(tzinfo=None)
+    latest_entry = (
+        dt.datetime.combine(dt.date.min, config.hard_exit_by)
+        - dt.timedelta(minutes=config.min_minutes_before_hard_exit)
+    ).time()
+    if now_ist_time >= latest_entry:
+        return None
+
     ctx = StrategyContext(store=store, instrument=instrument, exchange=exchange, as_of=as_of, interval=interval)
     evaluation = strategy.evaluate(ctx)
     if evaluation.verdict != "traded":
@@ -203,6 +242,11 @@ def _step_entry(
 
     signal = getattr(strategy, "last_signal", None)
     if signal is None:
+        return None
+
+    # Mirrors `te.engine.cycle.run_once`'s max-entries-per-underlying-per-day
+    # guard (`te/engine/cycle.py:529-539`), including the `>=` boundary.
+    if entries_today >= config.max_entries_per_underlying_per_day:
         return None
 
     levels = config.exit_geometry.levels(signal.entry_premium)
@@ -224,9 +268,17 @@ def _step_entry(
     # Levels re-derived from the ACTUAL fill, not the signal price, so the
     # plan's barriers and its `entry_premium` describe the same trade.
     filled = config.exit_geometry.levels(fill.fill_price)
+    # `filled.profit_lock_activation`/`profit_lock_buffer_pct` were computed
+    # by the geometry but previously discarded here, so `evaluate_position`
+    # (the SAME live exit-evaluation function this backtest already calls
+    # below, via `_step_exit`) always saw them as `None` and the rule could
+    # never fire in a backtest even when the live cycle would have engaged
+    # it — see `te.engine.exits.evaluate_position`'s profit-lock block.
     exit_plan = ExitPlan(
         entry_premium=fill.fill_price, stop=filled.stop, trailing_distance=filled.trailing_distance,
         target=filled.target, max_hold=config.max_hold, hard_exit_by=config.hard_exit_by,
+        profit_lock_activation=filled.profit_lock_activation,
+        profit_lock_buffer_pct=filled.profit_lock_buffer_pct,
     )
     return open_position(
         symbol=instrument, exchange=exchange, strategy=strategy.name, direction=signal.direction,

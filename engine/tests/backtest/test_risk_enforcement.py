@@ -358,6 +358,34 @@ def _setup(store: BarStore, days: list[dt.date], *, expiry: dt.date) -> str:
     return symbol
 
 
+def _write_fast_crashing_option_bars(store: BarStore, symbol: str, day: dt.date) -> None:
+    """Each entry's own premium crashes through its stop ONE MINUTE later,
+    so the trade taken at 09:16 resolves at 09:17 (`_settle` runs before the
+    entries loop on every minute of `run_many`'s while loop, so a loss that
+    resolved by `as_of` is on the books before that same minute's entries
+    are gated) -- unlike `_write_crashing_option_bars`' single crash at the
+    end of the day, which lands only after every one of the day's
+    `MAX_ENTRIES_PER_DAY` entries has already been taken. Without this
+    re-spacing a day-scoped gate and its absence are indistinguishable: both
+    let all 3 entries through before either loss reaches equity.
+
+    100 -> 90 -> 40 -> 20 -> 10: each step is a >20% drop from the previous,
+    so the entry made on bar N is stopped out by bar N+1 regardless of which
+    minute it was actually taken on."""
+    open_ts = dt.datetime.combine(day, dt.time(9, 15), tzinfo=IST)
+    prices = [100.0, 90.0, 40.0, 20.0, 10.0]
+    rows = [_bar_row(symbol, EXCHANGE, open_ts + dt.timedelta(minutes=m), p) for m, p in enumerate(prices)]
+    store.append(pd.DataFrame(rows, columns=list(BAR_COLUMNS)))
+
+
+def _setup_fast(store: BarStore, days: list[dt.date], *, expiry: dt.date) -> str:
+    symbol = _contract_symbol(expiry)
+    for day in days:
+        _write_index_bars(store, day)
+        _write_fast_crashing_option_bars(store, symbol, day)
+    return symbol
+
+
 
 
 
@@ -465,14 +493,15 @@ def test_a_daily_loss_limit_takes_no_further_entries_that_day(
 
     refused, not silently taken and reported as if the limit never applied.
 
-    Updated 2026-08-05 with the lookahead fix. A trade's P&L only reaches
-    equity when it RESOLVES, so a limit cannot refuse an entry made while
-    the losing trade is still open -- the loss has not happened yet. This
-    fixture fires every minute, so all of the day's allowed entries land
-    within three minutes and none of them can be stopped. The limit still
-    fires (`halted_days`), just after the burst. The live engine has the
-    identical property, which is why the assertion was corrected rather
-    than the behaviour.
+    Uses `_setup_fast`, which crashes the option premium one minute after
+    every entry, so the first trade RESOLVES before the second offered
+    entry is even evaluated (`_settle` runs before the entries loop on
+    every minute of `run_many`'s while loop). This is the arrangement that
+    can actually distinguish "the gate refused an entry" from "the fixture
+    never offered a second entry after the loss landed" -- with the
+    original `_setup` (a single end-of-day crash), all 3 entries fire
+    before any of them resolves, so `len(trades) == 3` regardless of
+    whether the gate does anything at all.
     """
 
     _patch_registry(monkeypatch, fake_always_fire=_AlwaysFireStrategy)
@@ -481,9 +510,11 @@ def test_a_daily_loss_limit_takes_no_further_entries_that_day(
 
     day = dt.date(2026, 6, 2)
 
-    _setup(store, [day], expiry=day + dt.timedelta(days=2))
+    _setup_fast(store, [day], expiry=day + dt.timedelta(days=2))
 
 
+
+    _, unlimited_trades_by_name = _run(store, strategy_names=["fake_always_fire"])
 
     results, trades_by_name = _run(
 
@@ -493,9 +524,12 @@ def test_a_daily_loss_limit_takes_no_further_entries_that_day(
 
 
 
+    unlimited_trades = unlimited_trades_by_name["fake_always_fire"]
     trades = trades_by_name["fake_always_fire"]
 
-    assert len(trades) == 3, f"all 3 entries fire before the first resolves, got {len(trades)}"
+    assert len(unlimited_trades) == 3, "control: every offered entry resolves and is taken without the limit"
+
+    assert len(trades) < 3, "the daily loss limit never refused an entry once the first loss had resolved"
 
     assert trades[0].net_paise_per_unit < 0, "fixture is meant to be a real loss"
 
@@ -561,15 +595,24 @@ def test_consecutive_losses_stand_down_blocks_further_entries_that_day(
 
 ) -> None:
 
+    """Uses `_setup_fast` (see its docstring and the daily-loss test above
+    for why): both the first and second losses resolve before the third
+    offered entry is evaluated, so the stand-down gate can actually be
+    observed refusing it. With the original `_setup`, all 3 entries fire
+    before any of them resolves and `len(trades) == 3` regardless of
+    whether the gate does anything."""
+
     _patch_registry(monkeypatch, fake_always_fire=_AlwaysFireStrategy)
 
     store = BarStore(tmp_path / "bars")
 
     day = dt.date(2026, 6, 2)
 
-    _setup(store, [day], expiry=day + dt.timedelta(days=2))
+    _setup_fast(store, [day], expiry=day + dt.timedelta(days=2))
 
 
+
+    _, unlimited_trades_by_name = _run(store, strategy_names=["fake_always_fire"])
 
     results, trades_by_name = _run(
 
@@ -579,9 +622,12 @@ def test_consecutive_losses_stand_down_blocks_further_entries_that_day(
 
 
 
+    unlimited_trades = unlimited_trades_by_name["fake_always_fire"]
     trades = trades_by_name["fake_always_fire"]
 
-    assert len(trades) == 3, "all 3 fire before any resolves; the stand-down registers after"
+    assert len(unlimited_trades) == 3, "control: every offered entry resolves and is taken without the limit"
+
+    assert len(trades) < 3, "the stand-down never refused an entry once 2 consecutive losses had resolved"
 
     assert results["fake_always_fire"].standdown_days == 1
 
