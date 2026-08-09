@@ -76,6 +76,62 @@ def test_bars_asof_includes_closed_bar_ingested_in_time(tmp_path: Path) -> None:
     assert out.iloc[0]["event_ts"] == pd.Timestamp(open_ts)
 
 
+def test_bars_asof_includes_a_bar_at_the_exact_close_boundary(tmp_path: Path) -> None:
+    """`as_of == close_ts` is the PRODUCTION case, not an edge case — the
+    paper cycle is scheduled ON the minute boundary. `<=` (not `<`) on close
+    must include a bar that closes exactly at `as_of`, or every live cycle
+    would evaluate on data one bar stale."""
+    store = BarStore(tmp_path)
+    open_ts = dt.datetime(2026, 7, 29, 9, 20, tzinfo=dt.UTC)  # closes exactly 09:21
+    store.append(pd.DataFrame([_bar(event_ts=open_ts, ingested_at=open_ts)]))
+
+    as_of = dt.datetime(2026, 7, 29, 9, 21, tzinfo=dt.UTC)  # == close_ts exactly
+    out = bars_asof(store, "NIFTY", as_of=as_of, lookback=dt.timedelta(hours=1), interval="1m")
+
+    assert len(out) == 1
+
+
+def test_bars_asof_excludes_a_bar_one_microsecond_before_its_close(tmp_path: Path) -> None:
+    """Control for the test above — one microsecond earlier than `close_ts`
+    the bar has not closed yet and must not be visible."""
+    store = BarStore(tmp_path)
+    open_ts = dt.datetime(2026, 7, 29, 9, 20, tzinfo=dt.UTC)  # closes exactly 09:21
+    store.append(pd.DataFrame([_bar(event_ts=open_ts, ingested_at=open_ts)]))
+
+    as_of = dt.datetime(2026, 7, 29, 9, 21, tzinfo=dt.UTC) - dt.timedelta(microseconds=1)
+    out = bars_asof(store, "NIFTY", as_of=as_of, lookback=dt.timedelta(hours=1), interval="1m")
+
+    assert out.empty
+
+
+def test_bars_asof_includes_a_bar_ingested_at_the_exact_as_of_instant(tmp_path: Path) -> None:
+    """`as_of == ingested_at` exactly must also be visible — the recorder's
+    live `ingested_at` and the scheduler's `as_of` can plausibly land on the
+    same instant, and `<=` must include it."""
+    store = BarStore(tmp_path)
+    open_ts = dt.datetime(2026, 7, 29, 9, 20, tzinfo=dt.UTC)  # closes 09:21
+    as_of = dt.datetime(2026, 7, 29, 9, 25, tzinfo=dt.UTC)
+    store.append(pd.DataFrame([_bar(event_ts=open_ts, ingested_at=as_of)]))  # ingested_at == as_of exactly
+
+    out = bars_asof(store, "NIFTY", as_of=as_of, lookback=dt.timedelta(hours=1), interval="1m")
+
+    assert len(out) == 1
+
+
+def test_bars_asof_excludes_a_bar_ingested_one_microsecond_after_as_of(tmp_path: Path) -> None:
+    """Control for the test above — ingested one microsecond after `as_of`
+    must not be visible."""
+    store = BarStore(tmp_path)
+    open_ts = dt.datetime(2026, 7, 29, 9, 20, tzinfo=dt.UTC)  # closes 09:21
+    as_of = dt.datetime(2026, 7, 29, 9, 25, tzinfo=dt.UTC)
+    late_ingest = as_of + dt.timedelta(microseconds=1)
+    store.append(pd.DataFrame([_bar(event_ts=open_ts, ingested_at=late_ingest)]))
+
+    out = bars_asof(store, "NIFTY", as_of=as_of, lookback=dt.timedelta(hours=1), interval="1m")
+
+    assert out.empty
+
+
 def test_bars_asof_requires_timezone_aware_as_of(tmp_path: Path) -> None:
     store = BarStore(tmp_path)
     with pytest.raises(ValueError, match="timezone-aware"):

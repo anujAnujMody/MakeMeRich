@@ -165,6 +165,21 @@ def test_strike_step_breaks_a_tie_toward_the_finer_gap(tmp_path: Path) -> None:
     assert index.strike_step(expiry=EXPIRY, option_type="CE") == Decimal(50)
 
 
+def test_a_distance_exactly_half_a_step_off_grid_is_refused(tmp_path: Path) -> None:
+    """The boundary itself, never exercised before: on a 100-point chain, 50
+    points off grid sits exactly `step / 2` away from the nearest listed
+    strike (56,000 or 56,100 are equidistant; the tie-break picks the
+    lower). `>=` (not `>`) must refuse it — the comment above the check in
+    `option_history.py` explains why the tie-break matters: resolving it
+    would narrow a call wing and widen a put wing by half a step from the
+    same request."""
+    index = _index(tmp_path, HOLED)
+    assert (
+        index.nearest(on=ON, index_level=SPOT, option_type="CE", otm_points=Decimal(50), max_days_to_expiry=7)
+        is None
+    )
+
+
 def test_a_single_strike_chain_has_no_measurable_step(tmp_path: Path) -> None:
     """And `nearest` must then REFUSE rather than return the only strike
     listed however far it sits from the request — `if step is None: return

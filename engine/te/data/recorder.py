@@ -94,10 +94,27 @@ class BarRecorder:
         #: `is_running()` `True` while zero ticks arrive; this is the only
         #: signal that catches that. See `WSRecorderSupervisor.feed_is_stale`.
         self._last_tick_at: dt.datetime | None = None
+        #: CONSECUTIVE `store.append()` failures since the last success —
+        #: reset to 0 on every successful flush, incremented on every
+        #: failed one. This is what makes a persistently failing
+        #: `BarStore.append` visible: `openalgo_ws.py`'s per-tick exception
+        #: handling (correctly) keeps the WS connection alive, and `_flush`
+        #: (correctly) keeps retrying the queued bar, so `last_tick_at`
+        #: stays fresh and `is_running()` stays `True` even while zero bars
+        #: are actually landing in the store. Ticks flowing, "alive" by
+        #: every existing signal, and nothing written — the exact "died
+        #: quietly while looking alive" shape a background task cost a
+        #: full session's bar recording to once already. A supervisor can
+        #: poll this the same way it polls `last_tick_at`/`is_running()`.
+        self._consecutive_flush_failures: int = 0
 
     @property
     def last_tick_at(self) -> dt.datetime | None:
         return self._last_tick_at
+
+    @property
+    def consecutive_flush_failures(self) -> int:
+        return self._consecutive_flush_failures
 
     def on_tick(self, message: dict[str, Any]) -> int:
         """Feeds one WS `market_data` frame in. Returns the number of bar
@@ -218,7 +235,18 @@ class BarRecorder:
                 }
             ]
         )
-        written = self._store.append(row)
+        try:
+            written = self._store.append(row)
+        except Exception:
+            self._consecutive_flush_failures += 1
+            logger.error(
+                "bar flush failed — bar retained for a later retry, not lost",
+                symbol=symbol,
+                event_ts=bucket.isoformat(),
+                consecutive_flush_failures=self._consecutive_flush_failures,
+            )
+            raise
+        self._consecutive_flush_failures = 0
         self._open_bars.pop(key, None)
         self._flushed_keys.add(key)
         logger.debug(

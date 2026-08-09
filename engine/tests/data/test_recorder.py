@@ -267,6 +267,72 @@ def test_a_failed_flush_keeps_the_bar_for_a_later_retry_instead_of_losing_it(tmp
     assert out.iloc[0]["o"] == 24200.0  # the original 09:20 bar's data, not lost or corrupted
 
 
+class _AlwaysFailStore:
+    """Models a PERSISTENTLY failing `BarStore.append` — every call raises.
+    This is the "died quietly while looking alive" shape: `openalgo_ws.py`
+    correctly keeps the connection up on a per-tick exception, and `_flush`
+    correctly keeps retrying the queued bar, so `last_tick_at` stays fresh
+    and nothing else observable changes while zero bars ever actually land."""
+
+    def append(self, bars):  # noqa: ANN001, ANN201
+        raise OSError("simulated persistent write failure")
+
+
+def test_a_persistently_failing_store_is_visible_via_consecutive_flush_failures(tmp_path: Path) -> None:
+    """The detection this project was missing: ticks flowing, `last_tick_at`
+    fresh, and zero bars written must be OBSERVABLE by something other than
+    a stdlib logging line a supervisor cannot poll."""
+    recorder = BarRecorder(_AlwaysFailStore())  # type: ignore[arg-type]
+    assert recorder.consecutive_flush_failures == 0
+
+    recorder.on_tick(_tick("NIFTY", "2026-07-29T09:20:05+00:00", 24200.0))
+    with pytest.raises(OSError, match="simulated persistent write failure"):
+        recorder.on_tick(_tick("NIFTY", "2026-07-29T09:21:05+00:00", 24210.0))
+    assert recorder.consecutive_flush_failures == 1
+    # The feed still looks alive by every other existing signal.
+    assert recorder.last_tick_at is not None
+
+    with pytest.raises(OSError, match="simulated persistent write failure"):
+        recorder.on_tick(_tick("NIFTY", "2026-07-29T09:22:05+00:00", 24220.0))
+    assert recorder.consecutive_flush_failures == 2, "consecutive failures must accumulate, not reset per tick"
+
+
+def test_flush_failures_reset_to_zero_after_a_later_success(tmp_path: Path) -> None:
+    """A transient failure that then recovers must not keep reporting
+    unhealthy forever — the counter tracks CONSECUTIVE failures since the
+    last success."""
+    real_store = BarStore(tmp_path)
+    flaky_store = _FailOnceStore(real_store)
+    recorder = BarRecorder(flaky_store)  # type: ignore[arg-type]
+
+    recorder.on_tick(_tick("NIFTY", "2026-07-29T09:20:05+00:00", 24200.0))
+    with pytest.raises(OSError, match="simulated transient write failure"):
+        recorder.on_tick(_tick("NIFTY", "2026-07-29T09:21:05+00:00", 24215.0))
+    assert recorder.consecutive_flush_failures == 1
+
+    recorder.on_tick(_tick("NIFTY", "2026-07-29T09:22:05+00:00", 24220.0))
+    assert recorder.consecutive_flush_failures == 0
+
+
+def test_a_failed_flush_is_logged_at_error(tmp_path: Path) -> None:
+    """Structlog, not stdlib logging — this project's `caplog` reads empty
+    (see `CLAUDE.md`), so a failure logged only via `logging.exception`
+    (as `openalgo_ws.py`'s per-tick handler does) is invisible to anything
+    reading through the project's own pipeline."""
+    from structlog.testing import capture_logs
+
+    recorder = BarRecorder(_AlwaysFailStore())  # type: ignore[arg-type]
+    recorder.on_tick(_tick("NIFTY", "2026-07-29T09:20:05+00:00", 24200.0))
+
+    with capture_logs() as logs:
+        with pytest.raises(OSError, match="simulated persistent write failure"):
+            recorder.on_tick(_tick("NIFTY", "2026-07-29T09:21:05+00:00", 24210.0))
+
+    errors = [e for e in logs if e.get("log_level") == "error"]
+    assert errors, f"no error-level event was logged; got {[e.get('event') for e in logs]}"
+    assert "flush failed" in errors[0]["event"]
+
+
 def test_last_tick_at_tracks_wall_clock_receipt_not_the_tick_own_timestamp(tmp_path: Path) -> None:
     """`WSRecorderSupervisor.check_feed_health` (see `te.engine.scheduler`)
     needs "are we CURRENTLY receiving anything" — a dead broker adapter
@@ -282,6 +348,35 @@ def test_last_tick_at_tracks_wall_clock_receipt_not_the_tick_own_timestamp(tmp_p
 
     assert recorder.last_tick_at is not None
     assert before <= recorder.last_tick_at <= after
+
+
+def test_flushed_bar_ingested_at_is_real_ingestion_time_not_the_bar_open(tmp_path: Path) -> None:
+    """`bars_asof`'s `ingested_at <= as_of` half exists to stop a backfilled
+    or revised bar leaking into a decision made before that data existed
+    (`te/data/asof.py`). That guarantee is a no-op for the live feed unless
+    `ingested_at` genuinely reflects WHEN we wrote the bar, not the bar's own
+    open minute — the two are usually the same to the second in the live
+    path, but must never be conflated. Mirrors
+    `test_last_tick_at_tracks_wall_clock_receipt_not_the_tick_own_timestamp`."""
+    store = BarStore(tmp_path)
+    recorder = BarRecorder(store)
+
+    before = dt.datetime.now(dt.UTC)
+    recorder.on_tick(_tick("NIFTY", "2026-07-29T09:20:05+00:00", 24200.0))
+    recorder.on_tick(_tick("NIFTY", "2026-07-29T09:20:30+00:00", 24210.0))
+    recorder.on_tick(_tick("NIFTY", "2026-07-29T09:21:05+00:00", 24215.0))  # closes and flushes the 09:20 bar
+    after = dt.datetime.now(dt.UTC)
+
+    out = store.read(symbol="NIFTY", start=_WINDOW_START, end=_WINDOW_END, interval="1m")
+    assert len(out) == 1
+    row = out.iloc[0]
+
+    event_ts = row["event_ts"].to_pydatetime()
+    ingested_at = row["ingested_at"].to_pydatetime()
+    assert ingested_at > event_ts, (
+        "ingested_at must be real wall-clock ingestion time, well after the bar's own open minute"
+    )
+    assert before <= ingested_at <= after
 
 
 def test_last_tick_at_ignores_a_tick_with_no_symbol(tmp_path: Path) -> None:

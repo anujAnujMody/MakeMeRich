@@ -301,8 +301,25 @@ class OpenAlgoRestClient:
 
     def symbol_meta(self, symbol: str, exchange: str) -> SymbolMeta:
         """Resolves one contract's lot size / tick size / expiry via
-        OpenAlgo's `symbol` service (`POST /api/v1/symbol`)."""
+        OpenAlgo's `symbol` service (`POST /api/v1/symbol`).
+
+        Raises `OpenAlgoRestError` if the response omits `lotsize` or
+        reports it as `<= 0`. This is the freeze-quantity-of-1 bug wearing a
+        different hat: a missing lot size defaulting to `0` (or a bare
+        `.get(..., 0)` letting a `0` through) is not a "no contract" signal
+        downstream — it is a real-looking integer that flows straight into
+        `quantity = lots * lot_size`, and `te/engine/state.py` only forces an
+        instrument inactive when `latest_lot_size` returns `None`, not on a
+        stored `0`. A response missing this field must never be written to
+        the `instruments` table at all."""
         data = self._post("/api/v1/symbol", {"symbol": symbol, "exchange": exchange})["data"]
+        raw_lot_size = data.get("lotsize")
+        if raw_lot_size is None or int(raw_lot_size) <= 0:
+            raise OpenAlgoRestError(
+                f"OpenAlgo symbol service returned no usable lotsize for {symbol}/{exchange} "
+                f"(got {raw_lot_size!r}) — refusing to sync a lot size of 0/1 that would silently "
+                "flow into position sizing"
+            )
         return SymbolMeta(
             symbol=str(data.get("symbol", symbol)),
             exchange=str(data.get("exchange", exchange)),
@@ -310,6 +327,6 @@ class OpenAlgoRestClient:
             instrument_type=str(data.get("instrumenttype", "")),
             expiry=str(data.get("expiry", "")),
             strike=float(data.get("strike", 0.0)),
-            lot_size=int(data.get("lotsize", 0)),
+            lot_size=int(raw_lot_size),
             tick_size=float(data.get("tick_size", 0.0)),
         )

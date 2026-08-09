@@ -12,6 +12,12 @@ import pytest
 from te.data.bhavcopy_bse import BSE_INDEX_SYMBOLS, parse_bhavcopy_bse
 
 _FIXTURE = Path(__file__).parent.parent / "fixtures" / "bhavcopy_bse_fo_golden.csv"
+_HEADER = (
+    "TradDt,BizDt,Sgmt,Src,FinInstrmTp,FinInstrmId,ISIN,TckrSymb,SctySrs,XpryDt,FininstrmActlXpryDt,"
+    "StrkPric,OptnTp,FinInstrmNm,OpnPric,HghPric,LwPric,ClsPric,LastPric,PrvsClsgPric,UndrlygPric,"
+    "SttlmPric,OpnIntrst,ChngInOpnIntrst,TtlTradgVol,TtlTrfVal,TtlNbOfTxsExctd,SsnId,NewBrdLotQty,"
+    "Rmks,Rsvd1,Rsvd2,Rsvd3,Rsvd4"
+)
 
 
 def test_bhavcopy_bse_parses_sensex_option_row() -> None:
@@ -43,3 +49,28 @@ def test_bhavcopy_bse_raises_on_html_response_instead_of_silently_returning_empt
     html_body = "<!DOCTYPE html><html><head><title>BSE India</title></head><body>...</body></html>"
     with pytest.raises(ValueError, match="looks like HTML"):
         parse_bhavcopy_bse(html_body)
+
+
+def test_a_blank_close_price_is_refused_by_name() -> None:
+    """A blank `ClsPric` must never become a fabricated `0.0` — mirrors the
+    NSE regression test; both exchanges share `_udiff_parser.py`."""
+    row = (
+        "29-JUL-2026,29-JUL-2026,FO,BSE,IDO,90002,,SENSEX,,27-AUG-2026,27-AUG-2026,77800,CE,"
+        "SENSEX26AUG77800CE,120,128,105,,113,118,77508,113,410000,6000,18000,2034000,3500,F1,20,,,,,"
+    )
+    csv_text = "\n".join([_HEADER, row])
+
+    with pytest.raises(ValueError, match="blank ClsPric"):
+        parse_bhavcopy_bse(csv_text)
+
+
+def test_a_blank_volume_is_refused_by_name() -> None:
+    """A blank `TtlTradgVol` is unknown data, not a real no-trade-day zero."""
+    row = (
+        "29-JUL-2026,29-JUL-2026,FO,BSE,IDO,90002,,SENSEX,,27-AUG-2026,27-AUG-2026,77800,CE,"
+        "SENSEX26AUG77800CE,120,128,105,113,113,118,77508,113,410000,6000,,2034000,3500,F1,20,,,,,"
+    )
+    csv_text = "\n".join([_HEADER, row])
+
+    with pytest.raises(ValueError, match="blank TtlTradgVol"):
+        parse_bhavcopy_bse(csv_text)
