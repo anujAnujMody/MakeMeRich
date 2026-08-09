@@ -85,3 +85,12 @@ def test_bankex_next_monthly_expiry_is_last_thursday_of_month() -> None:
     expiry = next_monthly_expiry("BANKEX", reference)
     assert expiry.weekday() == 3  # Thursday
     assert expiry == dt.date(2026, 7, 30)  # last Thursday of July 2026
+
+
+def test_banknifty_next_monthly_expiry_on_expiry_day_itself() -> None:
+    """The monthly path's twin of `test_nifty_next_weekly_expiry_on_expiry_day_itself`
+    — `reference == expiry` exactly, which neither existing monthly fixture
+    covers (one is a day past expiry, the other is the 1st of the month).
+    2026-07-28 is BANKNIFTY's last Tuesday of July."""
+    reference = dt.date(2026, 7, 28)  # a Tuesday, and July's last one
+    assert next_monthly_expiry("BANKNIFTY", reference) == reference

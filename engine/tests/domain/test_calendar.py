@@ -116,17 +116,56 @@ def test_a_malformed_row_is_skipped_not_fatal() -> None:
     assert calendar.known is True
 
 
+def test_a_dropped_row_is_both_skipped_and_surfaced() -> None:
+    """A dropped holiday row must not be silently indistinguishable from
+    "not a holiday" — `known` stays True (the whole year must not be thrown
+    away over one bad row) but the drop itself must be visible on the
+    returned calendar, not just swallowed by a bare `continue`."""
+    bad_date_row = {"date": "not-a-date", "closed_exchanges": ["NSE"], "holiday_type": "TRADING_HOLIDAY"}
+    no_date_row = {"description": "no date field at all", "closed_exchanges": ["NSE"]}
+    bad_closed_row = {"date": "2026-03-03", "closed_exchanges": "NSE", "holiday_type": "TRADING_HOLIDAY"}
+    bad_open_row = {
+        "date": "2026-03-04",
+        "holiday_type": "SPECIAL_SESSION",
+        "closed_exchanges": [],
+        "open_exchanges": "not-a-list",
+    }
+    calendar = from_holiday_rows([bad_date_row, no_date_row, bad_closed_row, bad_open_row, REPUBLIC_DAY])
+
+    assert calendar.known is True  # tolerant parsing itself is correct
+    assert len(calendar.dropped_rows) == 4
+    assert bad_date_row in calendar.dropped_rows
+    assert no_date_row in calendar.dropped_rows
+    assert bad_closed_row in calendar.dropped_rows
+    assert bad_open_row in calendar.dropped_rows
+    # The one well-formed row among the malformed ones must still count.
+    assert calendar.is_trading_day(dt.date(2026, 1, 26), exchange="NSE") is False
+
+
+def test_a_clean_calendar_reports_no_dropped_rows() -> None:
+    """`dropped_rows` must not manufacture a false positive on a normal
+    payload — every row here is well-formed."""
+    assert CALENDAR.dropped_rows == ()
+
+
 def test_a_special_session_with_unparseable_bounds_is_dropped() -> None:
     """Better to treat the date as a plain holiday than to invent a session
-    window for it."""
-    calendar = from_holiday_rows(
-        [
-            {
-                "date": "2026-11-08",
-                "holiday_type": "SPECIAL_SESSION",
-                "closed_exchanges": [],
-                "open_exchanges": [{"exchange": "NSE", "start_time": None, "end_time": "noon"}],
-            }
-        ]
+    window for it. Uses a WEEKDAY (2026-11-09, a Monday) rather than the real
+    Muhurat date (2026-11-08, a Sunday) — on the Sunday fixture,
+    `is_trading_day` reads False via the plain weekend branch regardless of
+    whether the row was actually dropped, so that fixture never exercised
+    this path at all. Also asserts the row itself lands on `dropped_rows`,
+    matching the four other drop paths `test_a_dropped_row_is_both_skipped_and_surfaced`
+    covers — a dropped row must not be silent, per the module docstring."""
+    bad_row = {
+        "date": "2026-11-09",
+        "holiday_type": "SPECIAL_SESSION",
+        "closed_exchanges": [],
+        "open_exchanges": [{"exchange": "NSE", "start_time": None, "end_time": "noon"}],
+    }
+    calendar = from_holiday_rows([bad_row])
+    assert calendar.is_trading_day(dt.date(2026, 11, 9), exchange="NSE") is True, (
+        "no special session AND no plain holiday entry — an ordinary weekday reads as trading"
     )
-    assert calendar.is_trading_day(dt.date(2026, 11, 8), exchange="NSE") is False
+    assert calendar.session_window(dt.date(2026, 11, 9), exchange="NSE") == DEFAULT_SESSION
+    assert bad_row in calendar.dropped_rows

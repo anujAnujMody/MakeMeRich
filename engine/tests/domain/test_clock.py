@@ -98,3 +98,19 @@ def test_is_market_open_within_default_session() -> None:
 def test_is_market_open_false_outside_session() -> None:
     moment = dt.datetime(2026, 7, 29, 16, 0, tzinfo=IST)
     assert not is_market_open(moment)
+
+
+def test_is_market_open_at_the_session_boundaries() -> None:
+    """The three existing fixtures (09:05, 12:00, 16:00) never touch either
+    boundary itself. Both ends are inclusive (`session.start <= local_time
+    <= session.end`), so the market must read OPEN at exactly 09:15:00.000
+    and 15:30:00.000, and CLOSED one microsecond either side of open."""
+    open_ts = dt.datetime(2026, 7, 29, 9, 15, 0, tzinfo=IST)
+    close_ts = dt.datetime(2026, 7, 29, 15, 30, 0, tzinfo=IST)
+    just_before_open = dt.datetime(2026, 7, 29, 9, 14, 59, 999999, tzinfo=IST)
+    just_after_close = dt.datetime(2026, 7, 29, 15, 30, 0, 1, tzinfo=IST)
+
+    assert is_market_open(open_ts)
+    assert is_market_open(close_ts)
+    assert not is_market_open(just_before_open)
+    assert not is_market_open(just_after_close)

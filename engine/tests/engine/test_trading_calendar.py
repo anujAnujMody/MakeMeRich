@@ -16,7 +16,7 @@ import pytest
 
 from te.domain.calendar import TradingCalendar, from_holiday_rows
 from te.domain.clock import IST
-from te.engine.trading_calendar import get_calendar, refresh_calendar, set_calendar, stored_years
+from te.engine.trading_calendar import _merge, get_calendar, refresh_calendar, set_calendar, stored_years
 from te.persistence.db import make_engine, make_session_factory, session_scope
 from te.persistence.models import Base
 
@@ -176,3 +176,31 @@ def test_the_paper_cycle_runs_during_a_muhurat_evening_session(tmp_path: Path) -
 
 def test_an_unknown_calendar_never_reports_a_trading_day() -> None:
     assert TradingCalendar.unknown().is_trading_day(dt.date(2026, 10, 1), exchange="NSE") is False
+
+
+def test_merge_removes_a_withdrawn_holiday_for_a_reported_exchange() -> None:
+    """A union can only grow; a holiday the exchange later WITHDRAWS could
+    never be removed and the engine would stand down forever on a real
+    trading day. The fresh calendar's `closed` set must REPLACE the stale
+    one for any exchange it reports — even when that means the fresh set no
+    longer contains a date the stale one did."""
+    withdrawn = dt.date(2026, 5, 1)
+    existing = TradingCalendar(known=True, closed={"NSE": frozenset({withdrawn})})
+    fresh = TradingCalendar(known=True, closed={"NSE": frozenset()})  # NSE reported, now empty
+
+    merged = _merge(existing, fresh, year=2026)
+
+    assert merged.is_trading_day(withdrawn, exchange="NSE") is True
+
+
+def test_merge_keeps_holidays_for_an_exchange_the_fresh_calendar_does_not_report() -> None:
+    """An exchange absent from the fresh payload must not silently lose its
+    holidays — only exchanges the fresh calendar actually reports should be
+    replaced."""
+    kept = dt.date(2026, 5, 1)
+    existing = TradingCalendar(known=True, closed={"BSE": frozenset({kept})})
+    fresh = TradingCalendar(known=True, closed={"NSE": frozenset()})  # says nothing about BSE
+
+    merged = _merge(existing, fresh, year=2026)
+
+    assert merged.is_trading_day(kept, exchange="BSE") is False

@@ -74,6 +74,14 @@ class TradingCalendar:
     known: bool
     closed: dict[str, frozenset[dt.date]] = field(default_factory=dict)
     special: dict[str, dict[dt.date, SpecialSession]] = field(default_factory=dict)
+    #: Rows `from_holiday_rows` could not parse (bad `date`, non-list
+    #: `closed_exchanges`/`open_exchanges`), kept verbatim so a caller that
+    #: can log (this module is pure, per the layer rule — see
+    #: `te.engine.trading_calendar`) can report exactly which rows were
+    #: dropped rather than just a count. A dropped row is NOT the same as
+    #: "not a holiday" — see the module docstring's "Failing safe" section —
+    #: so this must stay visible rather than vanish into a silent `continue`.
+    dropped_rows: tuple[dict[str, object], ...] = ()
 
     @staticmethod
     def unknown() -> TradingCalendar:
@@ -136,23 +144,33 @@ def from_holiday_rows(rows: list[dict[str, object]], *, ist_offset_minutes: int 
     Rows are tolerated, not trusted: a malformed date or a window whose
     bounds don't parse is skipped rather than aborting the whole calendar.
     Losing one holiday is bad; losing the entire year's calendar because one
-    row changed shape is worse.
+    row changed shape is worse. But a dropped row must not be silent —
+    `known` stays `True` (refusing the whole year over one bad row is the
+    failure the tolerance exists to avoid) while the skipped rows themselves
+    are carried on the returned calendar's `dropped_rows`, so a caller that
+    can log (this module cannot — see the module docstring) is able to
+    report exactly what was lost rather than have it read identically to
+    "no holiday on that date".
     """
     closed: dict[str, set[dt.date]] = {ex: set() for ex in TRADED_EXCHANGES}
     special: dict[str, dict[dt.date, SpecialSession]] = {ex: {} for ex in TRADED_EXCHANGES}
+    dropped: list[dict[str, object]] = []
 
     for row in rows:
         raw_date = row.get("date")
         if not isinstance(raw_date, str):
+            dropped.append(row)
             continue
         try:
             on = dt.date.fromisoformat(raw_date)
         except ValueError:
+            dropped.append(row)
             continue
 
         description = str(row.get("description", ""))
         closed_names = row.get("closed_exchanges") or []
         if not isinstance(closed_names, list):
+            dropped.append(row)
             continue
         for name in closed_names:
             exchange = str(name).upper()
@@ -163,6 +181,7 @@ def from_holiday_rows(rows: list[dict[str, object]], *, ist_offset_minutes: int 
             continue
         open_entries = row.get("open_exchanges") or []
         if not isinstance(open_entries, list):
+            dropped.append(row)
             continue
         for entry in open_entries:
             if not isinstance(entry, dict):
@@ -173,11 +192,19 @@ def from_holiday_rows(rows: list[dict[str, object]], *, ist_offset_minutes: int 
             window = _window_from_epoch_ms(entry.get("start_time"), entry.get("end_time"), ist_offset_minutes)
             if window is not None:
                 special[exchange][on] = SpecialSession(date=on, window=window, description=description)
+            else:
+                # A dropped row must not be silent — see the module
+                # docstring and `dropped_rows`'s own docstring. Skipping the
+                # session without recording it here would read identically
+                # to "no special session on this date", which is the exact
+                # silent failure this field exists to prevent.
+                dropped.append(row)
 
     return TradingCalendar(
         known=True,
         closed={ex: frozenset(dates) for ex, dates in closed.items()},
         special=special,
+        dropped_rows=tuple(dropped),
     )
 
 

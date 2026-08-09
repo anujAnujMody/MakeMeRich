@@ -17,6 +17,7 @@ from sqlalchemy import create_engine
 from te.broker.openalgo_login import LoginResult
 from te.broker.openalgo_ws import Instrument, OpenAlgoWSClient
 from te.data.barstore import BarStore
+from te.data.charges_loader import load_charge_rate_table
 from te.data.recorder import BarRecorder
 from te.domain.calendar import from_holiday_rows
 from te.domain.clock import IST
@@ -164,6 +165,13 @@ def test_build_scheduler_registers_every_job(tmp_path: Path) -> None:
         # evaluations and their outcome bars are all in before anything
         # trains on them. See `te.ml.nightly`.
         "ml_nightly_training",
+        # 15:35, after the close and the 15:15 hard exit. Checks the day that
+        # actually happened against the limits the engine claims to enforce —
+        # the backstop for rules breaking in ways no test imagined. Registered
+        # here rather than left to a human running the script, because a
+        # report nobody runs is a report that does not exist; this project has
+        # already shipped monitors that were never wired to anything.
+        "session_audit",
     }
 
     # Option strikes are re-resolved on a timer, not once at recorder start.
@@ -716,3 +724,164 @@ def test_a_position_is_quoted_once_per_cycle_not_once_per_consumer() -> None:
 
     assert calls == [_Row.symbol], f"quoted {len(calls)} times for one position in one cycle"
     assert first == second, "the two cycles saw different marks for the same position in the same minute"
+    # The mark itself, not just that it's cached. The position is LONG the
+    # option, so the price that matters is what it could actually be SOLD
+    # at — the bid. Marking at the LTP (100.0 -> 10_000p) instead of the bid
+    # (99.5 -> 9_950p) books the half-spread as free profit on every exit,
+    # the exact bug the entry side already closed (buying at the ask, not
+    # the LTP). A mutation audit found this test asserted only `calls` and
+    # `first == second`, never WHAT the mark was.
+    assert first == Paise(9_950), "must mark at the bid, not the LTP"
+
+
+def test_current_premium_from_quotes_falls_back_to_ltp_when_the_book_has_no_bid(tmp_path: Path) -> None:
+    """`bid <= 0` means the book carries no usable bid (e.g. an illiquid far
+    strike) — the only case where LTP is an acceptable stand-in."""
+    import datetime as dt
+
+    from te.broker.openalgo_rest import Quote
+    from te.data.barstore import BarStore
+    from te.engine.scheduler import _current_premium_from_quotes
+
+    class _Client:
+        def quotes(self, symbol: str, exchange: str) -> Quote:
+            return Quote(
+                symbol=symbol,
+                exchange=exchange,
+                ltp=100.0,
+                open=0.0,
+                high=0.0,
+                low=0.0,
+                prev_close=0.0,
+                volume=0.0,
+                oi=0.0,
+                bid=0.0,
+                ask=100.5,
+            )
+
+    class _Row:
+        symbol = "NIFTY04AUG2624400CE"
+        exchange = "NFO"
+        entry_premium_paise = 10_000
+        last_mark_paise = None
+
+    source = _current_premium_from_quotes(
+        _Client(),  # type: ignore[arg-type]
+        BarStore(tmp_path / "unused"),
+        dt.datetime(2026, 7, 31, 5, 0, tzinfo=dt.UTC),
+    )
+    marked = source(_Row())  # type: ignore[arg-type]
+
+    assert marked == Paise(10_000), "with no usable bid, LTP is the documented fallback"
+
+
+def test_current_premium_from_quotes_falls_back_to_bars_when_the_book_has_no_price_at_all(
+    tmp_path: Path,
+) -> None:
+    """`bid <= 0` and `ltp <= 0` together mean the quote carries no usable
+    price at all (a dead/erroring feed reporting zeros rather than raising) —
+    the caller must fall through to the last CLOSED bar, exactly as it does
+    on an `OpenAlgoRestError`."""
+    import datetime as dt
+
+    import pandas as pd
+
+    from te.broker.openalgo_rest import Quote
+    from te.data.barstore import BAR_COLUMNS, BarStore
+    from te.engine.scheduler import _current_premium_from_quotes
+
+    symbol = "NIFTY04AUG2624400CE"
+    exchange = "NFO"
+    as_of = dt.datetime(2026, 7, 31, 5, 0, tzinfo=dt.UTC)
+
+    store = BarStore(tmp_path / "bars")
+    store.append(
+        pd.DataFrame(
+            [
+                {
+                    "symbol": symbol,
+                    "exchange": exchange,
+                    "event_ts": as_of - dt.timedelta(minutes=1),
+                    "interval": "1m",
+                    "o": 95.0,
+                    "h": 96.0,
+                    "l": 94.0,
+                    "c": 95.5,
+                    "v": 100,
+                    "oi": 0,
+                    "ingested_at": as_of - dt.timedelta(minutes=1),
+                    "source": "test",
+                }
+            ],
+            columns=list(BAR_COLUMNS),
+        )
+    )
+
+    class _Client:
+        def quotes(self, symbol: str, exchange: str) -> Quote:
+            return Quote(
+                symbol=symbol,
+                exchange=exchange,
+                ltp=0.0,
+                open=0.0,
+                high=0.0,
+                low=0.0,
+                prev_close=0.0,
+                volume=0.0,
+                oi=0.0,
+                bid=0.0,
+                ask=0.0,
+            )
+
+    row_symbol, row_exchange = symbol, exchange
+
+    class _Row:
+        symbol = row_symbol
+        exchange = row_exchange
+        entry_premium_paise = 10_000
+        last_mark_paise = None
+
+    source = _current_premium_from_quotes(_Client(), store, as_of)  # type: ignore[arg-type]
+    marked = source(_Row())  # type: ignore[arg-type]
+
+    assert marked == Paise(9_550), "with no usable bid or LTP, the last closed bar is the documented fallback"
+
+
+def test_the_nightly_training_job_labels_at_the_geometry_the_engine_trades(tmp_path: Path, monkeypatch) -> None:  # noqa: ANN001
+    """The labelling geometry and the TRADING geometry must be the same
+    object, not two copies of the same numbers.
+
+    `te.ml.barriers` used to hardcode a 20% stop against a 20% target — 1:1 —
+    under a comment saying the constants "must track" two settings. By the
+    time anyone checked, the live config had moved to a Rs 700 rupee cap at a
+    10x target multiple (~1:10), so every nightly label described a strategy
+    that was not running, and nothing failed. The constants were only the
+    symptom; the disease was that no code path forced the two to agree.
+
+    `_exit_geometry` is the single selector both halves must go through, so
+    this asserts identity with it rather than re-stating the expected stop
+    and target here — restating them would recreate exactly the drift this
+    test exists to prevent.
+    """
+    captured: dict[str, object] = {}
+
+    def _fake_run_nightly_training(*args: object, **kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr(scheduler_module, "run_nightly_training", _fake_run_nightly_training)
+
+    settings = _settings()
+    engine = make_engine(f"sqlite:///{tmp_path / 'nightly.db'}")
+    Base.metadata.create_all(engine)
+    session_factory = make_session_factory(engine)
+
+    scheduler_module.run_nightly_training_job(
+        session_factory,
+        engine,
+        BarStore(tmp_path),
+        charge_rate_table=load_charge_rate_table(settings.charges_path),
+        settings=settings,
+    )
+
+    assert captured["geometry"] == scheduler_module._exit_geometry(settings)
+    assert captured["max_lots"] == (settings.paper_cycle_max_lots or 1)

@@ -37,6 +37,11 @@ def test_scheduler_status_reports_all_jobs_including_paper_cycle() -> None:
         # the halt reset: an engine that retrains itself overnight should say
         # so in its own status, not only in a log file.
         "ml_nightly_training",
+        # 15:35 post-session self-check: did the day obey the limits the
+        # engine claims to enforce? Visible in the status for the same reason
+        # as the two above — and more so, since this is the job whose absence
+        # would mean nobody is watching the watchers.
+        "session_audit",
     }
 
     paper_cycle_job = next(job for job in body["jobs"] if job["id"] == "paper_cycle")

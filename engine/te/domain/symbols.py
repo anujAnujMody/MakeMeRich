@@ -112,7 +112,16 @@ def _fmt_strike(strike: Decimal | int | float) -> str:
     return format(normalized, "f")
 
 
-def build_option_symbol(base: str, expiry: dt.date, strike: Decimal | int | float, option_type: OptionType) -> str:
+def build_option_symbol(base: str, expiry: dt.date, strike: Decimal | int, option_type: OptionType) -> str:
+    # A float strike is a trap, not a valid input: 26500.0 can arrive as
+    # 26499.999999999996 from upstream arithmetic and format into a symbol
+    # the broker rejects or, worse, mis-resolves to the wrong strike.
+    # Annotations do not execute, so this is a runtime guard, not decoration.
+    if isinstance(strike, float):
+        raise TypeError(
+            f"build_option_symbol got a float strike ({strike!r}); pass a Decimal "
+            "(e.g. Decimal(str(strike)), never Decimal(strike)) or an int"
+        )
     return f"{base}{fmt_expiry(expiry)}{_fmt_strike(strike)}{option_type}"
 
 
@@ -216,7 +225,12 @@ def next_monthly_expiry(base: str, reference: dt.date) -> dt.date:
     the index's exchange's weekly weekday in a calendar month. Applies to
     BANKNIFTY/FINNIFTY/MIDCPNIFTY (NSE, Tuesday) and BANKEX (BSE, Thursday),
     which trade monthly only."""
-    weekday = _MONTHLY_ONLY_EXPIRY_WEEKDAY.get(base) or _WEEKLY_EXPIRY_WEEKDAY.get(base)
+    monthly_weekday = _MONTHLY_ONLY_EXPIRY_WEEKDAY.get(base)
+    # Explicit `is not None`, not `or`: a genuine Monday (`weekday() == 0`)
+    # expiry is falsy and `or` would wrongly fall through to the weekly
+    # table (or to `None` and a raise) for any index the NSE ever assigns
+    # Monday to.
+    weekday = monthly_weekday if monthly_weekday is not None else _WEEKLY_EXPIRY_WEEKDAY.get(base)
     if weekday is None:
         raise ValueError(f"{base!r} has no known expiry weekday")
     candidate = _last_weekday_of_month(reference.year, reference.month, weekday)
