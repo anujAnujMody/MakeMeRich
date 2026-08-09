@@ -50,6 +50,7 @@ from te.data.barstore import BarStore
 from te.data.charges_loader import load_charge_rate_table
 from te.domain.costs import CostModel, select_rates
 from te.engine.contract import UNDERLYING_INDEX_EXCHANGES
+from te.engine.scheduler import _exit_geometry
 from te.ml.barriers import ATM_SNAPSHOTS, round_trip_cost_in_index_points
 from te.ml.labeling import label_firings_from_evaluations
 from te.persistence.db import make_engine, make_session_factory
@@ -87,13 +88,22 @@ def main() -> int:
     engine = make_engine(settings.database_url)
     session_factory = make_session_factory(engine)
     cost_model = CostModel(select_rates(load_charge_rate_table(settings.charges_path), dt.date.today()))
+    # The geometry the LIVE engine actually trades, from the one selector
+    # that decides it — never a second copy of its branching. `STOP_PCT`/
+    # `TARGET_PCT` printed below are the OLD, no-longer-live figures.
+    geometry = _exit_geometry(settings)
+    max_lots = settings.paper_cycle_max_lots or 1
 
     rr = float(TARGET_PCT) / float(STOP_PCT)
-    print(f"IN-SAMPLE range-length sweep, {start}..{end}, barriers {STOP_PCT}%/{TARGET_PCT}% (R:R {rr:.2f})")
+    print(
+        f"IN-SAMPLE range-length sweep, {start}..{end}, "
+        f"barriers (HISTORICAL) {STOP_PCT}%/{TARGET_PCT}% (R:R {rr:.2f})"
+    )
+    print(f"live geometry actually used below: {geometry!r}, max_lots={max_lots}")
     print("expectancy in R, time exits counted as 0 (optimistic for a decaying option)\n")
 
     for symbol in chosen:
-        stop, target = barriers(symbol)
+        stop, target = barriers(symbol, geometry=geometry, max_lots=max_lots)
         cost = round_trip_cost_in_index_points(symbol, cost_model, RATES_VERIFIED_FROM)
         print(f"=== {symbol} ===")
         print(f"{'range':>6}{'firings':>9}{'labelled':>10}{'target':>8}{'stop':>7}{'time':>7}"

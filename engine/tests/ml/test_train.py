@@ -5,6 +5,7 @@ recorded to `TrialLedger`."""
 from __future__ import annotations
 
 import datetime as dt
+import math
 from pathlib import Path
 
 import numpy as np
@@ -65,6 +66,66 @@ def test_train_meta_model_records_every_inner_trial(trial_ledger: TrialLedger) -
     # len(DEFAULT_PARAM_GRID) configs x up to inner_splits inner splits each.
     assert after > 0
     assert after == result.n_trials_at_training
+    # The EXACT expected count, not just "self-consistent with whatever the
+    # ledger happens to hold" (`n_trials_at_training` is read back from the
+    # very same ledger, so it agrees with any count the code chooses to
+    # write). `_run_inner_cv` is called once per outer fold; each call
+    # records one trial per (config, inner split) pair with all synthetic
+    # data trainable and every split non-empty, so the count is exactly
+    # n_outer_folds * len(DEFAULT_PARAM_GRID) * inner_splits. Catches
+    # `trial_ledger.record(...)` being dedented to run once per config
+    # instead of once per (config, split), which would cut this to 6 instead
+    # of 18.
+    n_outer_folds = 2  # outer_splits=3 -> 1 train block + 2 evaluated test blocks
+    inner_splits = 3
+    assert after == n_outer_folds * len(DEFAULT_PARAM_GRID) * inner_splits
+
+
+def test_train_meta_model_feeds_the_ledgers_real_trial_stats_into_dsr(
+    trial_ledger: TrialLedger, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`isinstance(result.dsr, float)` is true of `nan` and of every wrong
+    value — it does not prove `train_meta_model` supplied the ledger's REAL
+    N/mean/var to `deflated_sharpe_ratio()`. Spy on the call and assert the
+    kwargs it actually received match what the ledger holds. Catches both
+    `n_trials=1` (never deflating for multiple testing) and `var_sharpe=0.0`
+    (collapsing the null to `mean_sharpe`, undoing the deflation regardless
+    of N) — either mutation makes `captured["n_trials"]`/`captured["var_sharpe"]`
+    disagree with the ledger's own numbers."""
+    import te.ml.train as train_module
+
+    features, labels, pred_times, eval_times = _synthetic_dataset(n=300, seed=71)
+
+    captured: dict[str, object] = {}
+    real_dsr = train_module.deflated_sharpe_ratio
+
+    def _spy(**kwargs: object) -> float:
+        captured.update(kwargs)
+        return real_dsr(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(train_module, "deflated_sharpe_ratio", _spy)
+
+    train_meta_model(
+        features=features,
+        labels=labels,
+        prediction_times=pred_times,
+        evaluation_times=eval_times,
+        spec=SECONDARY_V1,
+        trial_ledger=trial_ledger,
+        run_id="dsr-wiring",
+    )
+
+    ledger_sharpes = trial_ledger.trial_sharpes("dsr-wiring:inner")
+    real_n_trials = trial_ledger.n_trials("dsr-wiring:inner")
+    real_mean = float(np.mean(ledger_sharpes))
+    real_var = float(np.var(ledger_sharpes, ddof=1))
+
+    assert real_n_trials > 1, "test setup produced too few trials to exercise deflation at all"
+    assert real_var > 0.0, "test setup produced zero-variance trial sharpes — var_sharpe mutation is invisible"
+
+    assert captured["n_trials"] == real_n_trials
+    assert captured["mean_sharpe"] == pytest.approx(real_mean)
+    assert captured["var_sharpe"] == pytest.approx(real_var)
 
 
 def test_train_meta_model_returns_a_fitted_model_and_metrics(trial_ledger: TrialLedger) -> None:
@@ -83,6 +144,20 @@ def test_train_meta_model_returns_a_fitted_model_and_metrics(trial_ledger: Trial
     assert result.model.feature_spec == SECONDARY_V1
     assert isinstance(result.dsr, float)
     assert result.pbo.n_combinations >= 0
+    # `n_combinations >= 0` is true of the `PboResult(nan, 0)` "not
+    # evaluated" fallback too — it cannot fail if PBO were silently taking
+    # that branch every time. This dataset has 5 outer folds and a 3-config
+    # grid, all trainable, so PBO must actually be evaluated: `n_combinations`
+    # is exactly `math.comb(s, s // 2)` for the resolved `s_groups`
+    # (`min(8, n_periods - (n_periods % 2) or 2)`, `n_periods` = the total
+    # OOS row count concatenated across all outer test blocks — 300 samples
+    # / 6 outer_splits blocks x 5 evaluated OOS folds), and `pbo` itself must
+    # be a real number in [0, 1] (excludes NaN).
+    assert not math.isnan(result.pbo.pbo)
+    assert 0.0 <= result.pbo.pbo <= 1.0
+    n_periods = 250  # 300 samples over 6 blocks -> 5 evaluated OOS folds of 50 rows each
+    s_groups = min(8, n_periods - (n_periods % 2) or 2)
+    assert result.pbo.n_combinations == math.comb(s_groups, s_groups // 2)
     assert result.n_labeled_samples == 300
     # DEFAULT_OUTER_SPLITS=6 -> block 0 seeds the training set, 5 OOS folds.
     assert len(result.best_params_per_outer_fold) == 5

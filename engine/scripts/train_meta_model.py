@@ -69,6 +69,7 @@ import sys
 from te.data.barstore import BarStore
 from te.data.charges_loader import load_charge_rate_table
 from te.domain.costs import CostModel, select_rates
+from te.engine.scheduler import _exit_geometry
 from te.ml.barriers import ATM_SNAPSHOTS
 from te.ml.featurespec import SECONDARY_V1
 from te.ml.nightly import build_labeled_dataset
@@ -123,7 +124,17 @@ def main() -> int:
     # full; a hand-run script and a cron job building their training sets
     # from two copies of the same code is how the two quietly start
     # describing different strategies.
-    frame = build_labeled_dataset(session_factory, store, cost_model, instruments=tuple(chosen))
+    #
+    # `geometry`/`max_lots` come from the SAME selector the live engine uses
+    # (`te.engine.scheduler._exit_geometry`) rather than a second copy of its
+    # branching — see `te.ml.barriers.barriers()` for why there is no honest
+    # default and `te.ml.nightly.build_labeled_dataset` for why `te.ml`
+    # cannot select this itself.
+    geometry = _exit_geometry(settings)
+    max_lots = settings.paper_cycle_max_lots or 1
+    frame = build_labeled_dataset(
+        session_factory, store, cost_model, geometry=geometry, max_lots=max_lots, instruments=tuple(chosen)
+    )
 
     if frame.empty:
         print("no labelled firings — nothing to train on", file=sys.stderr)

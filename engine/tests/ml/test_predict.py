@@ -131,6 +131,71 @@ def test_evaluate_reads_the_maturity_stage_exactly_once(
     assert rows[0].stage == real().value
 
 
+def test_shadow_hook_logs_the_models_real_predicted_probability(
+    store: BarStore,
+    session_factory,  # noqa: ANN001
+    model: MetaModel,
+) -> None:
+    """`ml_predictions` is the SOLE evidence base a future promotion decision
+    is made from. The existing shadow-hook test never asserts `.p` (only
+    `.displayed`/`.stage`/`.feature_spec_name`/`.feature_spec_version`), so a
+    `p=0.5` typo in place of the real predicted probability would ship
+    silently — recompute the model's own `predict_proba` on the SAME feature
+    row independently and assert the logged `p` matches it exactly, not a
+    constant."""
+    gate = MaturityGate(session_factory)
+    hook = ShadowMLHook(model=model, spec=SECONDARY_V1, store=store, gate=gate, session_factory=session_factory)
+    as_of = dt.datetime(2026, 6, 9, 10, 0, tzinfo=IST)
+
+    from te.ml.dataset import build_training_set
+
+    expected_features = build_training_set(
+        as_of, SECONDARY_V1, store, session_factory, instrument=INSTRUMENT, for_inference=True
+    )
+    expected_p = model.predict_proba(expected_features)
+
+    hook.evaluate(instrument=INSTRUMENT, as_of=as_of, cycle_id=1)
+
+    with session_factory() as session:
+        rows = session.execute(sa.select(ml_predictions)).all()
+    assert len(rows) == 1
+    assert rows[0].p == pytest.approx(expected_p)
+    # Guards against a test that would pass even for a hardcoded p=0.5:
+    # the model must genuinely have predicted something other than that.
+    assert rows[0].p != pytest.approx(0.5)
+
+
+def test_shadow_hook_builds_features_at_the_supplied_as_of_not_now(
+    store: BarStore,
+    session_factory,  # noqa: ANN001
+    model: MetaModel,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`evaluate(as_of=...)` must build features AT `as_of`, never at
+    "whatever time it happens to run" — on any replay of a past cycle,
+    building features at `dt.datetime.now()` would read data from the
+    future. Spy on `build_training_set` and assert it received exactly the
+    `as_of` `evaluate()` was called with."""
+    import te.ml.predict as predict_module
+
+    gate = MaturityGate(session_factory)
+    hook = ShadowMLHook(model=model, spec=SECONDARY_V1, store=store, gate=gate, session_factory=session_factory)
+    as_of = dt.datetime(2026, 6, 9, 10, 0, tzinfo=IST)
+
+    captured: dict[str, object] = {}
+    real_build = predict_module.build_training_set
+
+    def _spy(as_of_arg, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+        captured["as_of"] = as_of_arg
+        return real_build(as_of_arg, *args, **kwargs)
+
+    monkeypatch.setattr(predict_module, "build_training_set", _spy)
+
+    hook.evaluate(instrument=INSTRUMENT, as_of=as_of, cycle_id=1)
+
+    assert captured["as_of"] == as_of
+
+
 def test_influence_with_an_explicit_stage_matches_reading_it_from_the_db(
     session_factory,  # noqa: ANN001
 ) -> None:

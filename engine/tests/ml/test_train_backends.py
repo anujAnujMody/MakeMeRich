@@ -111,12 +111,21 @@ def test_a_second_backend_raises_the_trial_count_under_the_same_run_id(trial_led
 
     assert trial_ledger.n_trials(scope) == 0
 
+    # outer_splits=3 -> 2 evaluated outer folds; each `_TINY_GRIDS` backend
+    # grid has 2 configs; inner_splits=3 -> up to 3 inner trials each.
+    n_outer_folds = 2
+    trials_per_backend = n_outer_folds * len(_TINY_GRIDS[ModelBackend.XGBOOST]) * 3
+
     first = train_meta_model(
         **common, backend=ModelBackend.XGBOOST, param_grid=_TINY_GRIDS[ModelBackend.XGBOOST]
     )
     after_first = trial_ledger.n_trials(scope)
     assert after_first > 0
     assert first.n_trials_at_training == after_first
+    # The exact count, not just ">0" — under-reporting (e.g. recording once
+    # per config instead of once per (config, split)) would still pass a
+    # bare ">0" check.
+    assert after_first == trials_per_backend
 
     second = train_meta_model(
         **common, backend=ModelBackend.CATBOOST, param_grid=_TINY_GRIDS[ModelBackend.CATBOOST]
@@ -126,6 +135,9 @@ def test_a_second_backend_raises_the_trial_count_under_the_same_run_id(trial_led
     assert after_second > after_first, "the second backend's trials vanished from the ledger"
     assert second.n_trials_at_training == after_second
     assert second.n_trials_at_training > first.n_trials_at_training
+    # The second backend must ADD its own full trial count, not just
+    # "some more than zero" — the exact total across both backends.
+    assert after_second == 2 * trials_per_backend
 
 
 def test_the_same_config_dict_under_two_backends_is_two_distinct_trials(trial_ledger: TrialLedger) -> None:
@@ -350,6 +362,15 @@ def test_pbo_matrix_rows_never_mix_backends(trial_ledger: TrialLedger) -> None:
     assert result.pbo.n_combinations >= 0
     assert len(result.best_params_per_outer_fold) > 0
     assert all(config in grid for config in result.best_params_per_outer_fold)
+    # `n_combinations >= 0` alone is also true of the `PboResult(nan, 0)`
+    # "not evaluated" fallback — assert PBO was genuinely computed for this
+    # (2-outer-fold, 2-config, all-trainable) run: a real number in [0, 1]
+    # and the exact combinatorial count for the resolved `s_groups`.
+    import math
+
+    assert not math.isnan(result.pbo.pbo)
+    assert 0.0 <= result.pbo.pbo <= 1.0
+    assert result.pbo.n_combinations > 0
 
 
 def test_train_meta_model_rejects_an_unknown_backend(trial_ledger: TrialLedger) -> None:

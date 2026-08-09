@@ -6,6 +6,7 @@ Direct unit coverage of `influence()` per stage; the cross-module proof that
 from __future__ import annotations
 
 import datetime as dt
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -106,6 +107,22 @@ def test_gating_stage_can_veto_in_paper_mode(session_factory) -> None:  # noqa: 
     assert influence.veto is True
 
 
+@pytest.mark.parametrize(("p", "expected_veto"), [(0.499, True), (0.5, False), (0.501, False)])
+def test_gating_veto_boundary_is_strictly_less_than_the_threshold(  # noqa: ANN001
+    session_factory, p: float, expected_veto: bool
+) -> None:
+    """The only p values exercised elsewhere at GATING/LIVE_GATING are 0.0
+    (veto expected) — a boundary flip from `p < _VETO_THRESHOLD` to
+    `p <= _VETO_THRESHOLD` would veto a prediction of exactly 0.5, and no
+    existing test would notice. `p == 0.5` is reachable in practice
+    (degenerate models, a calibrator on a balanced fold)."""
+    _set_stage_directly(session_factory, Stage.GATING)
+    _set_mode_directly(session_factory, "dry-run")
+    gate = MaturityGate(session_factory)
+    influence = gate.influence(p)
+    assert influence.veto is expected_veto
+
+
 def test_gating_stage_cannot_veto_in_live_mode(session_factory) -> None:  # noqa: ANN001
     """Even at GATING stage, if the engine's persisted mode is `live`,
     `influence()` must return `veto=False` regardless of `p` — gating stage
@@ -126,12 +143,36 @@ def test_size_multiplier_clamped_to_0_5_1_0(session_factory, p: float) -> None: 
     assert 0.5 <= influence.size_multiplier <= 1.0
 
 
+def test_size_multiplier_is_the_probability_itself_in_the_clamp_interior(session_factory) -> None:  # noqa: ANN001
+    """A range check (`0.5 <= x <= 1.0`) is satisfied by both the correct
+    `size_multiplier = p` mapping AND any monotone distortion of it (e.g.
+    `p * 0.5`, still clamped into range at every p in [0, 1]). Pin the
+    IDENTITY at an interior point, where the clamp is a no-op and only the
+    real mapping can produce the exact value — this multiplies a sized
+    position, so a silent distortion here halves real money on every
+    live-gated trade."""
+    _set_stage_directly(session_factory, Stage.LIVE_GATING)
+    gate = MaturityGate(session_factory)
+    influence = gate.influence(0.75)
+    assert influence.size_multiplier == Decimal("0.75")
+
+
 def test_live_gating_may_veto_and_resize(session_factory) -> None:  # noqa: ANN001
     _set_stage_directly(session_factory, Stage.LIVE_GATING)
     gate = MaturityGate(session_factory)
     influence = gate.influence(0.0)
     assert influence.veto is True
     assert influence.size_multiplier == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize(("p", "expected_veto"), [(0.499, True), (0.5, False), (0.501, False)])
+def test_live_gating_veto_boundary_is_strictly_less_than_the_threshold(  # noqa: ANN001
+    session_factory, p: float, expected_veto: bool
+) -> None:
+    _set_stage_directly(session_factory, Stage.LIVE_GATING)
+    gate = MaturityGate(session_factory)
+    influence = gate.influence(p)
+    assert influence.veto is expected_veto
 
 
 def test_set_stage_writes_audit_row_and_updates_current_stage(session_factory) -> None:  # noqa: ANN001

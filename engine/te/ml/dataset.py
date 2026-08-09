@@ -57,6 +57,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from te.data.asof import bars_asof
 from te.data.barstore import BarStore
+from te.data.option_history import available_option_symbols
 from te.domain.clock import DEFAULT_SESSION, IST
 from te.domain.symbols import next_monthly_expiry, next_weekly_expiry, parse_option_symbol
 from te.ml.featurespec import PRIMARY_VOCABULARY, FeatureSpec
@@ -130,15 +131,79 @@ def _underlying_base(instrument: str) -> str:
         return instrument
 
 
-def _dte(as_of: dt.datetime, instrument: str) -> float:
+#: Memoises the sorted list of expiry dates the option archive holds bars
+#: for, per underlying — same reasoning and same granularity as
+#: `_DAILY_CLOSES_CACHE`: `_dte` runs once per firing (thousands of calls
+#: over a training run), and `available_option_symbols` is a directory scan
+#: over every `symbol=` partition, which would make a per-firing call
+#: quadratic over exactly the archive this module is meant to grow with.
+#: Keyed on the IST DATE of `as_of` (not "forever") so a long-running live
+#: process still picks up a newly-listed expiry the next day.
+_ARCHIVED_EXPIRIES_CACHE: dict[tuple[str, str, dt.date], list[dt.date]] = {}
+
+
+def clear_archived_expiries_cache() -> None:
+    """Drops the memoised per-underlying archived-expiry list. For tests
+    that write new option bars into a store already read from in this
+    process."""
+    _ARCHIVED_EXPIRIES_CACHE.clear()
+
+
+def _archived_expiries(store: BarStore, base: str, as_of: dt.datetime) -> list[dt.date]:
+    """Every EXPIRY DATE the option archive holds bars for, under `base`,
+    sorted ascending.
+
+    Directory-listing only (`available_option_symbols`) — the same source
+    `te.data.option_history.OptionContractIndex` resolves a firing's real
+    contract from, and for the same reason: the expiry encoded in a
+    contract's own symbol is a historical fact of what the exchange actually
+    listed, independent of when its bars happened to be backfilled onto
+    disk. No `ingested_at` gate applies here because nothing about a BAR's
+    PRICE is being read — only a symbol NAME already present in the store's
+    directory listing — so there is no future information for a historical
+    `as_of` to leak.
+    """
+    key = (str(store.root), base, as_of.astimezone(IST).date())
+    cached = _ARCHIVED_EXPIRIES_CACHE.get(key)
+    if cached is not None:
+        return cached
+    expiries = sorted({parsed.expiry for parsed in available_option_symbols(store, base)})
+    _ARCHIVED_EXPIRIES_CACHE[key] = expiries
+    return expiries
+
+
+def _nearest_archived_expiry(store: BarStore, base: str, as_of: dt.datetime, on: dt.date) -> dt.date | None:
+    """The earliest archived expiry for `base` on or after `on`, or `None`
+    when the archive holds nothing that far forward for this underlying."""
+    for expiry in _archived_expiries(store, base, as_of):
+        if expiry >= on:
+            return expiry
+    return None
+
+
+def _dte(store: BarStore, as_of: dt.datetime, instrument: str) -> float:
     """Days to expiry of the contract this firing would trade.
 
     From the symbol itself when it carries an expiry; otherwise from the
-    exchange's expiry calendar for that underlying — NIFTY/SENSEX trade
-    weeklies, BANKNIFTY/BANKEX are monthly-only (confirmed against the live
-    broker on 2026-07-31: BANKNIFTY's nearest expiry was 25 days out against
-    NIFTY's 4). That difference is precisely why `dte` is a feature worth
-    having, so falling back to a fixed number here would erase the signal.
+    option ARCHIVE's own listed contracts for that underlying (see
+    `_nearest_archived_expiry`) — never from today's expiry-weekday
+    calendar. `te.domain.symbols._WEEKLY_EXPIRY_WEEKDAY` /
+    `_MONTHLY_ONLY_EXPIRY_WEEKDAY` describe the CURRENT regime only (their
+    own docstring: "post Nov-2024/Sep-2025 regime"), and NIFTY's weekly
+    expiry weekday alone changed twice across the archive's 2024-2026 span.
+    Resolving a firing from BEFORE one of those changes against today's
+    table would compute `dte` against a weekday the exchange was not using
+    at the time — present, correctly typed, and wrong. `te.ml.labeling`
+    already avoids this the same way, for the same stated reason (see
+    `_try_real_premium_label`'s docstring); this mirrors it for the feature
+    path rather than leaving the two to disagree.
+
+    Falls back to today's expiry-weekday calendar ONLY when the archive has
+    nothing recorded at or after `as_of`'s date for this underlying — e.g.
+    live inference (`as_of=now()`) on a day the recorder has not yet backed
+    up bars for a freshly-listed expiry. That fallback cannot reintroduce the
+    historical-regime bug: `today` really is "now" on this branch, so
+    today's calendar is by definition the regime in force.
 
     The calendar helpers are weekday-based and do not adjust for trading
     holidays, so this can be a day out when an expiry shifts. Acceptable for
@@ -152,10 +217,12 @@ def _dte(as_of: dt.datetime, instrument: str) -> float:
         pass
 
     base = _underlying_base(instrument)
-    try:
-        expiry = next_weekly_expiry(base, today)
-    except ValueError:
-        expiry = next_monthly_expiry(base, today)
+    expiry = _nearest_archived_expiry(store, base, as_of, today)
+    if expiry is None:
+        try:
+            expiry = next_weekly_expiry(base, today)
+        except ValueError:
+            expiry = next_monthly_expiry(base, today)
     return float((expiry - today).days)
 
 
@@ -339,7 +406,7 @@ def build_training_set(
         "day_of_week_sin": dow_sin,
         "day_of_week_cos": dow_cos,
         "minutes_from_open": _minutes_from_open(as_of),
-        "dte": _dte(as_of, instrument),
+        "dte": _dte(store, as_of, instrument),
     }
 
     missing = [c for c in spec.columns if c not in values]

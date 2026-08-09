@@ -15,6 +15,8 @@ model":
 
 from __future__ import annotations
 
+import datetime as dt
+from decimal import Decimal
 from pathlib import Path
 
 import numpy as np
@@ -24,7 +26,10 @@ import sqlalchemy as sa
 from sklearn.linear_model import LogisticRegression
 from structlog.testing import capture_logs
 
-from te.data.barstore import BarStore
+from te.data.barstore import BAR_COLUMNS, BarStore
+from te.domain.clock import IST
+from te.domain.geometry import RupeeRiskGeometry
+from te.domain.money import Paise
 from te.ml.calibrate import fit_platt_calibrator
 from te.ml.featurespec import SECONDARY_V1
 from te.ml.gates import Stage, ml_maturity_state, model_promotions
@@ -41,6 +46,13 @@ from te.ml.nightly import (
 from te.ml.registry import get_latest_model_record, register_model
 from te.persistence.db import make_engine, make_session_factory
 from te.persistence.models import Base
+
+#: The live `Settings.paper_cycle_max_loss_per_trade_paise` (Rs 700) /
+#: `paper_cycle_target_risk_multiple` (10) geometry, so these tests exercise
+#: the same shape of geometry the real caller (`run_nightly_training_job` in
+#: `te.engine.scheduler`) supplies — never the old hardcoded 20%/20%.
+_LIVE_GEOMETRY = RupeeRiskGeometry(max_loss_paise=Paise(70_000), target_multiple=Decimal(10))
+_LIVE_MAX_LOTS = 1
 
 
 @pytest.fixture
@@ -142,7 +154,15 @@ def test_training_declines_on_a_sample_too_small_to_mean_anything(  # noqa: ANN0
     `honest-metrics` a model fitted on a handful of rows is a fabricated
     number waiting to be displayed, so the job returns `None` — and must not
     raise, or the scheduler would report a healthy system as failing."""
-    result = train_and_register(session_factory, engine, store, _cost_model(), instruments=("NIFTY",))
+    result = train_and_register(
+        session_factory,
+        engine,
+        store,
+        _cost_model(),
+        geometry=_LIVE_GEOMETRY,
+        max_lots=_LIVE_MAX_LOTS,
+        instruments=("NIFTY",),
+    )
 
     assert result is None
     assert get_latest_model_record(session_factory, MODEL_NAME) is None, "registered a model it never trained"
@@ -155,7 +175,15 @@ def test_the_nightly_job_never_promotes(session_factory, engine, store: BarStore
     is the only thing allowed to, and only with a human behind it."""
     _register(session_factory, model, version=1)
 
-    run_nightly_training(session_factory, engine, store, _cost_model(), instruments=("NIFTY",))
+    run_nightly_training(
+        session_factory,
+        engine,
+        store,
+        _cost_model(),
+        geometry=_LIVE_GEOMETRY,
+        max_lots=_LIVE_MAX_LOTS,
+        instruments=("NIFTY",),
+    )
 
     with session_factory() as session:
         stage_rows = session.execute(sa.select(ml_maturity_state.c.stage)).scalars().all()
@@ -173,24 +201,202 @@ def test_an_instrument_with_no_atm_snapshot_is_reported_not_silently_dropped(  #
     genuinely cannot be labelled — but a smaller-than-expected sample must
     never be the only evidence of that."""
     with capture_logs() as logs:
-        run_nightly_training(session_factory, engine, store, _cost_model(), instruments=("RELIANCE",))
+        run_nightly_training(
+            session_factory,
+            engine,
+            store,
+            _cost_model(),
+            geometry=_LIVE_GEOMETRY,
+            max_lots=_LIVE_MAX_LOTS,
+            instruments=("RELIANCE",),
+        )
 
     warned = [entry for entry in logs if "no ATM snapshot" in entry["event"]]
     assert warned, f"the unlabellable instrument was dropped silently: {logs}"
     assert warned[0]["instruments"] == ("RELIANCE",)
 
 
+def _seed_traded_evaluation(session_factory, *, instrument: str, entry_ts: dt.datetime, evaluation_id: str) -> None:  # noqa: ANN001
+    """One `verdict == "traded"` evaluation carrying the breakout condition
+    `label_firings_from_evaluations` keys off — the minimum `build_labeled_dataset`
+    needs to produce a real (non-empty) labelled row."""
+    from te.domain.evaluation import ConditionResult, Evaluation
+    from te.ml.labeling import _BREAKOUT_CONDITION_LABEL
+    from te.persistence.repos.paper_trading import record_cycle, record_evaluation
+
+    with session_factory() as session:
+        cycle_id = record_cycle(session, ts=entry_ts, mode="paper")
+        record_evaluation(
+            session,
+            cycle_id=cycle_id,
+            evaluation=Evaluation(
+                id=evaluation_id,
+                timestamp=entry_ts,
+                strategy="orb",
+                instrument=instrument,
+                verdict="traded",
+                reason="breakout confirmed",
+                conditions=(
+                    ConditionResult(
+                        label=_BREAKOUT_CONDITION_LABEL,
+                        required="close > range high",
+                        actual="close=24000.00, range=[23800.00, 23900.00]",
+                        passed=True,
+                        evaluated=True,
+                    ),
+                ),
+            ),
+        )
+        session.commit()
+
+
+def _index_bar(symbol: str, event_ts: dt.datetime, *, h: float, low: float, c: float) -> dict[str, object]:
+    return {
+        "symbol": symbol,
+        "exchange": "NFO",
+        "event_ts": event_ts,
+        "interval": "1m",
+        "o": c,
+        "h": h,
+        "l": low,
+        "c": c,
+        "v": 1_000,
+        "oi": 0,
+        "ingested_at": event_ts,
+        "source": "test",
+    }
+
+
+def test_build_labeled_dataset_barriers_come_from_the_callers_geometry_not_a_constant(  # noqa: ANN001
+    session_factory, store: BarStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`build_labeled_dataset` has no test caller at all in the audit's
+    finding — a hardcode of `max_lots=100` (or a fixed
+    `PremiumPercentGeometry(20, 20)`) at `nightly.py:118` would compute every
+    label at a geometry the engine does not trade, and the whole suite would
+    stay green. Seed a real traded evaluation plus index bars, spy on
+    `label_firings_from_evaluations` (the function `build_labeled_dataset`
+    threads `stop`/`target` into), and assert the distances it actually
+    receives equal `barriers(symbol, geometry=..., max_lots=...)` computed
+    independently with the SAME caller-supplied geometry/max_lots — i.e. the
+    caller's geometry, not a constant, sets the barriers."""
+    import te.ml.nightly as nightly_module
+    from te.ml.barriers import barriers as real_barriers
+    from te.ml.nightly import build_labeled_dataset
+
+    entry_ts = dt.datetime(2026, 6, 1, 9, 30, tzinfo=IST)
+    _seed_traded_evaluation(session_factory, instrument="NIFTY", entry_ts=entry_ts, evaluation_id="eval-0")
+
+    # A real, non-trivial price path under the traded instrument so labelling
+    # actually runs to completion rather than short-circuiting on empty bars.
+    rows = [
+        _index_bar("NIFTY", entry_ts + dt.timedelta(minutes=i), h=24_500.0, low=23_500.0, c=24_000.0)
+        for i in range(1, 20)
+    ]
+    store.append(pd.DataFrame(rows, columns=list(BAR_COLUMNS)))
+
+    captured: dict[str, object] = {}
+    real_label_firings = nightly_module.label_firings_from_evaluations
+
+    def _spy(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        captured["stop_distance"] = kwargs["stop_distance"]
+        captured["target_distance"] = kwargs["target_distance"]
+        return real_label_firings(*args, **kwargs)
+
+    monkeypatch.setattr(nightly_module, "label_firings_from_evaluations", _spy)
+
+    frame = build_labeled_dataset(
+        session_factory,
+        store,
+        _cost_model(),
+        geometry=_LIVE_GEOMETRY,
+        max_lots=_LIVE_MAX_LOTS,
+        instruments=("NIFTY",),
+    )
+
+    assert len(frame) > 0, "the seeded firing produced no labelled rows — the test setup itself is broken"
+    assert captured, "label_firings_from_evaluations was never called"
+
+    expected_stop, expected_target = real_barriers("NIFTY", geometry=_LIVE_GEOMETRY, max_lots=_LIVE_MAX_LOTS)
+    assert captured["stop_distance"] == expected_stop
+    assert captured["target_distance"] == expected_target
+
+    # A DIFFERENT geometry must produce DIFFERENT barriers reaching the same
+    # call — proof this is threaded through, not a coincidentally-matching
+    # constant.
+    other_geometry = RupeeRiskGeometry(max_loss_paise=Paise(140_000), target_multiple=Decimal(5))
+    other_expected_stop, other_expected_target = real_barriers("NIFTY", geometry=other_geometry, max_lots=_LIVE_MAX_LOTS)
+    assert (other_expected_stop, other_expected_target) != (expected_stop, expected_target), (
+        "test setup picked two geometries that happen to resolve to the same barriers"
+    )
+
+
+def test_geometry_stamp_is_symbol_specific_and_not_1_to_1() -> None:
+    """`model_registry.notes` must record what a label was actually computed
+    at. Every label used to be silently computed at a hardcoded 20%/20%; the
+    stamp now records the real per-symbol percentage under the live
+    `RupeeRiskGeometry`, which is neither 20/20 nor the same across symbols
+    (Rs 700 is a different fraction of NIFTY's Rs 92.05 premium than of
+    BANKNIFTY's Rs 876.75)."""
+    from te.ml.nightly import _geometry_stamp
+
+    stamp = _geometry_stamp(("NIFTY", "BANKNIFTY"), geometry=_LIVE_GEOMETRY, max_lots=_LIVE_MAX_LOTS)
+
+    assert "NIFTY=" in stamp
+    assert "BANKNIFTY=" in stamp
+    nifty_part, banknifty_part = (p for p in stamp.split(", "))
+    assert nifty_part != banknifty_part
+    assert "-20.00%/+20.00%" not in stamp, "still stamping the old hardcoded 1:1 geometry"
+
+
+def test_geometry_stamp_names_a_degenerate_symbol_rather_than_omitting_it() -> None:
+    """A symbol whose whole premium sits inside the rupee cap at this
+    quantity cannot be labelled at all — the stamp must say so explicitly
+    rather than silently dropping the symbol from the string."""
+    from te.domain.geometry import RupeeRiskGeometry as _RupeeRiskGeometry
+    from te.ml.nightly import _geometry_stamp
+
+    # A rupee cap so far ABOVE NIFTY's whole premium (Rs 92.05 at 65 units =
+    # Rs 5,983.25 notional) that the resolved stop distance lands at or
+    # beyond the entry premium itself — there is no reachable stop.
+    degenerate = _RupeeRiskGeometry(max_loss_paise=Paise(1_000_000), target_multiple=Decimal(10))
+
+    stamp = _geometry_stamp(("NIFTY",), geometry=degenerate, max_lots=_LIVE_MAX_LOTS)
+
+    assert stamp == "NIFTY=unlabelled (degenerate)"
+
+
 def test_training_failures_never_escape_into_the_scheduler(session_factory, engine, store: BarStore) -> None:  # noqa: ANN001
     """A layer that is structurally forbidden from changing a decision must
     also be unable to stop one. `run_nightly_training` is what APScheduler
     calls; anything it lets through becomes a job error on a system that is
-    trading correctly."""
+    trading correctly.
+
+    Not raising is necessary but not sufficient: a nightly job that dies
+    every night and says nothing is a full session of lost training data,
+    invisible until someone goes looking. `nightly.py` already imports
+    `structlog` and calls `logger.exception("nightly training failed", ...)`
+    in this exact except block — assert that event actually lands, at error
+    level, rather than only asserting the call didn't raise."""
 
     class Exploding:
         def __getattr__(self, name: str) -> object:
             raise RuntimeError("boom")
 
-    run_nightly_training(session_factory, engine, store, Exploding(), instruments=("NIFTY",))  # type: ignore[arg-type]
+    with capture_logs() as logs:
+        run_nightly_training(
+            session_factory,
+            engine,
+            store,
+            Exploding(),  # type: ignore[arg-type]
+            geometry=_LIVE_GEOMETRY,
+            max_lots=_LIVE_MAX_LOTS,
+            instruments=("NIFTY",),
+        )
+
+    failures = [entry for entry in logs if entry["event"] == "nightly training failed"]
+    assert failures, f"the training failure was swallowed with no log entry: {logs}"
+    assert failures[0]["log_level"] == "error"
 
 
 def test_the_sample_floor_is_at_least_the_honest_metrics_floor() -> None:

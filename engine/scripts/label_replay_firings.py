@@ -51,6 +51,7 @@ from te.data.charges_loader import load_charge_rate_table
 from te.data.lot_size_history import UnknownLotSizeError, load_lot_size_history, lot_size_on
 from te.data.option_history import OptionContractIndex
 from te.domain.costs import CostModel
+from te.engine.scheduler import _exit_geometry
 from te.ml.barriers import (
     ATM_SNAPSHOTS,
     MAX_HOLD,
@@ -101,12 +102,22 @@ def main() -> int:
     # and each must be priced at the rates that were really in force on its
     # own date. See `CostModel.__init__`.
     cost_model = CostModel(load_charge_rate_table(settings.charges_path))
+    # The geometry the LIVE engine actually trades, from the one selector
+    # that decides it (`te.engine.scheduler._exit_geometry`) — never a second
+    # copy of its branching. `STOP_PCT`/`TARGET_PCT` below are the OLD,
+    # no-longer-live 20%/20% figures, kept only as a labelled display value.
+    geometry = _exit_geometry(settings)
+    max_lots = settings.paper_cycle_max_lots or 1
 
-    print(f"barriers: stop -{STOP_PCT}% / target +{TARGET_PCT}% of ATM premium, max hold {MAX_HOLD}")
+    print(
+        f"barriers: stop -{STOP_PCT}% / target +{TARGET_PCT}% of ATM premium "
+        f"(HISTORICAL, no longer live), max hold {MAX_HOLD}"
+    )
+    print(f"live geometry actually used below: {geometry!r}, max_lots={max_lots}")
     print(f"labelling firings from {RATES_VERIFIED_FROM} onward (charge rates verified from that date)\n")
     print(f"{'instrument':<11}{'stop pts':>10}{'target pts':>12}{'stop %':>9}{'target %':>10}{'DTE':>6}")
     for symbol in chosen:
-        stop, target = barriers(symbol)
+        stop, target = barriers(symbol, geometry=geometry, max_lots=max_lots)
         print(
             f"{symbol:<11}{int(stop) / 100:>10.1f}{int(target) / 100:>12.1f}"
             f"{barrier_pct_as_index_pct(symbol, STOP_PCT):>8.3f}%"
@@ -145,7 +156,7 @@ def main() -> int:
     grand: Counter[str] = Counter()
     sources: Counter[str] = Counter()
     for symbol in chosen:
-        stop, target = barriers(symbol)
+        stop, target = barriers(symbol, geometry=geometry, max_lots=max_lots)
         firings = label_firings_from_evaluations(
             session_factory,
             store,
