@@ -130,6 +130,46 @@ def test_sizing_never_returns_zero_lots_silently(cost_model: CostModel, kwargs: 
         assert result.rejected_reason is None
 
 
+def test_risk_budget_is_the_binding_cap_when_it_is_the_smallest(cost_model: CostModel) -> None:
+    """`lots = min(lots_by_risk, lots_by_capital, lots_by_position_size)` —
+    every other test in this module/`test_max_lots.py` has `lots_by_risk`
+    sitting ABOVE at least one of the other two caps, so the risk budget is
+    only ever exercised as an on/off floor (`lots_by_risk < 1` rejects), never
+    as the thing that actually sets the size. A generous capital/position-
+    size ceiling and a tight risk budget here makes `lots_by_risk` strictly
+    the smallest, so dropping it from the `min()` would silently change the
+    result."""
+    capital = Paise(50_000_00)  # Rs 50,000 — affordability/position-size caps stay generous
+    risk_budget_pct = Decimal("1")  # Rs 500 risk budget — deliberately tight
+    premium = Paise(3_500)  # Rs 35
+    stop_premium = Paise(3_450)  # Rs 0.50 stop distance -> risk_per_lot = 0.50 x 65 = Rs 32.50/lot
+    lot_size = 65
+
+    result = size_position(
+        capital=capital,
+        risk_budget_pct=risk_budget_pct,
+        premium=premium,
+        stop_premium=stop_premium,
+        target_premium=Paise(4_500),
+        lot_size=lot_size,
+        costs=cost_model,
+        exchange="NFO",
+        on=ON,
+        min_edge_multiple=Decimal("1.2"),
+        max_position_size_pct=Decimal(100),
+    )
+
+    risk_per_lot = (int(premium) - int(stop_premium)) * lot_size
+    risk_budget_paise = int(Decimal(int(capital)) * risk_budget_pct / Decimal(100))
+    lots_by_risk = risk_budget_paise // risk_per_lot
+    lots_by_capital = int(capital) // (int(premium) * lot_size)
+    assert lots_by_risk < lots_by_capital, "the premise of this test no longer holds — re-derive the numbers"
+
+    assert result.rejected_reason is None
+    assert result.lots == lots_by_risk
+    assert result.lots == risk_budget_paise // risk_per_lot
+
+
 def test_max_position_size_pct_caps_lots_below_the_risk_and_capital_caps(cost_model: CostModel) -> None:
     """A position can be well within its risk budget yet still tie up an
     outsized share of capital in one bet when the stop is close to premium

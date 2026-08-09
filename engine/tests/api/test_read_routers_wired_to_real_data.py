@@ -67,6 +67,31 @@ def isolated_client(tmp_path: Path, monkeypatch):  # noqa: ANN201
 
 def _seed_closed_trade(sf, *, net_pnl_paise: int = 5_000) -> None:  # noqa: ANN001
     with sf() as session:
+        # A real closed trade always has a matching ENTRY-ledger row too —
+        # `open_positions` is written at open and never deleted, `closed_at`
+        # stamped on close (see CLAUDE.md's "Two ledgers"). Seeding only the
+        # `TradeRow` (as this fixture used to) understates
+        # `entries_count_today`, which reads `open_positions` alone.
+        session.add(
+            OpenPositionRow(
+                client_order_id="co-1",
+                symbol="NIFTY30JUL2624500CE",
+                exchange="NFO",
+                strategy="orb",
+                direction="long_call",
+                lots=1,
+                lot_size=65,
+                entry_premium_paise=10_000,
+                stop_paise=9_000,
+                current_stop_paise=9_000,
+                trailing_distance_paise=None,
+                target_paise=11_000,
+                max_hold_seconds=10_800,
+                hard_exit_by="15:20:00",
+                opened_at=NOW - dt.timedelta(minutes=30),
+                closed_at=NOW,
+            )
+        )
         session.add(
             TradeRow(
                 client_order_id="co-1",
@@ -128,15 +153,88 @@ def test_dashboard_reflects_real_closed_trade_and_open_position(isolated_client)
 
 
 def test_dashboard_snapshot_reflects_real_mode_and_counts(isolated_client) -> None:  # noqa: ANN001
+    """`tradesToday` is rendered against `maxTradesPerDay` in the same
+    response body — that cap is enforced on the ENTRY ledger
+    (`entries_count_today`), so the seeded 1 closed trade + 1 open position
+    must read as 2, not 1 (the exact pair that distinguishes the two
+    ledgers). Likewise `todayPnl` is displayed beside `dailyLossLimit`,
+    which `check_daily_loss_limit` enforces on realized PLUS unrealized
+    P&L — see `test_dashboard_snapshot_today_pnl_moves_with_unrealized_mark`
+    for the case where that unrealized term actually changes the number."""
     client, sf = isolated_client
     _seed_closed_trade(sf)
     _seed_open_position(sf)
 
     body = client.get("/api/dashboard/snapshot").json()
-    assert body["tradesToday"] == 1
+    assert body["tradesToday"] == 2
     assert body["openPositionsCount"] == 1
-    assert body["todayPnl"] == 50.0
+    # The open position has no recorded bar yet, so it marks at its own
+    # entry premium (`latest_close_paise(..., fallback=entry_premium)`) —
+    # zero GROSS unrealized P&L, but a real round-trip exit cost is still
+    # incurred even at a flat mark, so `todayPnl` must be strictly below the
+    # Rs 50 realized-only figure (this is what proves the unrealized term is
+    # actually wired in, not merely present and always zero).
+    assert body["todayPnl"] < 50.0
+
+    from te.api.db import charge_rate_table
+    from te.domain.costs import CostModel, select_rates
+    from te.domain.pnl import mark_to_market_pnl
+
+    today = dt.datetime.now(IST).date()
+    expected_unrealized_paise = mark_to_market_pnl(
+        entry_premium=Paise(8_000),
+        current_premium=Paise(8_000),
+        qty=60,  # 2 lots x 30 lot_size, matching `_seed_open_position`
+        exchange="NFO",
+        cost_model=CostModel(select_rates(charge_rate_table, today)),
+        on=today,
+    )
+    expected_today_pnl = round(50.0 + float(int(expected_unrealized_paise)) / 100, 2)
+    assert body["todayPnl"] == expected_today_pnl
     assert body["mode"] == "dry-run"  # real default, read from engine_state
+
+
+def test_dashboard_snapshot_today_pnl_moves_with_unrealized_mark(isolated_client, tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    """Regression for the dashboard agreeing with the counter bug: with a
+    position open and underwater, `todayPnl` must include that unrealized
+    loss — otherwise the page shows less budget used than
+    `check_daily_loss_limit` (realized + unrealized) is actually enforcing."""
+    import pandas as pd
+
+    from te.data.barstore import BAR_COLUMNS, BarStore
+
+    client, sf = isolated_client
+    _seed_closed_trade(sf, net_pnl_paise=0)
+    _seed_open_position(sf)  # entry_premium_paise=8_000, 2 lots x 30 lot_size = 60 qty
+
+    # The dashboard router marks positions off the REAL wall clock
+    # (`dt.datetime.now(IST)`), not this module's fixed `NOW` fixture — so
+    # the bar must be recent relative to actual test-run time, well inside
+    # `latest_close_paise`'s default 5-minute lookback.
+    bar_open = dt.datetime.now(dt.UTC) - dt.timedelta(minutes=2)
+    row = {
+        "symbol": "BANKNIFTY30JUL2652000PE",
+        "exchange": "NFO",
+        "event_ts": bar_open,
+        "interval": "1m",
+        "o": 80.0,
+        "h": 80.0,
+        "l": 60.0,
+        "c": 60.0,  # Rs 60, well below the Rs 80 entry premium -> a real unrealized loss
+        "v": 1,
+        "oi": 0,
+        "ingested_at": bar_open + dt.timedelta(minutes=1),
+        "source": "test",
+    }
+    store = BarStore(tmp_path / "bars")
+    store.append(pd.DataFrame([row], columns=list(BAR_COLUMNS)))
+    monkeypatch.setattr(dashboard_router, "bar_store", store)
+
+    body = client.get("/api/dashboard/snapshot").json()
+
+    # (6_000 - 8_000) paise x 60 qty = -Rs 1,200 gross, minus real round-trip
+    # costs -> strictly worse than the realized-only Rs 0.
+    assert body["todayPnl"] < 0
 
 
 def test_dashboard_honest_zero_state_with_no_data(isolated_client) -> None:  # noqa: ANN001

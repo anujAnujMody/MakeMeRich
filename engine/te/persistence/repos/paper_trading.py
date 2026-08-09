@@ -18,6 +18,7 @@ import datetime as dt
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
+from te.domain.clock import IST
 from te.domain.clock import to_utc as _utc
 from te.domain.evaluation import ConditionResult, Evaluation
 from te.domain.money import Paise
@@ -105,7 +106,7 @@ def evaluations_today(session: Session, on: dt.date) -> list[CycleEvaluationRow]
     return list(
         session.execute(
             select(CycleEvaluationRow)
-            .where(CycleEvaluationRow.ts >= start, CycleEvaluationRow.ts <= end)
+            .where(CycleEvaluationRow.ts >= start, CycleEvaluationRow.ts < end)
             .order_by(CycleEvaluationRow.ts.desc())
         )
         .scalars()
@@ -357,7 +358,7 @@ def underlying_entries_today(session: Session, *, strategy: str, underlying: str
             TradeRow.strategy == strategy,
             TradeRow.symbol.like(prefix),
             TradeRow.closed_at >= start,
-            TradeRow.closed_at <= end,
+            TradeRow.closed_at < end,
         )
     ).scalar_one()
     return int(open_count) + int(closed_count)
@@ -366,24 +367,69 @@ def underlying_entries_today(session: Session, *, strategy: str, underlying: str
 def trades_today(session: Session, on: dt.date) -> list[TradeRow]:
     start, end = _day_bounds(on)
     return list(
-        session.execute(select(TradeRow).where(TradeRow.closed_at >= start, TradeRow.closed_at <= end)).scalars().all()
+        session.execute(select(TradeRow).where(TradeRow.closed_at >= start, TradeRow.closed_at < end)).scalars().all()
     )
 
 
 def _day_bounds(on: dt.date) -> tuple[dt.datetime, dt.datetime]:
-    return (
-        dt.datetime.combine(on, dt.time.min, tzinfo=dt.UTC),
-        dt.datetime.combine(on, dt.time.max, tzinfo=dt.UTC),
-    )
+    """The IST trading day `on` — `[00:00 IST, 24:00 IST)`, i.e. a half-open
+    interval — converted to the UTC instants rows are actually stored in.
+
+    Previously stamped UTC tzinfo directly onto the IST calendar date
+    (`dt.datetime.combine(on, dt.time.min, tzinfo=dt.UTC)`), which is wrong
+    twice over: it treats an IST date as if it were already a UTC date (off
+    by the +05:30 offset), and it closed the interval at `time.max`
+    (`<=`) instead of the correct half-open `[start, end)`. It could not
+    bite in production only because NSE/BSE hours (09:15-15:30 IST, i.e.
+    03:45-10:00 UTC) never straddle UTC midnight — but the 09:15-11:30 IST
+    morning silently fell on the wrong SIDE of a UTC-midnight-relative
+    window computation is exactly the shape of bug this project has shipped
+    before. See `CLAUDE.md`'s "Dates: rows are UTC, the trading day is IST"."""
+    start_ist = dt.datetime.combine(on, dt.time.min, tzinfo=IST)
+    end_ist = start_ist + dt.timedelta(days=1)
+    return start_ist.astimezone(dt.UTC), end_ist.astimezone(dt.UTC)
 
 
 def trades_count_today(session: Session, on: dt.date) -> int:
-    """Aggregated in SQL — this runs once per instrument per cycle via
-    `te.risk.limits`, and hydrating the whole day's `TradeRow` objects just
-    to take their length is pure waste."""
+    """Trades CLOSED today. Aggregated in SQL — this runs once per instrument
+    per cycle via `te.risk.limits`, and hydrating the whole day's `TradeRow`
+    objects just to take their length is pure waste.
+
+    NOT the answer to "how many trades has the engine placed today" — see
+    `entries_count_today`, which is. A position opened an hour ago and still
+    running is a trade that was placed; it simply has no `TradeRow` yet."""
     start, end = _day_bounds(on)
     return session.execute(
-        select(func.count()).select_from(TradeRow).where(TradeRow.closed_at >= start, TradeRow.closed_at <= end)
+        select(func.count()).select_from(TradeRow).where(TradeRow.closed_at >= start, TradeRow.closed_at < end)
+    ).scalar_one()
+
+
+def entries_count_today(session: Session, on: dt.date) -> int:
+    """How many trades the engine has PLACED today — open and closed alike.
+
+    Counts the ENTRY ledger directly. `open_positions` rows are written at
+    open and never deleted (`closed_at` is stamped on close), so one count
+    over `opened_at` covers a position that is still running and one that has
+    already closed, with no risk of double-counting the same trade through
+    both ledgers.
+
+    This exists because `trades_count_today` counts the EXIT ledger, and
+    `check_max_trades_per_day` used it to enforce a cap on trades PLACED. A
+    live position has no `TradeRow` until it closes, so every open trade was
+    invisible to that cap: on 2026-08-07 six trades ran against a cap of
+    three and the guard never fired. The same mistake in
+    `check_daily_loss_limit` was found and fixed at the time; this neighbour
+    in the same file was not swept, and stayed broken.
+
+    `underlying_entries_today` above answers the same question per-underlying
+    by adding open positions to trades closed today. That form is correct but
+    subtler — it relies on the two ledgers being disjoint for a given trade —
+    so the general counter uses the entry ledger alone."""
+    start, end = _day_bounds(on)
+    return session.execute(
+        select(func.count())
+        .select_from(OpenPositionRow)
+        .where(OpenPositionRow.opened_at >= start, OpenPositionRow.opened_at < end)
     ).scalar_one()
 
 
@@ -393,7 +439,7 @@ def daily_net_pnl_paise(session: Session, on: dt.date) -> Paise:
     start, end = _day_bounds(on)
     total = session.execute(
         select(func.coalesce(func.sum(TradeRow.net_pnl_paise), 0)).where(
-            TradeRow.closed_at >= start, TradeRow.closed_at <= end
+            TradeRow.closed_at >= start, TradeRow.closed_at < end
         )
     ).scalar_one()
     return Paise(int(total))
@@ -455,7 +501,7 @@ def order_ids_today(session: Session, on: dt.date) -> list[str]:
     start, end = _day_bounds(on)
     rows = (
         session.execute(
-            select(OrderEventRow.client_order_id).distinct().where(OrderEventRow.ts >= start, OrderEventRow.ts <= end)
+            select(OrderEventRow.client_order_id).distinct().where(OrderEventRow.ts >= start, OrderEventRow.ts < end)
         )
         .scalars()
         .all()

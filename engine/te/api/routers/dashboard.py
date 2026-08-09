@@ -3,14 +3,16 @@ import datetime as dt
 from fastapi import APIRouter, Response
 from sqlalchemy.orm import Session
 
-from te.api.db import bar_store, session_factory, settings
+from te.api.db import bar_store, charge_rate_table, session_factory, settings
 from te.api.provenance import set_provenance
 from te.api.routers.positions import position_from_row
 from te.api.schemas.dashboard import DashboardData, DashboardSnapshot, OpenPosition, PipelineStageInfo
 from te.api.trade_stats import summarize_trades
 from te.data.asof import latest_close_paise
 from te.domain.clock import IST
+from te.domain.costs import CostModel, select_rates
 from te.domain.money import Paise, rupees
+from te.domain.pnl import mark_to_market_pnl
 from te.engine.state import (
     PIPELINE_STAGE_KEYS,
     get_guardrails,
@@ -22,10 +24,10 @@ from te.engine.state import (
 from te.ml.gates import MaturityGate
 from te.persistence.repos.paper_trading import (
     daily_net_pnl_paise,
+    entries_count_today,
     open_positions,
     recent_session_dates,
     trades_closed_since,
-    trades_count_today,
     trades_today,
 )
 
@@ -141,12 +143,33 @@ def get_dashboard_snapshot(response: Response) -> DashboardSnapshot:
     with session_factory() as session:
         mode = get_mode(session)
         run_state = get_run_state(session)
-        today_pnl = daily_net_pnl_paise(session, today)
-        today_trade_count = trades_count_today(session, today)
+        today_realized_pnl = daily_net_pnl_paise(session, today)
+        today_entries_count = entries_count_today(session, today)
         positions = open_positions(session)
         guardrails = get_guardrails(session, defaults=guardrails_defaults_from_settings(settings))
         pipeline = _build_pipeline(session)
         next_check_in_seconds = _next_check_in_seconds(session, now=as_of, run_state=run_state)
+
+        # `todayPnl` is rendered right beside `dailyLossLimit`, and that
+        # limit is enforced by `check_daily_loss_limit` on realized PLUS
+        # unrealized P&L — so the displayed figure must include the same
+        # mark-to-market term, or the page under-reports budget usage
+        # exactly when a position is underwater (the same shape as the
+        # `tradesToday` counter bug this endpoint used to carry).
+        unrealized_pnl_paise = 0
+        for row in positions:
+            current_premium = Paise(latest_close_paise(bar_store, row.symbol, as_of, fallback=row.entry_premium_paise))
+            unrealized_pnl_paise += int(
+                mark_to_market_pnl(
+                    entry_premium=Paise(row.entry_premium_paise),
+                    current_premium=current_premium,
+                    qty=row.lots * row.lot_size,
+                    exchange=row.exchange,
+                    cost_model=CostModel(select_rates(charge_rate_table, today)),
+                    on=today,
+                )
+            )
+        today_pnl = Paise(int(today_realized_pnl) + unrealized_pnl_paise)
 
         session_dates = recent_session_dates(session, limit=_TRAILING_SESSIONS)
         week_rows = trades_closed_since(session, min(session_dates)) if session_dates else []
@@ -154,8 +177,8 @@ def get_dashboard_snapshot(response: Response) -> DashboardSnapshot:
 
     set_provenance(
         response,
-        provenance="paper" if (today_trade_count or positions) else "none",
-        sample_size=today_trade_count,
+        provenance="paper" if (today_entries_count or positions) else "none",
+        sample_size=today_entries_count,
     )
     return DashboardSnapshot(
         mode=mode,
@@ -165,7 +188,7 @@ def get_dashboard_snapshot(response: Response) -> DashboardSnapshot:
         dailyLossLimit=float(rupees(guardrails.max_daily_loss)),
         openPositionsCount=len(positions),
         maxPositions=guardrails.max_concurrent_positions,
-        tradesToday=today_trade_count,
+        tradesToday=today_entries_count,
         maxTradesPerDay=guardrails.max_trades_per_day,
         positions=[
             OpenPosition(
