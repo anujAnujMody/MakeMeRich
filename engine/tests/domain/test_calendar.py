@@ -101,6 +101,17 @@ def test_next_trading_day_skips_holidays_and_weekends_together() -> None:
     assert CALENDAR.next_trading_day(dt.date(2026, 1, 23), exchange="NSE") == dt.date(2026, 1, 27)
 
 
+def test_next_trading_day_respects_a_tight_limit() -> None:
+    """`limit` bounds how many days ahead `next_trading_day` will look —
+    every other test here uses the generous default (30), so nothing pinned
+    the exact `range(1, limit + 1)` boundary. With `limit=1` the only
+    candidate checked is `after + 1 day`; if that is a trading day it must
+    be returned, not treated as out of range."""
+    # 2026-01-26 is Republic Day (Monday); 2026-01-27 (Tuesday) is the very
+    # next trading day, exactly one day ahead.
+    assert CALENDAR.next_trading_day(dt.date(2026, 1, 26), exchange="NSE", limit=1) == dt.date(2026, 1, 27)
+
+
 def test_a_malformed_row_is_skipped_not_fatal() -> None:
     """Losing one holiday is bad. Losing the whole year's calendar because
     one row changed shape is worse — and the second failure mode is silent,
@@ -146,6 +157,24 @@ def test_a_clean_calendar_reports_no_dropped_rows() -> None:
     """`dropped_rows` must not manufacture a false positive on a normal
     payload — every row here is well-formed."""
     assert CALENDAR.dropped_rows == ()
+
+
+def test_a_special_session_with_only_one_bound_unparseable_is_dropped() -> None:
+    """`_window_from_epoch_ms` refuses if EITHER bound fails to parse, not
+    only when BOTH do — `test_a_special_session_with_unparseable_bounds_is_dropped`
+    makes both `start_time`/`end_time` invalid at once, which cannot tell an
+    `or` from an `and`. Here only `end_time` is bad; a correct `or` still
+    drops the row, while an `and` would fall through and crash on
+    `float(None) / 1000`."""
+    bad_row = {
+        "date": "2026-11-10",
+        "holiday_type": "SPECIAL_SESSION",
+        "closed_exchanges": [],
+        "open_exchanges": [{"exchange": "NSE", "start_time": 1794141000000, "end_time": None}],
+    }
+    calendar = from_holiday_rows([bad_row])
+    assert calendar.session_window(dt.date(2026, 11, 10), exchange="NSE") == DEFAULT_SESSION
+    assert bad_row in calendar.dropped_rows
 
 
 def test_a_special_session_with_unparseable_bounds_is_dropped() -> None:

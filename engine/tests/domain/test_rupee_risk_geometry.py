@@ -252,6 +252,31 @@ def test_the_profit_lock_survives_the_new_geometry() -> None:
     assert levels.profit_lock_buffer_pct == Decimal(5)
 
 
+def test_the_fixed_point_prices_the_exit_below_entry_not_above() -> None:
+    """The fixed-point loop at `geometry.py:326-331` must evaluate the cost
+    estimator at a candidate BELOW entry (a long position's stop), not
+    above it. `test_cost_estimator_keeps_the_true_net_loss_under_the_cap`
+    uses a real, nearly-symmetric `CostModel.round_trip` and cannot tell the
+    two apart; this estimator is deliberately asymmetric around entry so the
+    direction is load-bearing."""
+    premium, lot_size = NIFTY
+
+    def estimator(exit_premium: Paise) -> Paise:
+        return Paise(0) if int(exit_premium) < int(premium) else Paise(1_000_000)
+
+    levels = _geometry().levels(premium, quantity=lot_size, cost_estimator=estimator)
+    assert levels.stop == Paise(int(premium) - (RS_700 // lot_size))
+
+
+def test_profit_lock_buffer_pct_of_exactly_zero_is_refused() -> None:
+    """The boundary `(0, 100)` names at its lower end — `0` itself must be
+    refused, not just negative values. Every other test in this file that
+    sets `profit_lock_buffer_pct` uses `Decimal(5)`, so nothing exercised
+    this exact edge."""
+    with pytest.raises(ValueError, match="profit_lock_buffer_pct must be in"):
+        _geometry(profit_lock_activation_pct=Decimal(15), profit_lock_buffer_pct=Decimal(0))
+
+
 def test_a_lock_that_could_never_fire_is_reported_as_off() -> None:
     """Found 2026-08-06 by `scripts/stop_level_report.py`, which crashed on
     `ExitPlan.__post_init__` at a Rs 300 stop:

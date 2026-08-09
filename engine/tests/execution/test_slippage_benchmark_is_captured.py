@@ -264,6 +264,61 @@ def test_a_fill_records_a_slippage_observation(tmp_path) -> None:  # noqa: ANN00
     assert rows[0].actual_paise == 7_425
 
 
+def test_a_fill_with_no_two_sided_quote_falls_back_to_the_requested_price(tmp_path) -> None:  # noqa: ANN001
+    """When no arrival bid/ask was captured (e.g. a backtest replay), the
+    slippage benchmark must fall back to `requested_price` — an `is not
+    None` -> `is None` flip on that `elif` would skip this branch even
+    though `requested_price` genuinely IS present, and `_observe_slippage`
+    would then return without recording anything at all."""
+    from te.broker.protocol import FillReport
+    from te.broker.ratelimit import TokenBucket
+    from te.broker.simulated import SimulatedBroker
+    from te.data.charges_loader import load_charge_rate_table
+    from te.domain.costs import CostModel, select_rates
+    from te.execution.manager import ExecutionManager
+    from te.persistence.models import SlippageObservationRow
+    from te.settings import Settings
+
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'noquote.db'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    cost_model = CostModel(select_rates(load_charge_rate_table(Settings().charges_path), _TS.date()))
+    manager = ExecutionManager(
+        factory,
+        OrderEventStore(factory),
+        _NoAutoFillBroker(SimulatedBroker(cost_model=cost_model, on=_TS.date())),
+        TokenBucket(rate=100, capacity=100),
+    )
+
+    client_order_id = manager.submit(_request(arrival_bid=None, arrival_ask=None))
+    manager.on_fill(
+        FillReport(
+            client_order_id=client_order_id,
+            venue_order_id="v-1",
+            venue_trade_id="t-1",
+            symbol="NIFTY04AUG2624600PE",
+            exchange="NFO",
+            side="BUY",
+            fill_qty=65,
+            fill_price=Paise(7_425),
+            gross_amount_paise=Paise(-482_625),
+            cost_breakdown=cost_model.round_trip(
+                entry_premium=Paise(7_425), exit_premium=Paise(7_425), qty=65, exchange="NFO", on=_TS.date()
+            ),
+            net_amount_paise=Paise(-482_625),
+            ts=_TS,
+        )
+    )
+
+    with factory() as session:
+        rows = session.query(SlippageObservationRow).all()
+
+    assert len(rows) == 1, "no arrival quote, but requested_price was present — must still be measured"
+    # Benchmarked against the REQUESTED price (7400), the only benchmark
+    # available with no two-sided quote.
+    assert rows[0].expected_paise == 7_400
+
+
 def test_a_bad_sell_fill_is_recorded_as_bad_not_good(tmp_path) -> None:  # noqa: ANN001
     """The sign bug, caught in review 2026-08-05.
 

@@ -99,6 +99,20 @@ def test_advisory_stage_shows_a_verdict_but_still_cannot_veto_or_resize(session_
     assert influence.size_multiplier == 1
 
 
+@pytest.mark.parametrize(("p", "expected_verdict"), [(0.499, "unfavourable"), (0.5, "favourable"), (0.501, "favourable")])
+def test_advisory_verdict_boundary_is_favourable_at_exactly_the_threshold(  # noqa: ANN001
+    session_factory, p: float, expected_verdict: str
+) -> None:
+    """`_verdict` uses `p >= _ADVISORY_VERDICT_THRESHOLD` — a boundary flip
+    to `p > _ADVISORY_VERDICT_THRESHOLD` would show "unfavourable" at
+    exactly `p == 0.5`, and no existing test checks the displayed STRING
+    (only that it is non-`None`)."""
+    _set_stage_directly(session_factory, Stage.ADVISORY)
+    gate = MaturityGate(session_factory)
+    influence = gate.influence(p)
+    assert influence.displayed_verdict == expected_verdict
+
+
 def test_gating_stage_can_veto_in_paper_mode(session_factory) -> None:  # noqa: ANN001
     _set_stage_directly(session_factory, Stage.GATING)
     _set_mode_directly(session_factory, "dry-run")

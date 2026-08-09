@@ -46,6 +46,53 @@ def test_absolute_distances_do_not_scale() -> None:
     assert geometry.levels(Paise(30_000)).stop == Paise(29_700)  # -1%
 
 
+def test_premium_percent_target_is_added_not_subtracted() -> None:
+    """`test_percentages_scale_with_the_premium` only ever checked `.stop`;
+    nothing pinned the sign on `.target`, so a target computed by
+    subtracting the percentage (putting it BELOW entry, on the wrong side of
+    a long position) was indistinguishable from a correct one."""
+    levels = PremiumPercentGeometry(stop_pct=Decimal(20), target_pct=Decimal(20)).levels(ENTRY)
+    assert levels.target == Paise(9_780)  # 8150 + 20% of 8150 (1630, truncated)
+    assert levels.target > ENTRY
+
+
+def test_absolute_target_is_added_not_subtracted() -> None:
+    """The `AbsolutePointGeometry` twin of the above — every existing test
+    for this class only asserted `.stop`."""
+    geometry = AbsolutePointGeometry(stop_distance=Paise(300), target_distance=Paise(500))
+    levels = geometry.levels(Paise(3_000))
+    assert levels.target == Paise(3_500)
+    assert levels.target > Paise(3_000)
+
+
+def test_absolute_stop_distance_of_zero_is_refused() -> None:
+    """`__post_init__` must reject a zero stop distance, not just a negative
+    one — a zero-distance stop sits exactly ON entry and can never define a
+    real stop-loss."""
+    with pytest.raises(ValueError, match="stop_distance must be positive"):
+        AbsolutePointGeometry(stop_distance=Paise(0), target_distance=Paise(300))
+
+
+def test_absolute_target_distance_of_zero_is_refused() -> None:
+    with pytest.raises(ValueError, match="target_distance must be positive"):
+        AbsolutePointGeometry(stop_distance=Paise(300), target_distance=Paise(0))
+
+
+def test_absolute_stop_distance_exactly_at_the_entry_premium_is_degenerate() -> None:
+    """The boundary the docstring's `>=` names: a stop distance EQUAL to the
+    entry premium puts the stop at exactly zero, which is not a real price.
+    `test_absolute_distances_do_not_scale` and friends never used a distance
+    that reaches this exact boundary."""
+    from te.domain.geometry import DegenerateGeometry
+
+    geometry = AbsolutePointGeometry(stop_distance=Paise(3_000), target_distance=Paise(300))
+    with pytest.raises(DegenerateGeometry):
+        geometry.levels(Paise(3_000))
+    # One paise short of the boundary works normally.
+    levels = AbsolutePointGeometry(stop_distance=Paise(2_999), target_distance=Paise(300)).levels(Paise(3_000))
+    assert levels.stop == Paise(1)
+
+
 def test_percent_helper_truncates() -> None:
     """The rounding is load-bearing and pinned by existing engine tests."""
     assert pct_of(Paise(9_655), Decimal(20)) == Paise(1_931)  # 1931.0 exactly

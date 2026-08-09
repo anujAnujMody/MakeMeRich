@@ -8,6 +8,7 @@ from te.domain.symbols import (
     fmt_expiry,
     next_monthly_expiry,
     next_weekly_expiry,
+    parse_expiry,
     parse_option_symbol,
 )
 
@@ -22,6 +23,23 @@ def test_build_option_symbol_integer_strike() -> None:
 
 def test_build_option_symbol_decimal_strike() -> None:
     assert build_option_symbol("VEDL", dt.date(2026, 6, 30), Decimal("292.5"), "PE") == "VEDL30JUN26292.5PE"
+
+
+def test_parse_expiry_round_trips_with_fmt_expiry() -> None:
+    """`parse_expiry` is `fmt_expiry`'s inverse — the form
+    `OpenAlgoRestClient.expiry_dates` returns and `te.engine.contract` feeds
+    it. Never exercised by any existing test."""
+    assert parse_expiry("30JUN26") == dt.date(2026, 6, 30)
+
+
+def test_parse_expiry_rejects_a_malformed_string() -> None:
+    with pytest.raises(ValueError, match="DDMMMYY expiry"):
+        parse_expiry("not-an-expiry")
+
+
+def test_parse_expiry_rejects_an_unrecognised_month() -> None:
+    with pytest.raises(ValueError, match="unrecognised month"):
+        parse_expiry("30ZZZ26")
 
 
 def test_parse_option_symbol_round_trips() -> None:
@@ -85,6 +103,22 @@ def test_bankex_next_monthly_expiry_is_last_thursday_of_month() -> None:
     expiry = next_monthly_expiry("BANKEX", reference)
     assert expiry.weekday() == 3  # Thursday
     assert expiry == dt.date(2026, 7, 30)  # last Thursday of July 2026
+
+
+def test_banknifty_next_monthly_expiry_in_december_itself() -> None:
+    """`_last_weekday_of_month`'s December branch (`month == 12`) is only hit
+    when computing the expiry INSIDE December — no existing fixture ever
+    resolves a December candidate. Last Tuesday of Dec 2026 is the 29th."""
+    reference = dt.date(2026, 12, 1)
+    assert next_monthly_expiry("BANKNIFTY", reference) == dt.date(2026, 12, 29)
+
+
+def test_banknifty_next_monthly_expiry_rolls_from_december_into_january() -> None:
+    """The other December edge: rolling PAST December's last Tuesday must
+    land on next YEAR's January, not this year's — the one path no existing
+    fixture reaches (the only other rollover test crosses July -> August)."""
+    reference = dt.date(2026, 12, 30)  # one day past Dec 2026's last Tuesday (the 29th)
+    assert next_monthly_expiry("BANKNIFTY", reference) == dt.date(2027, 1, 26)
 
 
 def test_banknifty_next_monthly_expiry_on_expiry_day_itself() -> None:

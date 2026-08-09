@@ -96,6 +96,25 @@ def test_match_pending_order_matches_unique_candidate() -> None:
     assert match.venue_order_id == "v-1"
 
 
+def test_match_pending_order_accepts_exactly_at_the_window_boundary() -> None:
+    """A candidate exactly `window` away must still match — the guard is
+    `<= window`, not `< window`. A `<=` -> `<` flip would reject the exact
+    boundary with the same (silent) `None` as a genuinely-outside-window
+    candidate, and no existing test (which only probes 1s inside / 30s
+    outside a 5s window) would notice."""
+    candidates = [_report(ts=TS + dt.timedelta(seconds=5))]
+    match = match_pending_order(
+        candidates,
+        symbol="NIFTY30JUN2626500CE",
+        side="BUY",
+        quantity=65,
+        submitted_at=TS,
+        window=dt.timedelta(seconds=5),
+    )
+    assert match is not None
+    assert match.venue_order_id == "v-1"
+
+
 def test_match_pending_order_rejects_outside_window() -> None:
     candidates = [_report(ts=TS + dt.timedelta(seconds=30))]
     match = match_pending_order(

@@ -407,6 +407,17 @@ class TestSanityCheckedMark:
         assert mark == Paise(4_200)
         assert pending is None
 
+    def test_a_move_exactly_at_the_jump_threshold_is_still_trusted(self) -> None:
+        """The guard is `<= max_jump_pct`, not `<` — a move of EXACTLY the
+        threshold must still be trusted immediately, not quarantined. A
+        `<=` -> `<` flip would reject this exact boundary the same way it
+        rejects a genuine bad tick, and no existing test (which only probes
+        a small in-band move and a far-past-threshold spike) would notice."""
+        # 4000 -> 4800 is exactly a 20% move, the default max_jump_pct.
+        mark, pending = sanity_checked_mark(candidate=Paise(4_800), last_confirmed=Paise(4_000), pending=None)
+        assert mark == Paise(4_800)
+        assert pending is None
+
     def test_a_big_unconfirmed_jump_is_quarantined_not_trusted(self) -> None:
         """The exact 2026-08-04 shape: candidate is far past the jump
         threshold from the last confirmed price, with nothing yet

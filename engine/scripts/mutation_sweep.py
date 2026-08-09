@@ -128,26 +128,32 @@ class _Collector(ast.NodeVisitor):
         self._counter = 0
 
     def _record(self, node: ast.AST, op: ast.AST, table: dict, kind: str) -> None:
+        """Counts ONLY operators that can actually be replaced.
+
+        This used to increment on every operator it saw, while the applier's
+        `_swap` returned early without incrementing for ones it could not
+        replace. The two indexes drifted, so mutant N as labelled here and
+        mutant N as applied there were different edits — the sweep reported
+        line numbers that did not match what it had actually changed. Both
+        sides now count the same things in the same order."""
         repl = table.get(type(op))
         if repl is None:
             return
         self.found.append((node, self._counter, kind, _name(op), repl.__name__))
+        self._counter += 1
 
     def visit_Compare(self, node: ast.Compare) -> None:  # noqa: N802
+        self.generic_visit(node)
         for op in node.ops:
             self._record(node, op, _CMP, "cmp")
-            self._counter += 1
-        self.generic_visit(node)
 
     def visit_BinOp(self, node: ast.BinOp) -> None:  # noqa: N802
-        self._record(node, node.op, _BIN, "bin")
-        self._counter += 1
         self.generic_visit(node)
+        self._record(node, node.op, _BIN, "bin")
 
     def visit_BoolOp(self, node: ast.BoolOp) -> None:  # noqa: N802
-        self._record(node, node.op, _BOOL, "bool")
-        self._counter += 1
         self.generic_visit(node)
+        self._record(node, node.op, _BOOL, "bool")
 
 
 class _Applier(ast.NodeTransformer):

@@ -74,6 +74,23 @@ def test_a_blank_close_price_is_refused_by_name() -> None:
         parse_bhavcopy_nse(csv_text)
 
 
+def test_a_blank_close_price_error_reports_the_real_strike() -> None:
+    """The error `context` must name the actual strike of the failing row,
+    not an empty placeholder — otherwise a bad bhavcopy row is unfixable
+    from the log alone. Regression for the `raw.get('StrkPric') or ''`
+    fallback: swapping that `or` for `and` would silently blank out every
+    reported strike (since a non-blank StrkPric is truthy, `x and '' ==
+    ''` always), even though the row genuinely carries strike 24500."""
+    row = (
+        "29-JUL-2026,29-JUL-2026,FO,NSE,IDO,45002,,NIFTY,,05-AUG-2026,05-AUG-2026,24500,CE,"
+        "NIFTY26AUG24500CE,38,45,32,,35,42,24211,35,850000,12000,45000,15750000,8000,F1,65,,,,,"
+    )
+    csv_text = "\n".join([_HEADER, row])
+
+    with pytest.raises(ValueError, match=r"strike='24500'"):
+        parse_bhavcopy_nse(csv_text)
+
+
 def test_a_blank_volume_is_refused_by_name() -> None:
     """Same for `TtlTradgVol` — a blank volume is unknown data, not a
     no-trade day (that is a real `0`, handled elsewhere)."""

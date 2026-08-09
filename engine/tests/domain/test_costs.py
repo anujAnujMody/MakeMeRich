@@ -134,6 +134,41 @@ def test_breakeven_premium_points(model: CostModel) -> None:
     assert abs(breakeven_delta_paise - 97) <= 5
 
 
+def test_leg_buy_and_sell_worked_example(model: CostModel) -> None:
+    """`leg()` prices a SINGLE execution and was previously exercised only
+    indirectly through `round_trip()`, so nothing pinned its own notional,
+    STT/stamp side-gating, or exchange_txn/sebi arithmetic. Hand-worked at
+    Rs 100 premium, qty 65 (see `test_worked_example`'s rates fixture):
+
+        notional          = 10000 * 65                    = 650,000p
+        exchange_txn      = 650000 * 3.553bps              =    231p (230.945 -> 231)
+        sebi              = 650000 * 0.01bps                =      1p (0.65 -> 1)
+        stamp (BUY only)  = 650000 * 0.3bps                 =     20p (19.5 -> 20)
+        stt   (SELL only) = 650000 * 15.0bps                =    975p
+        gst (BUY)  = 18% * (2000 + 231 + 1)                =    402p (401.76 -> 402)
+        gst (SELL) = same taxable base                     =    402p
+    """
+    premium = Paise(10_000)  # Rs 100
+
+    buy = model.leg(side="BUY", premium=premium, qty=QTY, exchange=EXCHANGE, on=ON)
+    assert buy.brokerage == 2000
+    assert buy.stt == 0  # STT is SELL-side only
+    assert buy.exchange_txn == 231
+    assert buy.sebi == 1
+    assert buy.stamp == 20  # stamp duty is BUY-side only
+    assert buy.gst == 402
+    assert buy.total == 2654
+
+    sell = model.leg(side="SELL", premium=premium, qty=QTY, exchange=EXCHANGE, on=ON)
+    assert sell.brokerage == 2000
+    assert sell.stt == 975
+    assert sell.exchange_txn == 231
+    assert sell.sebi == 1
+    assert sell.stamp == 0  # never on a sell
+    assert sell.gst == 402
+    assert sell.total == 3609
+
+
 def test_expiry_settlement_otm_is_zero_stt(model: CostModel) -> None:
     """OTM at expiry: no exercise happens, so no component charges anything."""
     breakdown = model.expiry_settlement(
