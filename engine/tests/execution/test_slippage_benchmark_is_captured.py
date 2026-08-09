@@ -169,6 +169,45 @@ def test_the_entry_order_carries_the_contracts_real_two_sided_market() -> None:
     assert request.limit_price == contract.ask
 
 
+class _NoAutoFillBroker:
+    """A `SimulatedBroker` that never reports its own fills.
+
+    `ExecutionManager.submit` now drains `BrokerPort.fill_reports()` (see
+    `ExecutionManager.drain_fills` — before that, nothing in production ever
+    called `on_fill` at all). The two tests below hand-deliver a specific
+    `FillReport` in order to pin the BENCHMARK and the SIGN of one
+    observation, and a real `SimulatedBroker` would fill the order at its
+    limit price first — leaving the hand-delivered fill to be rejected by
+    the overfill guard and measuring the simulator instead of the case under
+    test.
+
+    Withholding the automatic fill keeps each test measuring exactly the one
+    fill it constructs. That the drain itself works is pinned separately, in
+    `tests/execution/test_fills_reach_the_manager.py`.
+    """
+
+    def __init__(self, inner: SimulatedBroker) -> None:
+        self._inner = inner
+
+    def place_order(self, intent):  # noqa: ANN001, ANN201
+        return self._inner.place_order(intent)
+
+    def cancel_order(self, client_order_id, venue_order_id):  # noqa: ANN001, ANN201
+        return self._inner.cancel_order(client_order_id, venue_order_id)
+
+    def query_order(self, client_order_id):  # noqa: ANN001, ANN201
+        return self._inner.query_order(client_order_id)
+
+    def order_reports(self):  # noqa: ANN201
+        return self._inner.order_reports()
+
+    def fill_reports(self):  # noqa: ANN201
+        return []
+
+    def position_reports(self):  # noqa: ANN201
+        return self._inner.position_reports()
+
+
 def test_a_fill_records_a_slippage_observation(tmp_path) -> None:  # noqa: ANN001
     """The monitor existed but had never observed anything, so the
     live-money gate's "slippage is clean" condition passed on an empty
@@ -190,7 +229,7 @@ def test_a_fill_records_a_slippage_observation(tmp_path) -> None:  # noqa: ANN00
     manager = ExecutionManager(
         factory,
         OrderEventStore(factory),
-        SimulatedBroker(cost_model=cost_model, on=_TS.date()),
+        _NoAutoFillBroker(SimulatedBroker(cost_model=cost_model, on=_TS.date())),
         TokenBucket(rate=100, capacity=100),
     )
 
@@ -253,7 +292,7 @@ def test_a_bad_sell_fill_is_recorded_as_bad_not_good(tmp_path) -> None:  # noqa:
     manager = ExecutionManager(
         factory,
         OrderEventStore(factory),
-        SimulatedBroker(cost_model=cost_model, on=_TS.date()),
+        _NoAutoFillBroker(SimulatedBroker(cost_model=cost_model, on=_TS.date())),
         TokenBucket(rate=100, capacity=100),
     )
 

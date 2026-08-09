@@ -49,8 +49,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
+from typing import Callable
 
-from te.domain.money import Paise
+from te.domain.money import Paise, rupees
+
+
+class DegenerateGeometry(ValueError):
+    """The requested risk cannot be expressed as a stop at this premium and
+    position size — the whole premium sits inside the rupee cap (or inside
+    an absolute stop distance), so there is no reachable stop and no honest
+    target. Subclasses `ValueError`, so any existing caller that catches
+    `ValueError` keeps working."""
 
 
 def pct_of(premium: Paise, pct: Decimal) -> Paise:
@@ -62,6 +71,14 @@ def pct_of(premium: Paise, pct: Decimal) -> Paise:
     return Paise(int(Decimal(int(premium)) * pct / Decimal(100)))
 
 
+def _rupees_str(amount_paise: int) -> str:
+    """Integer-paise display formatting for error messages — no float
+    division on money, per the project's money rule. Reuses
+    `te.domain.money.rupees`, the one existing rupee formatter, rather than
+    restating the rounding."""
+    return f"Rs {rupees(Paise(amount_paise))}"
+
+
 @dataclass(frozen=True)
 class ExitLevels:
     """Resolved absolute levels for one entry."""
@@ -69,17 +86,24 @@ class ExitLevels:
     stop: Paise
     target: Paise
     trailing_distance: Paise | None
-    #: Premium at which the ONE-TIME profit lock engages — see
-    #: `te.engine.exits.evaluate_position`'s profit-lock check. `None` means
-    #: the rule is off. Distinct from `trailing_distance`, which ratchets
-    #: forever once activated; this fires exactly once and then freezes,
-    #: per the 2026-08-04 backtest that validated this specific shape
-    #: (activation=15%, buffer=5% of NIFTY option premium): it does not
-    #: improve mean R (roughly flat, -0.104R vs -0.102R baseline over 1,305
-    #: real trades) but trades some large winners for a materially higher
-    #: win rate (50.7% vs 46.2%) and removes the tail risk of a big winner
-    #: round-tripping all the way back to the original stop. A deliberate
-    #: risk-shaping choice, not a claimed profitability improvement.
+    #: Premium at which the profit lock FIRST engages — see
+    #: `te.engine.exits.evaluate_position`'s profit-lock check and
+    #: `te.engine.exits._next_profit_lock_rung`. `None` means the rule is
+    #: off. Distinct from `trailing_distance`, which ratchets continuously
+    #: (on every tick); this ratchets in discrete STEPS instead — each
+    #: further `profit_lock_activation_pct` gain locks the stop
+    #: `profit_lock_buffer_pct` below the price at that moment, then holds
+    #: until the next step. It fired exactly once and then froze until
+    #: 2026-08-06, when it was changed to a multi-rung ratchet at the
+    #: owner's request ("move SL after every +15%") — this field now names
+    #: only the FIRST rung, not the whole rule's ceiling. Shape backtested
+    #: 2026-08-04 at activation=15%, buffer=5% of NIFTY option premium: it
+    #: does not improve mean R (roughly flat, -0.104R vs -0.102R baseline
+    #: over 1,305 real trades) but trades some large winners for a
+    #: materially higher win rate (50.7% vs 46.2%) and removes the tail risk
+    #: of a big winner round-tripping all the way back to the original stop.
+    #: A deliberate risk-shaping choice, not a claimed profitability
+    #: improvement.
     profit_lock_activation: Paise | None = None
     #: How far below the price AT ACTIVATION the locked stop sits, as a
     #: percent of THAT price (not the entry premium) — kept as a raw
@@ -120,8 +144,15 @@ class PremiumPercentGeometry:
         if self.profit_lock_buffer_pct is not None and not (0 < self.profit_lock_buffer_pct < 100):
             raise ValueError(f"profit_lock_buffer_pct must be in (0, 100), got {self.profit_lock_buffer_pct}")
 
-    def levels(self, entry_premium: Paise, *, quantity: int | None = None) -> ExitLevels:
+    def levels(
+        self,
+        entry_premium: Paise,
+        *,
+        quantity: int | None = None,
+        cost_estimator: Callable[[Paise], Paise] | None = None,
+    ) -> ExitLevels:
         del quantity  # percentages of premium do not depend on how many units are bought
+        del cost_estimator  # a percentage of premium does not need a cost-aware fixed point either
         return ExitLevels(
             stop=Paise(entry_premium - pct_of(entry_premium, self.stop_pct)),
             target=Paise(entry_premium + pct_of(entry_premium, self.target_pct)),
@@ -154,8 +185,20 @@ class AbsolutePointGeometry:
         if self.trailing_distance is not None and self.trailing_distance <= 0:
             raise ValueError(f"trailing_distance must be positive when set, got {self.trailing_distance}")
 
-    def levels(self, entry_premium: Paise, *, quantity: int | None = None) -> ExitLevels:
+    def levels(
+        self,
+        entry_premium: Paise,
+        *,
+        quantity: int | None = None,
+        cost_estimator: Callable[[Paise], Paise] | None = None,
+    ) -> ExitLevels:
         del quantity  # an absolute premium distance does not depend on quantity either
+        del cost_estimator  # an absolute premium distance is fixed regardless of round-trip cost
+        if self.stop_distance >= int(entry_premium):
+            raise DegenerateGeometry(
+                f"a stop distance of {int(self.stop_distance)}p is at or beyond the entry premium of "
+                f"{int(entry_premium)}p — the stop would sit at or below zero, which is not a price"
+            )
         # The one-time profit lock (see `ExitLevels.profit_lock_activation`)
         # is a `PremiumPercentGeometry`-only feature — this type is used for
         # backtests replayed from `option_bhav` and pre-percentage tests,
@@ -210,12 +253,30 @@ class RupeeRiskGeometry:
     (the last live trail closed 14 of 14 trades at a 3.1-minute average
     hold). A distant real target is the honest interim: it does not claim a
     measurement nobody has made.
+
+    ### The cap is GROSS unless a `cost_estimator` is supplied
+
+    `stop_distance = max_loss_paise // quantity` alone caps only the PRICE
+    move, not the realised loss — round-trip costs (brokerage, STT,
+    exchange/SEBI charges, GST, stamp duty) sit on top of it and are not
+    free. At a Rs 700 cap, NIFTY's real premium and quantity, and today's
+    charges, the gross loss at stop is ~Rs 699 but the real net loss with
+    costs is ~Rs 771 — a breach of the cap this class exists to enforce.
+
+    `levels()` therefore accepts an optional `cost_estimator`: given a
+    candidate EXIT premium, it returns the round-trip cost in paise for the
+    whole position at `quantity` units. When supplied, the stop distance is
+    solved by a short fixed-point iteration (cost depends on the exit price,
+    which depends on the stop distance) so that gross loss + costs lands at
+    or under `max_loss_paise`. When `cost_estimator` is `None` (the
+    default), behaviour is exactly the old gross-only one — callers that
+    need the true net cap MUST pass an estimator.
     """
 
     #: What one trade is allowed to lose, in paise, across the whole
     #: position. This is the number the owner set; everything else bends to
     #: keep it true.
-    max_loss_paise: int
+    max_loss_paise: Paise
     #: Target distance as a multiple of the rupee risk. `10` means "risk
     #: Rs 700 to make Rs 7,000".
     target_multiple: Decimal
@@ -238,27 +299,58 @@ class RupeeRiskGeometry:
         if self.profit_lock_buffer_pct is not None and not (0 < self.profit_lock_buffer_pct < 100):
             raise ValueError(f"profit_lock_buffer_pct must be in (0, 100), got {self.profit_lock_buffer_pct}")
 
-    def levels(self, entry_premium: Paise, *, quantity: int | None = None) -> ExitLevels:
+    def levels(
+        self,
+        entry_premium: Paise,
+        *,
+        quantity: int | None = None,
+        cost_estimator: Callable[[Paise], Paise] | None = None,
+    ) -> ExitLevels:
         if quantity is None or quantity <= 0:
             raise ValueError(
-                f"RupeeRiskGeometry needs a positive quantity to convert Rs {self.max_loss_paise / 100:.2f} "
+                f"RupeeRiskGeometry needs a positive quantity to convert {_rupees_str(self.max_loss_paise)} "
                 f"of risk into a premium distance, got {quantity!r}"
             )
         # Truncating DOWN is deliberate and is the safe direction: a smaller
         # premium distance means the stop sits closer to entry, so the
         # realised loss lands at or below `max_loss_paise`, never above it.
         stop_distance = self.max_loss_paise // quantity
+        if cost_estimator is not None:
+            # Costs depend on the exit price, which depends on the stop
+            # distance being solved for — so this is a fixed point, not a
+            # closed form. Three iterations converge in practice: the cost
+            # curve is nearly flat over the small range a stop can move
+            # within one position, so each pass changes `d` by less than the
+            # last. See the class docstring's "GROSS unless a cost_estimator
+            # is supplied" section.
+            d = stop_distance
+            for _ in range(3):
+                candidate_exit = Paise(int(entry_premium) - d)
+                c = int(cost_estimator(candidate_exit))
+                d = (self.max_loss_paise - c) // quantity
+            stop_distance = d
         if stop_distance <= 0:
+            if cost_estimator is not None:
+                raise ValueError(
+                    f"{_rupees_str(self.max_loss_paise)} spread over {quantity} units is smaller than the "
+                    "round-trip cost of a trade at this position size — no stop can express this rupee cap "
+                    "once real costs are included"
+                )
             raise ValueError(
-                f"Rs {self.max_loss_paise / 100:.2f} spread over {quantity} units is less than one paise "
+                f"{_rupees_str(self.max_loss_paise)} spread over {quantity} units is less than one paise "
                 f"per unit — no stop can express this risk at this position size"
             )
         if stop_distance >= int(entry_premium):
-            # The premium is worth less than the loss being budgeted for, so
-            # the whole position is already inside the risk cap: the option
-            # cannot fall below zero. Stop at zero rather than at a negative
-            # premium, which is not a price.
-            stop_distance = int(entry_premium)
+            # The whole premium sits inside the rupee cap: there is no
+            # reachable stop (the option cannot print below zero) and,
+            # symmetrically, no honest target either. Refusing rather than
+            # clamping to a stop at premium zero, which is not a price the
+            # option can ever reach.
+            raise DegenerateGeometry(
+                f"entry premium {int(entry_premium)}p at quantity {quantity} cannot express a "
+                f"{_rupees_str(self.max_loss_paise)} rupee cap as a stop — the resolved stop distance "
+                f"({stop_distance}p) is at or beyond the entry premium itself"
+            )
         target_distance = int(Decimal(stop_distance) * self.target_multiple)
         target = Paise(int(entry_premium) + target_distance)
 

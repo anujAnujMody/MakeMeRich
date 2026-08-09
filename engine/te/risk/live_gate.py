@@ -14,7 +14,15 @@ checked against REAL persisted data — never fabricated, never assumed true:
   params are frozen (plan's R5); a session is one distinct calendar day of
   CLOSED paper trades whose net P&L for that day sums positive.
 - Tier-0 slippage currently clean (`te.risk.monitors.SlippageMonitor`, not
-  breached) — "within model".
+  breached) — "within model" — AND measured on a real sample: at least
+  `MIN_SLIPPAGE_OBSERVATIONS`, with non-zero spread. Both extra clauses are
+  load-bearing. `breached` is `False` on an empty sample, so the original
+  `if status.breached` passed trivially on zero observations; and once fills
+  were actually recorded, every PAPER observation is exactly zero (the
+  `SimulatedBroker` fills at precisely the limit price), which drives
+  `stdev` to 0, `z_score` to `None`, and `breached` back to `False`. Cleanly
+  measured simulated execution is not evidence about live execution, and
+  this gate must not be satisfiable without ever touching a real venue.
 - ML stage is `gating` (`te.ml.gates.MaturityGate`) AND has been for >= 60
   sessions, anchored at the most recent `model_promotions` row promoting
   INTO `gating` (a session here is one distinct calendar day with at least
@@ -45,6 +53,15 @@ MIN_DSR = 0.95
 MAX_PBO = 0.05
 MIN_POST_FREEZE_SESSIONS = 90
 MIN_GATING_SESSIONS = 60
+
+#: Slippage observations required before "execution is within model" may be
+#: asserted at all. Without a floor the condition read `if status.breached`,
+#: and `SlippageStatus.breached` is `False` on an EMPTY sample — so the one
+#: condition guarding real-money execution quality passed by having measured
+#: nothing. It had never observed anything, because nothing in production
+#: called `ExecutionManager.on_fill` (fixed alongside this, see
+#: `ExecutionManager.drain_fills`).
+MIN_SLIPPAGE_OBSERVATIONS = 30
 
 
 @dataclass(frozen=True)
@@ -147,12 +164,25 @@ class LiveUnlockGate:
                     )
 
             status = SlippageMonitor(session, instrument=self._instrument).status()
+            z_display = f"{status.z_score:.2f}" if status.z_score is not None else "n/a"
             if status.breached:
-                z_display = f"{status.z_score:.2f}" if status.z_score is not None else "n/a"
                 failing.append(
                     f"Tier-0 slippage monitor is currently breached for {self._instrument!r}: "
                     f"mean divergence {status.mean_diff_paise:.2f}p over {status.n} observations "
                     f"(z={z_display})"
+                )
+            elif status.n < MIN_SLIPPAGE_OBSERVATIONS:
+                failing.append(
+                    f"only {status.n} of {MIN_SLIPPAGE_OBSERVATIONS} required slippage observations "
+                    f"recorded for {self._instrument!r} — 'execution is within model' cannot be "
+                    "asserted from a sample this small"
+                )
+            elif status.stdev_diff_paise <= 0:
+                failing.append(
+                    f"all {status.n} slippage observations for {self._instrument!r} are identical "
+                    f"(stdev 0) — that is a simulated fill signature, not measured execution. "
+                    "SimulatedBroker fills every order at exactly its limit price, so paper fills "
+                    "carry no evidence about live execution quality"
                 )
 
             if stage is not Stage.GATING:
@@ -177,4 +207,12 @@ class LiveUnlockGate:
         return GateCheckResult(passed=not failing, failing_conditions=tuple(failing))
 
 
-__all__ = ["MAX_PBO", "MIN_DSR", "MIN_GATING_SESSIONS", "MIN_POST_FREEZE_SESSIONS", "GateCheckResult", "LiveUnlockGate"]
+__all__ = [
+    "MAX_PBO",
+    "MIN_DSR",
+    "MIN_GATING_SESSIONS",
+    "MIN_POST_FREEZE_SESSIONS",
+    "MIN_SLIPPAGE_OBSERVATIONS",
+    "GateCheckResult",
+    "LiveUnlockGate",
+]

@@ -119,7 +119,45 @@ class ExecutionManager:
 
         self._store.append(OrderSubmitted(client_order_id=client_order_id, ts=self._clock()))
         self._store.append(OrderAccepted(client_order_id=client_order_id, venue_order_id=ack.venue_order_id, ts=ack.ts))
+        self.drain_fills()
         return client_order_id
+
+    def drain_fills(self) -> None:
+        """Applies every fill the broker is currently holding.
+
+        Nothing in production ever called `on_fill`. `BrokerPort.fill_reports`
+        was implemented on both brokers and read by no engine code, so the
+        entire fill half of the lifecycle was dead: orders stopped at
+        `ACCEPTED`, `fold()` therefore reported `filled_qty=0` and every paper
+        position rendered perpetually OPEN, and `_observe_slippage` never ran
+        even once — leaving `SlippageMonitor` with an empty sample and the
+        live-money gate's "slippage is clean" condition passing trivially. A
+        gate that cannot fail is not a gate.
+
+        Safe to call as often as you like. `on_fill` dedups by
+        `venue_trade_id` against the persisted events, and returns early for
+        any fill whose `client_order_id` this manager never minted — an
+        unattributed fill is `te.execution.reconcile.Reconciler`'s job.
+
+        Never raises, for the same reason `_observe_slippage` never does: a
+        failure to RECORD a fill must not break the submit path that placed
+        it. The fill is not lost when this fails — `check_inflight` and the
+        reconciler both re-read the broker's own ground truth.
+        """
+        try:
+            reports = self._broker.fill_reports()
+        except Exception:  # noqa: BLE001 — recording must never break execution
+            logger.exception("could not read fills from broker")
+            return
+        for report in reports:
+            try:
+                self.on_fill(report)
+            except Exception:  # noqa: BLE001 — one bad fill must not strand the rest
+                logger.exception(
+                    "fill application failed",
+                    client_order_id=report.client_order_id,
+                    venue_trade_id=report.venue_trade_id,
+                )
 
     def on_fill(self, report: FillReport) -> None:
         """Applies one fill, deduped by `venue_trade_id`, guarded against

@@ -32,7 +32,7 @@ from te.data.barstore import BarStore
 from te.domain.clock import IST
 from te.domain.clock import assume_utc as _as_utc
 from te.domain.costs import CostModel
-from te.domain.geometry import ExitGeometry, RupeeRiskGeometry
+from te.domain.geometry import DegenerateGeometry, ExitGeometry, RupeeRiskGeometry
 from te.domain.money import Paise
 from te.domain.orders import OrderRequest
 from te.domain.pnl import GrossPnl, mark_to_market_pnl, net_pnl
@@ -615,7 +615,30 @@ def run_entry_cycle(
         # lot and then buying three) is the exact multiplication `max_lots`
         # exists to prevent.
         max_quantity = lot_size * (config.max_lots or 1)
-        levels = config.exit_geometry.levels(entry_premium, quantity=max_quantity)
+
+        # A `RupeeRiskGeometry` stop must cap the NET loss (gross + real
+        # round-trip costs), not just the gross price move — see that
+        # class's docstring. Closes over this instrument's `entry_premium`,
+        # `max_quantity`, `trade_exchange` and today's date; the other two
+        # geometry variants ignore `cost_estimator` entirely, so passing it
+        # unconditionally is safe.
+        def _cost_estimator(exit_premium: Paise) -> Paise:
+            return cost_model.round_trip(
+                entry_premium=entry_premium,
+                exit_premium=exit_premium,
+                qty=max_quantity,
+                exchange=trade_exchange,
+                on=as_of.date(),
+            ).total
+
+        try:
+            levels = config.exit_geometry.levels(
+                entry_premium, quantity=max_quantity, cost_estimator=_cost_estimator
+            )
+        except DegenerateGeometry as exc:
+            stage_ms["risk"] += (time.perf_counter() - _t2) * 1000
+            skip(instrument, f"exit geometry cannot express a stop at this premium and size: {exc}")
+            continue
         stop_premium, target_premium = levels.stop, levels.target
 
         sizing = size_position(

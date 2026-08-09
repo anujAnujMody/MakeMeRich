@@ -236,6 +236,26 @@ def test_duplicate_fill_ignored(session_factory, store: OrderEventStore) -> None
     assert len(fill_events) == 1
 
 
+def test_two_distinct_partial_fills_accumulate(session_factory, store: OrderEventStore) -> None:  # noqa: ANN001
+    """`test_duplicate_fill_ignored` and `test_overfill_rejected_and_halts`
+    never apply two DIFFERENT fills that both succeed — the dup test
+    re-delivers the same `venue_trade_id`, and the overfill test's second,
+    genuinely different id is the one that gets rejected. Neither
+    distinguishes "dedup by trade id" from "the accumulator happens to work
+    once". A real broker's 30/35 partial sequence must fold to the full 65,
+    reach FILLED, and never halt."""
+    manager, client_order_id = _accepted_order(session_factory, store, qty=65)
+
+    manager.on_fill(_fill(client_order_id, trade_id="t-1", qty=30))
+    manager.on_fill(_fill(client_order_id, trade_id="t-2", qty=35))
+
+    order = store.fold_order(client_order_id)
+    assert order.filled_qty == 65
+    assert order.status == "FILLED"
+    with session_factory() as session:
+        assert is_halted(session) is False
+
+
 def test_overfill_rejected_and_halts(session_factory, store: OrderEventStore) -> None:  # noqa: ANN001
     manager, client_order_id = _accepted_order(session_factory, store, qty=65)
 

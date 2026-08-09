@@ -21,11 +21,18 @@ the owner actually asked for, and the one both older geometries fail.
 
 from __future__ import annotations
 
+import datetime as dt
 from decimal import Decimal
 
 import pytest
 
-from te.domain.geometry import AbsolutePointGeometry, PremiumPercentGeometry, RupeeRiskGeometry
+from te.domain.costs import ChargeRates, CostModel
+from te.domain.geometry import (
+    AbsolutePointGeometry,
+    DegenerateGeometry,
+    PremiumPercentGeometry,
+    RupeeRiskGeometry,
+)
 from te.domain.money import Paise
 
 #: Real quotes, 2026-08-06. Premium in paise, then the lot size SEBI set for
@@ -60,6 +67,49 @@ def test_the_cap_is_the_same_rupees_across_instruments() -> None:
     for premium, lot_size in (NIFTY, SENSEX, BANKNIFTY):
         loss = _loss_rupees(premium, lot_size, geometry)
         assert 700 - lot_size / 100 <= loss <= 700, f"lot {lot_size}: lost Rs {loss} against a Rs 700 cap"
+
+
+def test_cost_estimator_keeps_the_true_net_loss_under_the_cap() -> None:
+    """The cap is GROSS unless a `cost_estimator` is supplied — see the class
+    docstring's "The cap is GROSS unless a cost_estimator is supplied"
+    section. Every other test in this file computes loss as a pure price
+    distance and never exercises the fixed-point block at
+    `geometry.py:318-331`; this is the one that does, using a real
+    `CostModel.round_trip`-backed estimator at NIFTY's live premium/quantity
+    and today's real charge rates (`config/charges.yaml`'s 2026-04-01 row)."""
+    rates = ChargeRates(
+        effective_from=dt.date(2026, 4, 1),
+        verified_at=dt.date(2026, 7, 29),
+        brokerage_per_executed_order_paise=Paise(2000),
+        stt_sell_bps=Decimal("15.0"),
+        stt_exercise_intrinsic_bps=Decimal("15.0"),
+        exchange_txn_bps={"NFO": Decimal("3.553"), "BFO": Decimal("3.25")},
+        sebi_bps=Decimal("0.01"),
+        gst_pct=Decimal("18.0"),
+        stamp_buy_bps=Decimal("0.3"),
+    )
+    cost_model = CostModel(rates)
+    on = dt.date(2026, 8, 6)
+    premium, lot_size = NIFTY
+
+    def estimator(exit_premium: Paise) -> Paise:
+        breakdown = cost_model.round_trip(
+            entry_premium=premium, exit_premium=exit_premium, qty=lot_size, exchange="NFO", on=on
+        )
+        return Paise(breakdown.total)
+
+    levels = _geometry().levels(premium, quantity=lot_size, cost_estimator=estimator)
+
+    stop_distance = int(premium) - int(levels.stop)
+    gross_loss_at_stop = stop_distance * lot_size
+    round_trip_costs = int(estimator(levels.stop))
+    assert gross_loss_at_stop + round_trip_costs <= RS_700, (
+        f"gross {gross_loss_at_stop} + costs {round_trip_costs} breaches the Rs 700 cap"
+    )
+    # And the cost-aware stop must actually be TIGHTER than the gross-only
+    # one, or the fixed point never ran at all.
+    gross_only_stop_distance = RS_700 // lot_size
+    assert stop_distance < gross_only_stop_distance
 
 
 def test_a_percentage_stop_cannot_express_this() -> None:
@@ -145,12 +195,39 @@ def test_quantity_is_required() -> None:
         _geometry().levels(Paise(16_680), quantity=0)
 
 
-def test_a_stop_below_zero_premium_is_clamped_to_zero() -> None:
-    """An option cannot fall below zero, so a rupee cap larger than the whole
-    position's value is already satisfied by the position itself. The stop
-    goes to zero rather than to a negative number, which is not a price."""
-    levels = _geometry(max_loss_paise=10_000_00).levels(Paise(5_000), quantity=65)
-    assert int(levels.stop) == 0
+def test_a_premium_entirely_inside_the_cap_is_refused_not_clamped() -> None:
+    """A rupee cap larger than the whole position's value used to clamp the
+    stop to a premium of ZERO and call that a working trade. It is not one.
+
+    An option cannot print zero, so a stop there can never be hit — and the
+    target is computed as a multiple of the same clamped distance, landing
+    at roughly 11x entry, which is not reachable either. The position had no
+    working stop and no reachable target and could only ever leave on the
+    time exit, while every log line and every dashboard field described a
+    normally-protected trade.
+
+    The band is real at the live configuration, not hypothetical: with a
+    Rs 700 cap over 65 units, any premium from Rs 5.00 (the liquidity
+    floor) to Rs 10.76 lands inside it.
+
+    Refusing is what `te.engine.cycle` turns into an honest skip, so the
+    signal is passed over with a stated reason rather than traded blind."""
+    with pytest.raises(DegenerateGeometry):
+        _geometry(max_loss_paise=10_000_00).levels(Paise(5_000), quantity=65)
+
+
+def test_a_premium_exactly_at_the_cap_boundary_is_refused() -> None:
+    """The exact boundary the class docstring names: at a Rs 700 cap over 65
+    units, `70_000 // 65 == 1_076` exactly. A premium of Rs 10.76 (1,076p) has
+    a stop distance equal to the premium itself — the degenerate "stop at
+    zero" case — and must raise, not clamp. One paise higher, at Rs 10.77
+    (1,077p), the stop is reachable and the trade works normally."""
+    with pytest.raises(DegenerateGeometry):
+        _geometry().levels(Paise(1_076), quantity=65)
+
+    levels = _geometry().levels(Paise(1_077), quantity=65)
+    assert int(levels.stop) > 0
+    assert int(levels.target) > int(levels.stop)
 
 
 def test_a_cap_too_small_to_express_is_refused() -> None:
@@ -222,6 +299,29 @@ def test_the_lock_survives_whenever_it_can_actually_fire() -> None:
     ).levels(premium, quantity=lot_size)
     assert levels.profit_lock_activation is not None
     assert int(levels.profit_lock_activation) < int(levels.target)
+
+
+def test_a_lock_at_the_exact_equality_point_is_reported_as_off() -> None:
+    """The boundary the guard above is never tested at: `candidate ==
+    target` exactly, not past it. `int(candidate) < int(target)` is the
+    correct direction for "reachable" — `<=` would treat exact equality as
+    reachable and hand `ExitPlan.__post_init__` an activation that sits ON
+    the target rather than strictly before it, tripping its strict
+    `stop < activation < target` validator at the moment a position was
+    meant to open."""
+    geometry = RupeeRiskGeometry(
+        max_loss_paise=10_000,  # Rs 100
+        target_multiple=Decimal(1),
+        profit_lock_activation_pct=Decimal(15),
+        profit_lock_buffer_pct=Decimal(5),
+    )
+    premium, lot_size = Paise(670), 100
+    levels = geometry.levels(premium, quantity=lot_size)
+
+    candidate = int(premium) + int(premium) * 15 // 100
+    assert candidate == int(levels.target), "premise: the +15% trigger sits exactly on the target"
+    assert levels.profit_lock_activation is None
+    assert levels.profit_lock_buffer_pct is None, "both halves off together, or ExitPlan rejects the pair"
 
 
 @pytest.mark.parametrize(

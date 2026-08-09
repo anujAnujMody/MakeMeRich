@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import datetime as dt
 import random
+import statistics
 from pathlib import Path
 
 import pytest
@@ -78,8 +79,11 @@ def test_slippage_monitor_diverges_before_pnl(session_factory) -> None:
     assert breach_at_n is not None
     # Breaches well within a single session's typical fill count (dozens at
     # most), nowhere near the tens of thousands of samples a P&L-noise-only
-    # t-test of comparable power would require.
-    assert breach_at_n <= 20
+    # t-test of comparable power would require. `<= 20` alone is true by
+    # construction (the loop never runs past 20) and would stay green even
+    # if `DEFAULT_SLIPPAGE_MIN_OBSERVATIONS` were quadrupled to 20 itself —
+    # a concrete bound the loop does not hand us for free closes that gap.
+    assert breach_at_n <= 8
 
 
 def test_deliberately_injected_slippage_fault_trips_tier0_within_one_session(session_factory) -> None:
@@ -308,10 +312,61 @@ def test_rolling_performance_computes_trailing_sharpe_and_profit_factor(session_
         snap = rp.snapshot()
 
     assert snap.n_trades == 5
+    assert snap.n_sessions == 5
     assert snap.trailing_sharpe is not None
     assert snap.trailing_profit_factor is not None
     expected_pf = (1_000 + 2_000 + 1_500) / (500 + 300)
     assert round(snap.trailing_profit_factor, 6) == round(expected_pf, 6)
+    expected_sharpe = statistics.mean([1_000, -500, 2_000, -300, 1_500]) / statistics.stdev(
+        [1_000, -500, 2_000, -300, 1_500]
+    )
+    assert round(snap.trailing_sharpe, 6) == round(expected_sharpe, 6)
+
+
+def test_rolling_performance_truncates_to_the_configured_window(session_factory) -> None:
+    """25 sessions against a 20-session window: only the 20 MOST RECENT
+    sessions may feed the statistic — the fixture in
+    `test_rolling_performance_computes_trailing_sharpe_and_profit_factor`
+    seeds only 5 sessions against a 20-session window, so the window itself
+    is never exercised there. `recent_session_dates(limit=window_sessions)`
+    is the only thing enforcing the cutoff; widening that limit (e.g. to
+    `window_sessions * 100`) would silently turn "trailing 20 sessions" into
+    "lifetime" while every other test in this file stays green."""
+    from te.persistence.repos.paper_trading import insert_trade
+
+    net_pnls = [100 * (i + 1) if i % 2 == 0 else -50 * (i + 1) for i in range(25)]
+    with session_factory() as session:
+        for i, net_pnl in enumerate(net_pnls):
+            insert_trade(
+                session,
+                client_order_id=f"c-{i}",
+                symbol="NIFTY30JUN2626500CE",
+                exchange="NFO",
+                strategy="orb",
+                direction="long_call",
+                lots=1,
+                lot_size=65,
+                entry_premium=Paise(3_000),
+                exit_premium=Paise(3_000),
+                gross_pnl=Paise(net_pnl),
+                costs=Paise(0),
+                net_pnl=Paise(net_pnl),
+                exit_reason="target" if net_pnl > 0 else "stop",
+                opened_at=NOW - dt.timedelta(hours=1),
+                closed_at=NOW + dt.timedelta(days=i),
+            )
+        session.commit()
+
+        rp = RollingPerformance(session, window_sessions=20)
+        snap = rp.snapshot()
+
+    included = net_pnls[-20:]  # the 20 most recent sessions/trades, oldest 5 excluded
+    assert snap.n_sessions == 20
+    assert snap.n_trades == 20
+    expected_pf = sum(x for x in included if x > 0) / abs(sum(x for x in included if x < 0))
+    assert round(snap.trailing_profit_factor, 6) == round(expected_pf, 6)
+    expected_sharpe = statistics.mean(included) / statistics.stdev(included)
+    assert round(snap.trailing_sharpe, 6) == round(expected_sharpe, 6)
 
 
 def test_rolling_performance_empty_when_no_trades(session_factory) -> None:
