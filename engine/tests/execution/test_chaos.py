@@ -114,14 +114,33 @@ def test_chaos_100_orders_never_silently_mismatches(tmp_path: Path, cost_model: 
         client_order_ids.append(manager.submit(request))
 
     # Deliver every fill the venue actually produced, with duplicates and
-    # out-of-order delivery injected.
+    # out-of-order delivery injected. Track, per delivery, which specific
+    # order's fill caused the halt flag to newly flip on — a single blanket
+    # `halted` read at the end cannot fail once ANYTHING halts, so it would
+    # accept a halt caused by order A as proof that order B's silent
+    # mismatch is fine too. `on_fill` sets the halt at the exact moment it
+    # rejects an overfilling report for ONE order, so the client_order_id
+    # of the fill just delivered is the order that actually caused it.
+    with session_factory() as session:
+        was_halted = is_halted(session)
+    halt_caused_by: set[str] = set()
+
+    def _deliver(report) -> None:  # noqa: ANN001
+        nonlocal was_halted
+        manager.on_fill(report)
+        with session_factory() as session:
+            now_halted = is_halted(session)
+        if now_halted and not was_halted:
+            halt_caused_by.add(report.client_order_id)
+        was_halted = now_halted
+
     fills = list(sim.fill_reports())
     delivery_order = list(range(len(fills)))
     rng.shuffle(delivery_order)  # out-of-order delivery
     for idx in delivery_order:
-        manager.on_fill(fills[idx])
+        _deliver(fills[idx])
         if rng.random() < 0.15:
-            manager.on_fill(fills[idx])  # duplicate re-delivery
+            _deliver(fills[idx])  # duplicate re-delivery
 
     # For every order the manager ever knew about: the local fold must
     # either agree with the venue's own status/filled_qty, OR the system
@@ -151,4 +170,13 @@ def test_chaos_100_orders_never_silently_mismatches(tmp_path: Path, cost_model: 
     assert not mismatches or halted, (
         f"{len(mismatches)}/{CHAOS_ORDER_COUNT} orders silently mismatched the venue's own state "
         f"while NOT halted: {mismatches[:5]}..."
+    )
+    # Per-order, not blanket: a halt caused by ONE order's rejected overfill
+    # must not be accepted as an excuse for a DIFFERENT order's unexamined
+    # mismatch. Every mismatched order must itself be the one that caused a
+    # halt.
+    unexplained = [c for c in mismatches if c not in halt_caused_by]
+    assert not unexplained, (
+        f"{len(unexplained)} order(s) mismatched the venue's own state without themselves ever "
+        f"causing a halt — a halt caused by a DIFFERENT order is hiding them: {unexplained[:5]}..."
     )

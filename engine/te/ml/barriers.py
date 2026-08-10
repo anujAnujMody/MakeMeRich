@@ -36,6 +36,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from te.domain.costs import CostModel
+from te.domain.geometry import ExitGeometry
 from te.domain.money import Paise
 
 
@@ -77,17 +78,21 @@ ATM_SNAPSHOTS: dict[str, AtmSnapshot] = {
 }
 
 
-#: Must track `Settings.paper_cycle_stop_pct` / `paper_cycle_target_pct`.
-#: 1:1 since the barrier sweep — labelling at a geometry the engine no longer
-#: trades would describe a different strategy, and any runway or filter
-#: derived from those labels would be tuned for a configuration that is not
-#: running. See `scripts/sweep_barriers.py` for the evidence.
+#: HISTORICAL ONLY — no longer read by `barriers()`. Kept as a display value
+#: for scripts that still print "what the barrier sweep found" (see
+#: `scripts/label_replay_firings.py`), but they no longer describe what the
+#: engine trades.
 #:
-#: Moved here from `scripts/label_replay_firings.py` on 2026-08-05 for the
-#: reason in this module's docstring: `te.ml.nightly` (the scheduled training
-#: job) needs them, and a package module importing from `scripts/` would make
-#: the engine's nightly job depend on a directory that is neither shipped nor
-#: on `testpaths`.
+#: This is the bug this module's `barriers()` used to have: a hardcoded 1:1
+#: while `Settings.paper_cycle_max_loss_per_trade_paise` (a real setting,
+#: currently Rs 700) makes `te.engine.scheduler._exit_geometry` return a
+#: `RupeeRiskGeometry` with `target_multiple=10` for every live trade — a
+#: 20%/20% label described a strategy nothing was running. `barriers()` now
+#: takes the `ExitGeometry` the caller is actually configured with (see
+#: `te.ml.nightly.build_labeled_dataset`) and derives the percentage from it
+#: per symbol, since `RupeeRiskGeometry`'s stop distance depends on the
+#: position's own premium and quantity and cannot be expressed as one fixed
+#: percentage.
 STOP_PCT = Decimal(20)
 TARGET_PCT = Decimal(20)
 MAX_HOLD = dt.timedelta(hours=3)
@@ -106,9 +111,68 @@ MAX_HOLD = dt.timedelta(hours=3)
 RATES_VERIFIED_FROM = dt.date(2024, 1, 1)
 
 
-def barriers(symbol: str) -> tuple[Paise, Paise]:
-    """`index_barriers` at the geometry the engine actually trades."""
-    return index_barriers(symbol, stop_pct=STOP_PCT, target_pct=TARGET_PCT)
+def barriers(
+    symbol: str,
+    *,
+    geometry: ExitGeometry | None = None,
+    max_lots: int = 1,
+) -> tuple[Paise, Paise]:
+    """`index_barriers` at the geometry the engine actually trades.
+
+    `geometry` has no honest default. `RupeeRiskGeometry` — what the live
+    engine trades whenever `Settings.paper_cycle_max_loss_per_trade_paise` is
+    set, which it is — cannot be expressed as one fixed stop/target
+    percentage: its stop distance depends on THIS symbol's own premium and
+    quantity (`ATM_SNAPSHOTS[symbol].premium_rupees` and
+    `.lot_size * max_lots`). A caller that omits `geometry` gets a `ValueError`
+    rather than a silent fall back to a hardcoded 20%/20% — that fallback is
+    exactly the bug this signature exists to make impossible to reintroduce
+    (see the module-level `STOP_PCT`/`TARGET_PCT` comment).
+
+    `max_lots` must be the same cap `te.risk.sizing.size_position` enforces
+    live (`Settings.paper_cycle_max_lots`) — the guarantee that a rupee cap
+    stays a rupee cap depends on quantity never growing past it, per
+    `RupeeRiskGeometry`'s own docstring.
+    """
+    if geometry is None:
+        raise ValueError(
+            f"barriers({symbol!r}) needs the ExitGeometry the engine actually trades — pass one explicitly "
+            "(see te.ml.nightly.build_labeled_dataset). There is no honest default: a hardcoded 20%/20% is "
+            "the exact bug this parameter exists to prevent."
+        )
+    stop_pct, target_pct = geometry_barrier_pct(symbol, geometry=geometry, max_lots=max_lots)
+    return index_barriers(symbol, stop_pct=stop_pct, target_pct=target_pct)
+
+
+def geometry_barrier_pct(symbol: str, *, geometry: ExitGeometry, max_lots: int) -> tuple[Decimal, Decimal]:
+    """`(stop_pct, target_pct)` of `ATM_SNAPSHOTS[symbol]`'s premium implied
+    by `geometry` at `max_lots` — the percentages `barriers()` restates as
+    index points, exposed separately so a caller (the nightly training job's
+    provenance stamp) can record exactly what a label was computed at without
+    re-deriving the number by hand.
+    """
+    snapshot = ATM_SNAPSHOTS[symbol]
+    entry_premium = Paise(int(round(snapshot.premium_rupees * 100)))
+    quantity = snapshot.lot_size * max_lots
+    # No `cost_estimator` here on purpose. `RupeeRiskGeometry.levels()` would
+    # use one to shrink the STOP so the realised NET loss (gross + costs)
+    # stays under the cap — correct for a live order, which really does pay
+    # costs at the stop. But this module's cost handling is already
+    # deliberately one-sided: `te.ml.labeling.label_one_firing` adds cost
+    # ONLY to the target ("the plan's formula is stated only for the target
+    # side, so only the target barrier is shifted here"), and leaves the stop
+    # at its configured, not cost-adjusted, level — `premium_barrier_levels`
+    # does the same for the real-premium path. Passing a `cost_estimator`
+    # here would tighten the stop derived from geometry AND (independently,
+    # downstream, in the walk) push the target out for the same round-trip
+    # cost — spending the same cost twice across the two barriers of one
+    # sweep, which is not how the rest of this module treats it. Leaving it
+    # `None` keeps the stop at the gross distance, consistent with every
+    # other barrier this module computes.
+    levels = geometry.levels(entry_premium, quantity=quantity)
+    stop_pct = Decimal(int(entry_premium) - int(levels.stop)) / Decimal(int(entry_premium)) * 100
+    target_pct = Decimal(int(levels.target) - int(entry_premium)) / Decimal(int(entry_premium)) * 100
+    return stop_pct, target_pct
 
 
 def index_barriers(symbol: str, *, stop_pct: Decimal, target_pct: Decimal) -> tuple[Paise, Paise]:

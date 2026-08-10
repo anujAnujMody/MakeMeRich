@@ -228,7 +228,13 @@ def _replay_one_day(
     # `last_signal` at the top of every `evaluate()`, so one instance across
     # the day carries no state forward.
     strategy = strategy_factory()
-    while as_of <= last:
+    # `<`, not `<=`. Live refuses an entry at `now_ist_time >= latest_entry`
+    # (`te/engine/cycle.py:441-444`) -- the boundary minute itself is
+    # refused, not just the minutes after it. `last` here IS that
+    # `latest_entry` (see `replay_orb`'s docstring), so a `<=` loop bound
+    # let a crossing whose decision point landed exactly on the cutoff
+    # become a training row for a trade the live engine would never offer.
+    while as_of < last:
         ctx = StrategyContext(store=day_store, instrument=symbol, exchange=exchange, as_of=as_of)
         evaluation = strategy.evaluate(ctx)
         result.evaluations += 1

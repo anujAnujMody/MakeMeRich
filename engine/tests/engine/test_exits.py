@@ -170,6 +170,13 @@ def test_max_hold_time_exit_fires() -> None:
 
     assert decision is not None
     assert decision.reason == "time"
+    # The exit PRICE, not just the reason. A mutation audit found this
+    # branch could book the exit at the position's own ENTRY premium
+    # (`Paise(2_000)`, unconditionally recording a gross P&L of exactly
+    # zero) and this test would stay green — only the reason was ever
+    # checked. `exit_premium` here must be the live mark passed in, never a
+    # fabricated number.
+    assert decision.exit_premium == Paise(2_050)
 
 
 def test_hard_exit_before_close_fires() -> None:
@@ -179,6 +186,33 @@ def test_hard_exit_before_close_fires() -> None:
     position = dataclasses.replace(_position(), current_stop=Paise(2_900))  # deep in profit, stop nearly at target
     now = dt.datetime(2026, 7, 29, 15, 25, tzinfo=IST)  # past hard_exit_by=15:20
     _, decision = evaluate_position(position, current_premium=Paise(2_950), now=now)
+
+    assert decision is not None
+    assert decision.reason == "time"
+
+
+def test_hard_exit_fires_exactly_at_the_boundary_minute() -> None:
+    """Every other hard-exit test uses 15:25/15:30 against `hard_exit_by=
+    15:20`, well past the edge — `>` would pass those identically. The
+    boundary itself (`now == hard_exit_by`, exactly) is what pins `>=`.
+
+    Opened at 13:30 (< 3h max_hold before 15:20), so the max-hold branch
+    cannot ALSO fire and mask a `>=` -> `>` mutation on the hard-exit check
+    specifically."""
+    position = _position(opened_at=dt.datetime(2026, 7, 29, 13, 30, tzinfo=IST))
+    now = dt.datetime(2026, 7, 29, 15, 20, tzinfo=IST)  # exactly hard_exit_by
+    _, decision = evaluate_position(position, current_premium=Paise(2_100), now=now)
+
+    assert decision is not None
+    assert decision.reason == "time"
+
+
+def test_max_hold_fires_exactly_at_the_boundary() -> None:
+    """The `max_hold=3h` sibling of the hard-exit boundary test above —
+    `test_max_hold_time_exit_fires` uses +4h, past the edge."""
+    position = _position()
+    now = OPENED_AT + dt.timedelta(hours=3)  # exactly max_hold
+    _, decision = evaluate_position(position, current_premium=Paise(2_050), now=now)
 
     assert decision is not None
     assert decision.reason == "time"
@@ -371,6 +405,17 @@ class TestSanityCheckedMark:
     def test_a_small_move_is_trusted_immediately(self) -> None:
         mark, pending = sanity_checked_mark(candidate=Paise(4_200), last_confirmed=Paise(4_000), pending=None)
         assert mark == Paise(4_200)
+        assert pending is None
+
+    def test_a_move_exactly_at_the_jump_threshold_is_still_trusted(self) -> None:
+        """The guard is `<= max_jump_pct`, not `<` — a move of EXACTLY the
+        threshold must still be trusted immediately, not quarantined. A
+        `<=` -> `<` flip would reject this exact boundary the same way it
+        rejects a genuine bad tick, and no existing test (which only probes
+        a small in-band move and a far-past-threshold spike) would notice."""
+        # 4000 -> 4800 is exactly a 20% move, the default max_jump_pct.
+        mark, pending = sanity_checked_mark(candidate=Paise(4_800), last_confirmed=Paise(4_000), pending=None)
+        assert mark == Paise(4_800)
         assert pending is None
 
     def test_a_big_unconfirmed_jump_is_quarantined_not_trusted(self) -> None:

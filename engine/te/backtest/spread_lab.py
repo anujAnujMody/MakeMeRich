@@ -402,7 +402,9 @@ def collect_signals(
         lot_size = lot_size_for(day)
 
         as_of = first
-        while as_of <= last:
+        # `<`, not `<=` -- see `te.backtest.strategy_lab.run_many`'s identical
+        # fix for why the boundary minute itself must be excluded.
+        while as_of < last:
             ctx.as_of = as_of
             for name, strategy in strategies.items():
                 if entries_today[name] >= MAX_ENTRIES_PER_DAY:

@@ -16,16 +16,25 @@ from te.domain.costs import CostBreakdown
 from te.domain.money import Paise
 from te.domain.pnl import GrossPnl, NetPnl
 
-_ZERO_COSTS = CostBreakdown(
-    brokerage=Paise(0), stt=Paise(0), exchange_txn=Paise(0), sebi=Paise(0), gst=Paise(0), stamp=Paise(0)
+#: Deliberately non-zero, following `tests/backtest/test_report.py::_trade`'s
+#: pattern: a `_COSTS` of zero (as this fixture previously used) makes
+#: `gross_pnl` numerically equal to `net_pnl`, so a mutation that reads
+#: `gross_pnl` instead of `net_pnl` (`te/backtest/daily.py:47`) would pass
+#: every test in this file undetected.
+_COSTS = CostBreakdown(
+    brokerage=Paise(200), stt=Paise(150), exchange_txn=Paise(50), sebi=Paise(1), gst=Paise(80), stamp=Paise(6)
 )
 
 
 def _trade(*, exit_ts: dt.datetime, net_pnl: int) -> ClosedTrade:
+    # `gross_pnl` deliberately DIFFERS from `net_pnl` by the real cost total
+    # (`gross == net + costs`) rather than being set equal to it, so a
+    # gross-instead-of-net mutation changes the aggregated total.
+    gross_pnl = net_pnl + _COSTS.total
     return ClosedTrade(
         symbol="NIFTY", exchange="NFO", strategy="orb", direction="long_call", lots=1, lot_size=65,
         entry_premium=Paise(10_000), exit_premium=Paise(10_500), entry_ts=exit_ts, exit_ts=exit_ts,
-        exit_reason="target", gross_pnl=GrossPnl(Paise(net_pnl)), costs=_ZERO_COSTS,
+        exit_reason="target", gross_pnl=GrossPnl(Paise(gross_pnl)), costs=_COSTS,
         net_pnl=NetPnl(Paise(net_pnl)),
     )
 
@@ -144,28 +153,34 @@ def test_build_daily_report_on_empty_mapping_is_the_honest_zero_state() -> None:
 
 def test_build_daily_report_hand_computed_mean_median_best_worst_and_thresholds() -> None:
     """Hand-built sequence, in rupees for readability then converted to
-    paise: +200, +600, -100, +1200, -50, +500, +900.
+    paise: +200, +600, -100, +1200, -50, +500, +900, +1000.
 
-    sorted: [-100, -50, 200, 500, 600, 900, 1200] -> median = 500
-    mean = (200+600-100+1200-50+500+900)/7 = 3250/7 = 464.2857... -> 464.29 Rs
+    The last day is exactly the `days_at_or_above_1000` boundary (Rs 1,000)
+    -- `_RS_500_PAISE`'s boundary is already exercised by the Rs 500 day
+    above it, but a `>` vs `>=` mutation on the 1,000 threshold
+    (`te/backtest/daily.py:224`) previously had no day at exactly that
+    value to catch it.
+
+    sorted: [-100, -50, 200, 500, 600, 900, 1000, 1200] -> median = (500+600)/2 = 550
+    mean = (200+600-100+1200-50+500+900+1000)/8 = 4250/8 = 531.25 Rs
     best = 1200, worst = -100
-    >= 500: 500, 600, 900, 1200 -> 4 days
-    >= 1000: 1200 -> 1 day
+    >= 500: 500, 600, 900, 1000, 1200 -> 5 days
+    >= 1000: 1000, 1200 -> 2 days
     losing days: -100, -50 -> 2
     """
-    rupee_nets = [200, 600, -100, 1200, -50, 500, 900]
+    rupee_nets = [200, 600, -100, 1200, -50, 500, 900, 1000]
     daily = _days(*enumerate(n * 100 for n in rupee_nets))
     report = build_daily_report(daily, capital=Paise(30_000_00), trade_count=10)
 
-    assert report.sessions == 7
+    assert report.sessions == 8
     assert report.trades == 10
     assert report.total_net_paise == sum(n * 100 for n in rupee_nets)
-    assert report.mean_daily_paise == 46_429  # round(325000/7) = 46428.57.. -> 46429
-    assert report.median_daily_paise == 500_00
+    assert report.mean_daily_paise == 53_125  # 425000/8 = 53125 exactly
+    assert report.median_daily_paise == 550_00
     assert report.best_day_paise == 1_200_00
     assert report.worst_day_paise == -100_00
-    assert report.days_at_or_above_500 == 4
-    assert report.days_at_or_above_1000 == 1
+    assert report.days_at_or_above_500 == 5
+    assert report.days_at_or_above_1000 == 2
     assert report.losing_days == 2
 
 

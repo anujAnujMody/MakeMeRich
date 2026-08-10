@@ -65,8 +65,21 @@ services:
       # `lot_size` for its whole instrument list, so NIFTY+SENSEX (NFO vs
       # BFO, different lot sizes) can't both go in this one config yet.
       - TE_PAPER_CYCLE_INSTRUMENTS=${TE_PAPER_CYCLE_INSTRUMENTS:-["NIFTY"]}
-      # ₹20,000 starting paper capital, in paise (Paise is always integer
-      # paise — see te/domain/money.py — never a float rupee amount).
+      # SEED ONLY — in paise (Paise is always integer paise, see
+      # te/domain/money.py, never a float rupee amount). This value is used
+      # ONCE, to populate `engine_state.capital_paise` the first time this
+      # container starts against a brand-new database. Every real paper
+      # cycle after that reads the STORED value via `get_guardrails`
+      # (te/engine/state.py), which is edited from the dashboard's Account
+      # Guardrails card and survives restarts/redeploys untouched — this
+      # env var is then completely ignored for trading. Changing it here
+      # does NOT change a running account's capital; the engine logs a
+      # WARNING at startup (te.engine.scheduler.
+      # _warn_if_stored_guardrails_diverge_from_settings) whenever this
+      # value disagrees with what is actually stored, precisely because that
+      # was found live: this was set to Rs 20,000 while a stored Rs 50,000
+      # governed every real cycle, with nothing anywhere saying so. To
+      # change the live capital, edit it on the dashboard, not here.
       - TE_PAPER_CYCLE_CAPITAL_PAISE=${TE_PAPER_CYCLE_CAPITAL_PAISE:-2000000}
     volumes:
       - engine-data:/app/data

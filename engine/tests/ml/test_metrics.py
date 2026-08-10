@@ -13,8 +13,10 @@ from scipy.stats import norm
 
 from te.ml.metrics import (
     EULER_MASCHERONI,
+    _performance,
     deflated_sharpe_ratio,
     expected_max_sharpe_under_null,
+    expected_max_z,
     probabilistic_sharpe_ratio,
     probability_of_backtest_overfitting,
 )
@@ -104,6 +106,99 @@ def test_dsr_decreases_as_trials_increase() -> None:
 
     # Not a degenerate flat line — deflation must actually bite somewhere.
     assert values[0] > values[-1]
+
+
+def test_psr_accepts_the_minimum_two_observations_but_rejects_one() -> None:
+    """`n_obs=2` is the smallest T for which `sqrt(T-1)` is meaningful and
+    must be accepted; `n_obs=1` must be rejected. A `<` -> `<=` flip on the
+    guard would reject the valid boundary (`n_obs=2`) with the same error."""
+    result = probabilistic_sharpe_ratio(sr_hat=0.1, sr_benchmark=0.0, n_obs=2, skewness=0.0, kurtosis=3.0)
+    assert 0.0 <= result <= 1.0
+
+    with pytest.raises(ValueError, match="n_obs must be >= 2"):
+        probabilistic_sharpe_ratio(sr_hat=0.1, sr_benchmark=0.0, n_obs=1, skewness=0.0, kurtosis=3.0)
+
+
+def test_psr_denominator_exactly_zero_raises_a_clean_error() -> None:
+    """`sr_hat=1, skewness=1, kurtosis=1` drives the PSR denominator
+    (`1 - skew*sr_hat + ((kurt-1)/4)*sr_hat**2`) to exactly 0. The guard is
+    `<= 0`, so this exact boundary must raise the documented `ValueError` —
+    a `<=` -> `<` flip would let it through and crash later on a ZeroDivisionError
+    instead, an unhelpful and undocumented failure mode."""
+    with pytest.raises(ValueError, match="PSR denominator is non-positive"):
+        probabilistic_sharpe_ratio(sr_hat=1.0, sr_benchmark=0.0, n_obs=10, skewness=1.0, kurtosis=1.0)
+
+
+def test_expected_max_sharpe_accepts_zero_variance() -> None:
+    """`var_sharpe=0` is a valid (if degenerate) input — every trial ever
+    run had identical Sharpe — and must not raise; only a NEGATIVE variance
+    is nonsensical. A `<` -> `<=` flip on the guard would reject the valid
+    boundary. With var_sharpe=0 the sqrt term vanishes, so SR0 == mean_sharpe
+    exactly."""
+    sr0 = expected_max_sharpe_under_null(mean_sharpe=0.05, var_sharpe=0.0, n_trials=10)
+    assert sr0 == pytest.approx(0.05, abs=1e-12)
+
+    with pytest.raises(ValueError, match="var_sharpe must be non-negative"):
+        expected_max_sharpe_under_null(mean_sharpe=0.05, var_sharpe=-0.01, n_trials=10)
+
+
+def test_expected_max_z_below_two_trials_is_the_flat_1_96_threshold() -> None:
+    """Per the docstring, below two trials there is no multiple-testing
+    problem, so `n_trials=1` (and `0`) must return exactly 1.96, NOT the
+    Blom's-approximation formula (which would evaluate to `norm.ppf(0.5) ==
+    0.0` at n_trials=1 — a completely different, wrong number). A `<=` ->
+    `<` flip on the guard would let `n_trials=1` fall through to the formula."""
+    assert expected_max_z(1) == 1.96
+    assert expected_max_z(0) == 1.96
+    # And n_trials=2 (first trial count where the multiple-testing
+    # correction actually applies) must NOT take the flat-threshold path.
+    assert expected_max_z(2) != 1.96
+
+
+def test_expected_max_z_blom_approximation_matches_independently_derived_value() -> None:
+    """Golden value for `n_trials=10`, re-derived independently here
+    (`scipy.stats.norm.ppf` spelled out inline, never calling back into
+    `te.ml.metrics`) — pins the exact `(n - 0.375) / (n + 0.25)` formula, so
+    swapping `-`/`+`/`/` for a neighbouring operator changes the result."""
+    n = 10
+    expected = norm.ppf((n - 0.375) / (n + 0.25))
+    assert expected_max_z(n) == pytest.approx(expected, abs=1e-12)
+    assert expected_max_z(n) == pytest.approx(1.5466, abs=1e-4)
+
+
+def test_performance_zero_variance_trial_falls_back_to_its_mean() -> None:
+    """A constant-return trial (sample std == 0 via `ddof=1`) must report
+    its MEAN as performance, per the docstring — not `mean / 0` (inf/nan
+    from a `>` -> `>=` flip on the `std > 0` guard, since std is never
+    negative so `>=0` is always true) and not `mean * std` (0, from a
+    `Div` -> `Mult` flip). A second, non-degenerate trial in the same call
+    pins the division itself: mean=2.0, std=2.0 -> perf=1.0, which a
+    `Div` -> `Mult` flip would instead report as 4.0."""
+    returns = np.array(
+        [
+            [1.0, 1.0, 1.0],  # constant -> std == 0 -> perf must be the mean, 1.0
+            [0.0, 2.0, 4.0],  # mean=2.0, sample std (ddof=1)=2.0 -> perf = mean/std = 1.0
+        ]
+    )
+    perf = _performance(returns)
+    assert np.all(np.isfinite(perf))
+    assert perf == pytest.approx([1.0, 1.0], abs=1e-9)
+
+
+def test_pbo_accepts_the_minimum_s_groups_of_two() -> None:
+    """`s_groups=2` is the smallest positive even group count and must be
+    accepted (giving C(2,1)=2 combinations); only `s_groups < 2` (i.e. 0 or
+    negative) is invalid. A `<` -> `<=` flip on the guard would reject this
+    valid boundary with the same error as `s_groups=0`."""
+    rng = np.random.default_rng(1)
+    returns = rng.normal(loc=0.0, scale=1.0, size=(6, 40))
+
+    result = probability_of_backtest_overfitting(returns, s_groups=2)
+
+    assert result.n_combinations == 2  # C(2, 1)
+
+    with pytest.raises(ValueError, match="s_groups must be a positive even number"):
+        probability_of_backtest_overfitting(returns, s_groups=0)
 
 
 def test_pbo_on_pure_noise_is_near_half() -> None:

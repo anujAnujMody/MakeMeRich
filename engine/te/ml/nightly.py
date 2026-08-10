@@ -43,11 +43,13 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from te.data.barstore import BarStore
 from te.domain.costs import CostModel
+from te.domain.geometry import DegenerateGeometry, ExitGeometry
 from te.ml.barriers import (
     ATM_SNAPSHOTS,
     MAX_HOLD,
     RATES_VERIFIED_FROM,
     barriers,
+    geometry_barrier_pct,
     round_trip_cost_in_index_points,
 )
 from te.ml.dataset import build_training_set
@@ -84,6 +86,8 @@ def build_labeled_dataset(
     store: BarStore,
     cost_model: CostModel,
     *,
+    geometry: ExitGeometry,
+    max_lots: int,
     instruments: tuple[str, ...],
     strategy: str = "orb",
     spec: FeatureSpec = SECONDARY_V1,
@@ -95,12 +99,33 @@ def build_labeled_dataset(
     `pit-correctness-guard`'s single-dataset-path rule. There is deliberately
     no second "compute features for training" path here to drift from it.
 
+    `geometry`/`max_lots` are the `ExitGeometry` and
+    `Settings.paper_cycle_max_lots` the engine is ACTUALLY configured with —
+    supplied by the caller (`run_nightly_training_job` in
+    `te.engine.scheduler`), never selected in here. `te.ml` must not import
+    `te.engine`, so this module cannot replicate
+    `te.engine.scheduler._exit_geometry`'s branching without the two
+    selectors drifting apart; the caller that already has that logic passes
+    the result in instead. See `barriers()` for why there is no honest
+    default.
+
     Returns an empty frame when nothing could be labelled; callers decide
     what that means rather than having an exception decide for them.
     """
     rows: list[dict[str, object]] = []
     for symbol in instruments:
-        stop, target = barriers(symbol)
+        try:
+            stop, target = barriers(symbol, geometry=geometry, max_lots=max_lots)
+        except DegenerateGeometry as exc:
+            # Whole premium sits inside the rupee cap for THIS symbol at this
+            # quantity — there is no reachable stop, so no honest barrier can
+            # be labelled. Skipped and logged, never guessed: the same
+            # "visible, not inferred from a smaller sample" rule the
+            # no-ATM-snapshot case already follows below.
+            logger.warning(
+                "nightly training: geometry cannot express a stop, cannot label", instrument=symbol, error=str(exc)
+            )
+            continue
         firings = label_firings_from_evaluations(
             session_factory,
             store,
@@ -129,12 +154,43 @@ def build_labeled_dataset(
     return pd.DataFrame(rows)
 
 
+def _geometry_stamp(instruments: tuple[str, ...], *, geometry: ExitGeometry, max_lots: int) -> str:
+    """The stop/target percentages a label was computed at, per symbol —
+    written into `model_registry.notes`.
+
+    Every label in `model_registry` used to be computed at a hardcoded
+    20%/20% with no record that it was 20/20, so a future geometry change
+    (a different rupee cap, a different `target_risk_multiple`) could not be
+    told apart from an old model in the one place its provenance is kept.
+    `model_registry` has no dedicated geometry column this module is allowed
+    to add (that table lives in `te.ml.registry`, outside this task's file
+    list) — `notes` is the honest place available to record it loudly rather
+    than leave the mismatch silent again. A symbol whose geometry is
+    degenerate at this quantity is named as `unlabelled (degenerate)` rather
+    than omitted, so a later reader does not mistake its absence for an
+    oversight.
+    """
+    parts: list[str] = []
+    for symbol in instruments:
+        if symbol not in ATM_SNAPSHOTS:
+            continue
+        try:
+            stop_pct, target_pct = geometry_barrier_pct(symbol, geometry=geometry, max_lots=max_lots)
+        except DegenerateGeometry:
+            parts.append(f"{symbol}=unlabelled (degenerate)")
+            continue
+        parts.append(f"{symbol}=-{float(stop_pct):.2f}%/+{float(target_pct):.2f}% of premium")
+    return ", ".join(parts)
+
+
 def train_and_register(
     session_factory: sessionmaker[Session],
     engine: Engine,
     store: BarStore,
     cost_model: CostModel,
     *,
+    geometry: ExitGeometry,
+    max_lots: int,
     instruments: tuple[str, ...],
     backend: ModelBackend = ModelBackend.XGBOOST,
     spec: FeatureSpec = SECONDARY_V1,
@@ -151,7 +207,7 @@ def train_and_register(
     the system working correctly.
     """
     frame = build_labeled_dataset(
-        session_factory, store, cost_model, instruments=instruments, spec=spec
+        session_factory, store, cost_model, geometry=geometry, max_lots=max_lots, instruments=instruments, spec=spec
     )
     if len(frame) < MIN_SAMPLES_TO_TRAIN:
         logger.info(
@@ -220,7 +276,10 @@ def train_and_register(
         pbo=result.pbo.pbo,
         n_trials_at_training=result.n_trials_at_training,
         n_labeled_samples=result.n_labeled_samples,
-        notes=f"registered by the nightly job, stays at shadow stage — {verdict}",
+        notes=(
+            f"registered by the nightly job, stays at shadow stage — {verdict}; "
+            f"labelled at {_geometry_stamp(instruments, geometry=geometry, max_lots=max_lots)}"
+        ),
     )
     logger.info(
         "nightly training: registered",
@@ -312,13 +371,24 @@ def run_nightly_training(
     store: BarStore,
     cost_model: CostModel,
     *,
+    geometry: ExitGeometry,
+    max_lots: int,
     instruments: tuple[str, ...],
 ) -> None:
     """Scheduler entry point. Swallows nothing it can act on, but never lets
     a training failure escape into the scheduler — a job that cannot learn
     tonight must not be able to affect tomorrow's trading, and APScheduler
     would otherwise surface this as a job error on a system that is
-    functioning correctly."""
+    functioning correctly.
+
+    `geometry`/`max_lots` are REQUIRED, on purpose, with no default: the
+    caller (`run_nightly_training_job` in `te.engine.scheduler`) already
+    builds the `ExitGeometry` the engine is actually configured with (via its
+    own `_exit_geometry(settings)`) and must pass that same object and
+    `settings.paper_cycle_max_lots` straight through — `te.ml` cannot select
+    it itself without importing `te.engine` or duplicating that selector, and
+    a hardcoded fallback here is the exact bug this whole change removes.
+    """
     tradeable = tuple(s for s in instruments if s in ATM_SNAPSHOTS)
     skipped = tuple(s for s in instruments if s not in ATM_SNAPSHOTS)
     if skipped:
@@ -331,6 +401,8 @@ def run_nightly_training(
         logger.info("nightly training: no labellable instruments configured")
         return
     try:
-        train_and_register(session_factory, engine, store, cost_model, instruments=tradeable)
+        train_and_register(
+            session_factory, engine, store, cost_model, geometry=geometry, max_lots=max_lots, instruments=tradeable
+        )
     except Exception:  # noqa: BLE001 — a learning failure must never break the engine
         logger.exception("nightly training failed", instruments=tradeable)

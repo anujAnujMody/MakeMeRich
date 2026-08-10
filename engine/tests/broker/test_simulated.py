@@ -108,8 +108,24 @@ def test_deterministic_slippage_applied_in_adverse_direction(cost_model: CostMod
     broker = SimulatedBroker(cost_model=cost_model, on=dt.date(2026, 7, 29), slippage_bps=Decimal("10"))
     broker.place_order(_intent(side="BUY", qty=65, price=Paise(10_000)))
     fill = broker.fill_reports()[0]
-    # BUY slippage moves the fill price UP (worse for the buyer).
-    assert fill.fill_price > Paise(10_000)
+    # BUY slippage moves the fill price UP (worse for the buyer). Asserted
+    # to the exact paise: 10 bps of Rs 100.00 is Rs 0.10 (10 paise), so the
+    # fill must land at exactly 10_010 — a magnitude bug (e.g. a dropped
+    # `/ _BPS_DIVISOR`, which would move a Rs 100.00 fill to Rs 1,100.00)
+    # would still satisfy a bare `>` comparison.
+    assert fill.fill_price == Paise(10_010)
+
+
+def test_deterministic_slippage_applied_in_adverse_direction_for_a_sell(cost_model: CostModel) -> None:
+    """SELL is the untested direction: "always worse for the trader" means
+    the fill price must move DOWN, not up, when selling. No existing test
+    constructs a SELL with non-zero `slippage_bps`, so a sign error here
+    (`- adjustment` -> `+ adjustment`) previously survived the whole suite."""
+    broker = SimulatedBroker(cost_model=cost_model, on=dt.date(2026, 7, 29), slippage_bps=Decimal("10"))
+    broker.place_order(_intent(side="SELL", qty=65, price=Paise(12_000)))
+    fill = broker.fill_reports()[0]
+    assert fill.fill_price < Paise(12_000)
+    assert fill.fill_price == Paise(11_988)  # 10 bps of Rs 120.00 = 12 paise, worse for a seller
 
 
 def test_query_order_returns_report_by_client_order_id(cost_model: CostModel) -> None:

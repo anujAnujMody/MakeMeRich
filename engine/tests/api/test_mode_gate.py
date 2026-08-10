@@ -11,6 +11,7 @@ shares that same singleton engine for the whole pytest session."""
 from __future__ import annotations
 
 import datetime as dt
+import random
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,7 @@ from te.ml import registry as ml_registry
 from te.ml.gates import MaturityGate, Stage
 from te.persistence.db import make_engine, make_session_factory
 from te.persistence.models import Base, CycleRow, TradeRow
+from te.risk.live_gate import MIN_SLIPPAGE_OBSERVATIONS
 from te.risk.monitors import SlippageMonitor
 
 STRATEGY = "orb"
@@ -96,9 +98,20 @@ def _satisfy_all_conditions(sf) -> None:  # noqa: ANN001
             session.commit()
 
     with sf() as session:
+        # A REAL clean sample: enough observations to clear the gate's
+        # `MIN_SLIPPAGE_OBSERVATIONS` floor, and scattered either side of the
+        # benchmark so the spread is non-zero.
+        #
+        # This used to record 10 observations of `expected == actual`, which
+        # is the signature of SIMULATED execution — `SimulatedBroker` fills
+        # every order at exactly its limit price. That sample drives stdev to
+        # 0, z-score to None and `breached` to False, so it "satisfied" the
+        # slippage condition while carrying no evidence at all about
+        # execution quality. See `te.risk.live_gate`.
+        rng = random.Random(11)
         monitor = SlippageMonitor(session, instrument=INSTRUMENT)
-        for i in range(10):
-            monitor.observe(Paise(10_000), Paise(10_000), ctx=f"clean-{i}")
+        for i in range(MIN_SLIPPAGE_OBSERVATIONS + 10):
+            monitor.observe(Paise(10_000), Paise(10_000 + round(rng.gauss(0, 5))), ctx=f"clean-{i}")
         session.commit()
 
     gate = MaturityGate(sf)

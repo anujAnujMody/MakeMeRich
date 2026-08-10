@@ -19,6 +19,7 @@ import pytest
 
 from te.data.barstore import BAR_COLUMNS, BarStore
 from te.domain.clock import IST
+from te.domain.evaluation import NOT_EVALUATED_PREFIX
 from te.strategy.context import StrategyContext
 from te.strategy.orb import OrbParams, OrbStrategy
 
@@ -173,6 +174,32 @@ def test_trades_long_call_on_confirmed_upside_breakout(store: BarStore) -> None:
     assert strategy.last_signal.entry_premium == 10_800  # 108.00 rupees -> paise
 
 
+def test_a_duplicated_breakout_bar_still_signals(store: BarStore) -> None:
+    """Guards `orb.py`'s `.drop_duplicates(subset="event_ts", keep="last")`.
+    A WS reconnect or a retried recorder flush can re-append a minute that is
+    already stored — reachable live, not a contrived shape. Without the
+    dedup, the duplicate becomes `breakout_bars.iloc[-2]`, comparing the
+    breakout bar against a copy of ITSELF: `prev_close == close` reads as
+    "the crossing already happened on an earlier bar" and the real breakout
+    is silently suppressed — the "never fired once and nobody noticed"
+    failure class, since nothing raises and nothing logs an error."""
+    breakout_row = _bar(_open(15), o=100, h=110, low=100, c=108, v=1_500)
+    rows = [
+        *_opening_range_rows(high=105, low=95),  # avg opening volume = 1000
+        breakout_row,
+        dict(breakout_row),  # the SAME event_ts appended a second time
+    ]
+    _write(store, rows)
+    strategy = OrbStrategy(OrbParams(opening_range_minutes=15, min_opening_bars=3))
+    ctx = StrategyContext(store=store, instrument=INSTRUMENT, exchange=EXCHANGE, as_of=_open(16))
+
+    evaluation = strategy.evaluate(ctx)
+
+    assert evaluation.verdict == "traded", "a duplicated breakout bar must not suppress the real breakout"
+    assert strategy.last_signal is not None
+    assert strategy.last_signal.direction == "long_call"
+
+
 def test_does_not_resignal_while_price_merely_remains_beyond_the_range(store: BarStore) -> None:
     """Regression for the churn bug found live on 2026-07-31. ORB read only
     the LATEST bar and asked "is price outside the range?" — true for every
@@ -283,8 +310,28 @@ def test_volume_confirmation_is_not_reported_as_passed_when_there_is_no_volume(s
 
     volume_cond = next(c for c in evaluation.conditions if c.label == "breakout volume confirmation")
     assert volume_cond.evaluated is False, "claimed to have evaluated a volume filter with no volume data"
+    assert volume_cond.passed is False, "an unevaluated condition must never carry passed=True"
+    assert volume_cond.outcome == "unmeasurable", "must be distinguishable from a short-circuited 'not_reached'"
+    assert volume_cond.actual.startswith(NOT_EVALUATED_PREFIX)
     assert "no volume" in volume_cond.actual
     assert evaluation.verdict == "traded", "an unmeasurable condition must not block a genuine breakout"
+
+
+def test_volume_confirmation_passes_at_exact_equality(store: BarStore) -> None:
+    """`passed=volume >= threshold` (orb.py:238) — every other fixture uses
+    volumes that pass or fail on both `>=` and `>`, so the boundary itself
+    was never pinned. With `volume_confirmation_multiple=1.0` (the default),
+    a breakout bar whose volume exactly equals the opening-range average
+    must still pass."""
+    _write(store, _breakout_rows(breakout_volume=1_000, range_volume=1_000))
+    ctx = StrategyContext(store=store, instrument=INSTRUMENT, exchange=EXCHANGE, as_of=_open(61))
+
+    evaluation = OrbStrategy().evaluate(ctx)
+
+    volume_cond = next(c for c in evaluation.conditions if c.label == "breakout volume confirmation")
+    assert volume_cond.evaluated is True
+    assert volume_cond.passed is True
+    assert evaluation.verdict == "traded"
 
 
 def test_volume_confirmation_still_applies_when_volume_is_present(store: BarStore) -> None:

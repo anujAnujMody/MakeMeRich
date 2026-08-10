@@ -78,19 +78,41 @@ def test_a_burst_beyond_the_rate_has_to_wait(monkeypatch: pytest.MonkeyPatch, cl
     assert limiter.try_acquire() is False, "bucket should be empty immediately after one quote at 1/sec"
 
 
-def test_orders_and_quotes_do_not_share_a_budget() -> None:
-    """A burst of position marks must never delay an exit order. The order
-    limiter lives in `te.execution.manager` at `max_orders_per_second`; this
-    one is per-client and quote-only, and they are separate objects by
-    construction."""
+def test_orders_and_quotes_do_not_share_a_budget(client_and_calls) -> None:  # noqa: ANN001
+    """A burst of position marks must never delay an exit order.
+
+    The previous version of this test asserted
+    `client._quote_limiter is not order_bucket`, where `order_bucket` was a
+    `TokenBucket` the test had just constructed two lines above — no
+    possible source change could make two independently-constructed objects
+    identical, so that assertion was true by construction and could never
+    fail, including under the exact regression it claimed to guard against
+    (the quote limiter becoming a module-level singleton shared with
+    `te.execution.manager`, which would still leave the test's own fresh
+    `order_bucket` a different object).
+
+    This drains the REAL quote limiter, then proves the REAL execution
+    manager's order budget — the one actually wired into
+    `te.execution.manager.ExecutionManager`, not a fresh local — still
+    grants every one of its tokens."""
     from te.broker.ratelimit import TokenBucket
+    from te.execution.manager import ExecutionManager
 
     client = OpenAlgoRestClient("http://x", "k", quotes_per_second=1)
     order_bucket = TokenBucket(rate=5, capacity=5)
+    manager = ExecutionManager(
+        session_factory=None,  # type: ignore[arg-type]  # submit() is never called in this test
+        store=None,  # type: ignore[arg-type]
+        broker=None,  # type: ignore[arg-type]
+        rate_limiter=order_bucket,
+    )
 
     assert client._quote_limiter is not None
-    assert client._quote_limiter is not order_bucket
+    # Capacity 1 at 1 quote/sec: one quote drains the whole bucket.
+    client.quotes("NIFTY", "NSE_INDEX")
+    assert client._quote_limiter.try_acquire() is False, "the quote budget should now be fully drained"
 
-    client.quotes  # noqa: B018 — referencing the throttled method, not calling it
     for _ in range(5):
-        assert order_bucket.try_acquire() is True, "order budget must be untouched by quote throttling"
+        assert manager._rate_limiter.try_acquire() is True, (  # noqa: SLF001
+            "draining the quote limiter must not touch the execution manager's real order budget"
+        )

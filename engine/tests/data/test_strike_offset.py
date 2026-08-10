@@ -126,6 +126,24 @@ def test_offset_counts_STRIKES_so_it_adapts_to_a_different_step_size() -> None:
     assert contract.strike == Decimal(56_400)
 
 
+def test_an_expiry_exactly_at_max_days_to_expiry_is_still_reachable(chain: OptionContractIndex) -> None:
+    """The boundary itself. `_EXPIRY` (2026-03-12) is exactly 2 days after
+    `_ON` (2026-03-10) — every other test in this file uses a 2-day gap
+    against the default `max_days_to_expiry=7` or a gap far past it, never a
+    candidate sitting exactly ON the limit. `>` (not `>=`) must still return
+    a contract here, or a compliant request one day inside its own stated
+    window would be silently refused."""
+    contract = chain.nearest(
+        on=_ON,
+        index_level=Decimal(24_500),
+        option_type="CE",
+        strikes_out_of_the_money=1,
+        max_days_to_expiry=(_EXPIRY - _ON).days,
+    )
+    assert contract is not None
+    assert contract.strike == Decimal(24_550)
+
+
 def test_an_expiry_beyond_the_cycle_is_still_refused_with_an_offset(chain: OptionContractIndex) -> None:
     """The coverage guard must not be weakened by the new parameter."""
     assert (

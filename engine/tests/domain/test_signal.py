@@ -6,6 +6,7 @@ open a position without a real exit plan attached (see
 from __future__ import annotations
 
 import datetime as dt
+from decimal import Decimal
 
 import pytest
 
@@ -59,9 +60,54 @@ def test_exit_plan_rejects_an_entry_outside_its_own_barriers() -> None:
         _exit_plan(entry_premium=Paise(1_500))  # below the 1_800 stop
 
 
+def test_exit_plan_rejects_an_entry_exactly_at_its_own_stop() -> None:
+    """`stop < entry_premium < target` is a STRICT chain — an entry sitting
+    exactly ON the stop is a position that opens already past its own
+    barrier, per the module docstring's `__post_init__` note."""
+    with pytest.raises(ValueError, match="must sit between stop"):
+        _exit_plan(entry_premium=Paise(1_800))  # equals the stop, not above it
+
+
+def test_exit_plan_rejects_an_entry_exactly_at_its_own_target() -> None:
+    """The upper-bound twin of the above: an entry AT the target is already
+    past the far barrier."""
+    with pytest.raises(ValueError, match="must sit between stop"):
+        _exit_plan(entry_premium=Paise(2_400))  # equals the target, not below it
+
+
+def test_exit_plan_rejects_a_zero_max_hold() -> None:
+    """`max_hold <= 0` must be refused — a zero hold time never lets a
+    position exist at all."""
+    with pytest.raises(ValueError, match="max_hold must be positive"):
+        _exit_plan(max_hold=dt.timedelta(0))
+
+
+def test_exit_plan_rejects_a_profit_lock_activation_exactly_at_the_stop() -> None:
+    """`stop < profit_lock_activation < target` is strict, same reasoning as
+    `entry_premium`'s own chain — a lock that activates exactly at the stop
+    can never fire (the stop would already have exited the position)."""
+    with pytest.raises(ValueError, match="must sit between stop"):
+        _exit_plan(profit_lock_activation=Paise(1_800), profit_lock_buffer_pct=Decimal(5))  # equals the stop
+
+
+def test_exit_plan_rejects_a_profit_lock_activation_exactly_at_the_target() -> None:
+    """The upper-bound twin — an activation exactly AT the target can never
+    fire either, since the target would already have closed the trade."""
+    with pytest.raises(ValueError, match="must sit between stop"):
+        _exit_plan(profit_lock_activation=Paise(2_400), profit_lock_buffer_pct=Decimal(5))  # equals the target
+
+
 def test_exit_plan_rejects_target_not_above_stop() -> None:
     with pytest.raises(ValueError, match="target"):
         _exit_plan(stop=Paise(2_000), target=Paise(1_900))
+
+
+def test_exit_plan_rejects_a_profit_lock_buffer_pct_of_exactly_zero() -> None:
+    """`profit_lock_buffer_pct` must be in the OPEN interval `(0, 100)` — `0`
+    itself must be refused, same lower-bound reasoning as
+    `geometry.RupeeRiskGeometry`'s own equivalent check."""
+    with pytest.raises(ValueError, match="profit_lock_buffer_pct must be in"):
+        _exit_plan(profit_lock_activation=Paise(2_000), profit_lock_buffer_pct=Decimal(0))
 
 
 def test_signal_construction() -> None:

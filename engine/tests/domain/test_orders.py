@@ -75,6 +75,30 @@ def test_fold_partial_fill_then_fill_accumulates_quantity() -> None:
     assert order.filled_qty == 65
 
 
+def test_fold_two_partial_fills_accumulate_before_the_final_fill() -> None:
+    """Both the earlier fold test and `test_store.py`'s only ever apply ONE
+    partial before the final fill, which reaches the same total whether the
+    `OrderPartiallyFilled` branch accumulates or merely assigns. Two
+    genuinely distinct partials (20 + 20) before the final 25 is the only
+    way to show the accumulator actually accumulates a SECOND time."""
+    order = fold(
+        [
+            _initialized(qty=65),
+            OrderSubmitted(client_order_id="coid-1", ts=TS),
+            OrderAccepted(client_order_id="coid-1", venue_order_id="v-1", ts=TS),
+            OrderPartiallyFilled(
+                client_order_id="coid-1", venue_trade_id="t-1", fill_qty=20, fill_price=Paise(10_000), ts=TS
+            ),
+            OrderPartiallyFilled(
+                client_order_id="coid-1", venue_trade_id="t-2", fill_qty=20, fill_price=Paise(10_010), ts=TS
+            ),
+            OrderFilled(client_order_id="coid-1", venue_trade_id="t-3", fill_qty=25, fill_price=Paise(10_050), ts=TS),
+        ]
+    )
+    assert order.status == "FILLED"
+    assert order.filled_qty == 65
+
+
 def test_fold_rejected() -> None:
     order = fold([_initialized(), OrderRejected(client_order_id="coid-1", reason="bad symbol", ts=TS)])
     assert order.status == "REJECTED"

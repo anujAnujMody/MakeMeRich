@@ -367,6 +367,65 @@ def get_guardrails(session: Session, *, defaults: AccountGuardrails) -> AccountG
     )
 
 
+#: `get_guardrails_provenance`'s per-field result: `"stored"` means the row
+#: in `engine_state` exists and parsed, so it is what actually governs
+#: trading; `"seed"` means that row is missing or unreadable and
+#: `guardrails_defaults_from_settings` supplied the value instead — the trap
+#: this whole module exists to make visible (see `te.engine.scheduler.
+#: _warn_if_stored_guardrails_diverge_from_settings`).
+GuardrailProvenance = Literal["stored", "seed"]
+
+_GUARDRAIL_KEYS: tuple[str, ...] = (
+    _CAPITAL_PAISE_KEY,
+    _MAX_DAILY_LOSS_PAISE_KEY,
+    _MAX_POSITION_SIZE_PCT_KEY,
+    _MAX_DRAWDOWN_PCT_KEY,
+    _MAX_TRADES_PER_DAY_KEY,
+    _MAX_CONCURRENT_POSITIONS_KEY,
+    _RISK_PER_TRADE_PCT_KEY,
+)
+
+#: `AccountGuardrails` field name, keyed identically to `_GUARDRAIL_KEYS`
+#: above (same order) — the mapping `get_guardrails_provenance` reports
+#: against, and what `GET /api/engine/guardrails` exposes per field.
+_GUARDRAIL_FIELD_NAMES: tuple[str, ...] = (
+    "capital",
+    "max_daily_loss",
+    "max_position_size_pct",
+    "max_drawdown_pct",
+    "max_trades_per_day",
+    "max_concurrent_positions",
+    "risk_per_trade_pct",
+)
+
+_GUARDRAIL_INT_FIELDS = frozenset({"capital", "max_daily_loss", "max_trades_per_day", "max_concurrent_positions"})
+
+
+def get_guardrails_provenance(session: Session) -> dict[str, GuardrailProvenance]:
+    """Per-field `"stored"`/`"seed"` — whether each of the 7 guardrails is
+    actually the DB-stored value `get_guardrails` will return, or a
+    `Settings.paper_cycle_*`-seeded fallback because no row (or an
+    unparseable one) exists yet. Uses the exact same parse rules `_read_int`/
+    `_read_decimal` apply, so this can never disagree with what
+    `get_guardrails` actually returned for the same session."""
+    provenance: dict[str, GuardrailProvenance] = {}
+    for key, field_name in zip(_GUARDRAIL_KEYS, _GUARDRAIL_FIELD_NAMES, strict=True):
+        row = session.get(EngineState, key)
+        if row is None:
+            provenance[field_name] = "seed"
+            continue
+        try:
+            if field_name in _GUARDRAIL_INT_FIELDS:
+                int(row.value)
+            else:
+                Decimal(row.value)
+        except (ValueError, InvalidOperation):
+            provenance[field_name] = "seed"
+            continue
+        provenance[field_name] = "stored"
+    return provenance
+
+
 def set_guardrails(session: Session, guardrails: AccountGuardrails) -> None:
     """Validates before writing ANY key (all-or-nothing on the write side,
     unlike the lenient per-key read above) — a partially-invalid save should

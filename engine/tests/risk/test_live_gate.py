@@ -20,7 +20,7 @@ from te.ml import registry as ml_registry
 from te.ml.gates import MaturityGate, Stage, model_promotions
 from te.persistence.db import make_engine, make_session_factory
 from te.persistence.models import Base, CycleRow, TradeRow
-from te.risk.live_gate import LiveUnlockGate
+from te.risk.live_gate import MAX_PBO, MIN_DSR, MIN_SLIPPAGE_OBSERVATIONS, LiveUnlockGate
 from te.risk.monitors import SlippageMonitor
 
 STRATEGY = "orb"
@@ -91,11 +91,36 @@ def _insert_cycle(session_factory, *, ts: dt.datetime, mode: str = "paper") -> N
         session.commit()
 
 
-def _make_clean_slippage(session_factory, *, n: int = 10) -> None:  # noqa: ANN001
+def _make_clean_slippage(session_factory, *, n: int = 40) -> None:  # noqa: ANN001
+    """A REAL clean sample: enough observations to clear
+    `MIN_SLIPPAGE_OBSERVATIONS`, scattered either side of the benchmark so
+    the spread is non-zero, and centred on zero so it is genuinely clean.
+
+    This helper used to record `n=10` observations of `expected == actual`,
+    which is precisely the signature of simulated execution — the
+    `SimulatedBroker` fills every order at exactly its limit price. That
+    sample drives `stdev` to 0, `z_score` to `None` and `breached` to
+    `False`, so it "satisfied" the gate's slippage condition without
+    carrying one bit of evidence about execution quality. The test agreed
+    with the bug, which is why the gate's emptiest possible state passed."""
+    import random
+
+    rng = random.Random(11)
     with session_factory() as session:
         monitor = SlippageMonitor(session, instrument=INSTRUMENT)
         for i in range(n):
-            monitor.observe(Paise(10_000), Paise(10_000), ctx=f"clean-{i}")
+            actual = 10_000 + round(rng.gauss(0, 5))
+            monitor.observe(Paise(10_000), Paise(actual), ctx=f"clean-{i}")
+        session.commit()
+
+
+def _make_identical_slippage(session_factory, *, n: int = 40) -> None:  # noqa: ANN001
+    """Plenty of observations, all exactly at the benchmark — what recording
+    real paper fills actually produces."""
+    with session_factory() as session:
+        monitor = SlippageMonitor(session, instrument=INSTRUMENT)
+        for i in range(n):
+            monitor.observe(Paise(10_000), Paise(10_000), ctx=f"simulated-{i}")
         session.commit()
 
 
@@ -159,6 +184,11 @@ def test_live_gate_fails_with_specific_reasons_on_fresh_db(session_factory) -> N
     assert "no PBO recorded yet for strategy 'orb'" in joined
     assert "params_frozen_at" in joined
     assert "'shadow'" in joined
+    # The slippage condition must FAIL on an empty DB, not pass silently.
+    # `SlippageStatus.breached` is `False` with zero observations, so the
+    # original `if status.breached` check asserted "execution is within
+    # model" having measured nothing at all.
+    assert "slippage observations" in joined
     # no generic/vague placeholders anywhere
     for condition in result.failing_conditions:
         assert condition != "not ready"
@@ -176,6 +206,81 @@ def test_live_gate_passes_when_all_conditions_synthetically_satisfied(session_fa
 
     assert result.failing_conditions == ()
     assert result.passed is True
+
+
+def test_live_gate_refuses_a_slippage_sample_that_is_too_small(session_factory) -> None:  # noqa: ANN001
+    """Below `MIN_SLIPPAGE_OBSERVATIONS` the gate must say so rather than
+    read a thin sample as proof of clean execution."""
+    _satisfy_dsr_pbo(session_factory)
+    _satisfy_sessions(session_factory)
+    _satisfy_gating(session_factory)
+    _make_clean_slippage(session_factory, n=MIN_SLIPPAGE_OBSERVATIONS - 1)
+
+    result = LiveUnlockGate(session_factory).check()
+
+    assert result.passed is False
+    joined = " | ".join(result.failing_conditions)
+    assert f"of {MIN_SLIPPAGE_OBSERVATIONS} required slippage observations" in joined
+
+
+def test_live_gate_refuses_simulated_fills_as_execution_evidence(session_factory) -> None:
+    """The live-money gate must not be satisfiable without ever touching a
+    real venue.
+
+    Once `ExecutionManager.drain_fills` made fills actually reach
+    `on_fill`, paper trading began recording plenty of observations — but
+    the `SimulatedBroker` fills at exactly the limit price, so every one is
+    a zero divergence. That drives `stdev` to 0, which drives `z_score` to
+    `None` and `breached` to `False`. A large, perfectly clean, entirely
+    meaningless sample would otherwise pass the condition more convincingly
+    than the empty one did."""
+    _satisfy_dsr_pbo(session_factory)
+    _satisfy_sessions(session_factory)
+    _satisfy_gating(session_factory)
+    _make_identical_slippage(session_factory, n=MIN_SLIPPAGE_OBSERVATIONS * 2)
+
+    result = LiveUnlockGate(session_factory).check()
+
+    assert result.passed is False
+    joined = " | ".join(result.failing_conditions)
+    assert "simulated fill signature" in joined
+
+
+def test_live_gate_dsr_pbo_thresholds_are_pinned_to_their_documented_values() -> None:
+    """The module docstring and this whole gate's purpose promise DSR>0.95,
+    PBO<0.05 — pin the literal constants directly (not merely "some strict
+    inequality holds against whatever `MIN_DSR`/`MAX_PBO` currently are"),
+    so silently loosening either (e.g. `MIN_DSR = 0.65`, `MAX_PBO = 0.40`,
+    the exact loosened values the audit checked survive without this) fails
+    here even though a boundary test parametrised over the live symbols
+    could not distinguish it."""
+    assert MIN_DSR == 0.95
+    assert MAX_PBO == 0.05
+
+
+@pytest.mark.parametrize(
+    "dsr,pbo,should_pass",
+    [
+        (0.95, 0.02, False),  # exactly AT the DSR threshold — comparison is strict `>`, must still fail
+        (0.95 + 1e-9, 0.02, True),  # one float ULP above — must pass
+        (0.97, 0.05, False),  # exactly AT the PBO threshold — comparison is strict `<`, must still fail
+    ],
+    ids=["dsr_exactly_at_threshold", "dsr_just_above_threshold", "pbo_exactly_at_threshold"],
+)
+def test_live_gate_dsr_pbo_boundaries(session_factory, dsr: float, pbo: float, should_pass: bool) -> None:  # noqa: ANN001
+    """`MIN_DSR`/`MAX_PBO` are the only thing standing between paper and a
+    real account — pinned at the literal boundary the same way
+    `tests/risk/test_pure_predicates.py` pins the loss limits, so the DSR/PBO
+    fixtures elsewhere in this file (0.97/0.02 pass, 0.60/0.50 fail) never
+    approach either edge, this does."""
+    _insert_model_record(session_factory, dsr=dsr, pbo=pbo)
+    _satisfy_sessions(session_factory)
+    _satisfy_slippage(session_factory)
+    _satisfy_gating(session_factory)
+
+    result = LiveUnlockGate(session_factory).check()
+
+    assert result.passed is should_pass
 
 
 @pytest.mark.parametrize(

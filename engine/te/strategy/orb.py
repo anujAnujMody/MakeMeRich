@@ -246,11 +246,17 @@ class OrbStrategy:
                     f"not evaluated — {ctx.instrument} reports no volume on its bars "
                     f"(an index has no traded volume of its own, only its derivatives do)"
                 ),
-                passed=True,
+                passed=False,
                 evaluated=False,
             )
         conditions.append(volume_cond)
-        if not volume_cond.passed:
+        # `unmeasurable` (no volume to confirm against) must NOT block the
+        # trade — there is no evidence to block on, and that is today's
+        # behaviour. `failed` (evaluated=True, passed=False) is the only
+        # outcome that should skip. Branch on `.outcome`, not the raw
+        # `passed` flag, so an unmeasurable condition can never read as a
+        # pass either.
+        if volume_cond.outcome == "failed":
             return self._skip(ctx, conditions, "breakout volume below confirmation threshold")
 
         self.last_signal = Signal(

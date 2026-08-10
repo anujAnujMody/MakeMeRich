@@ -25,6 +25,7 @@ from te.persistence.repos.paper_trading import (
     daily_net_pnl_paise,
     open_positions_count,
     record_risk_event,
+    entries_count_today,
     trades_count_today,
     trades_today,
 )
@@ -221,7 +222,20 @@ def check_consecutive_losses(session: Session, config: RiskLimitsConfig, *, on: 
 
 
 def check_max_trades_per_day(session: Session, config: RiskLimitsConfig, *, on: dt.date) -> None:
-    count = trades_count_today(session, on)
+    """Cap on trades PLACED today — counted from the ENTRY ledger.
+
+    This read `trades_count_today`, which counts the EXIT ledger, so a
+    position that was open right now had not been counted at all: it has no
+    `TradeRow` until it closes. On 2026-08-07 six trades ran against a cap of
+    three and this guard never fired, because at each entry decision the
+    earlier positions were still open and therefore invisible.
+
+    The identical mistake in `check_daily_loss_limit` was found and fixed at
+    the time. Nobody swept its neighbours in this same file, so this one
+    stayed broken — which is why `CLAUDE.md` says to sweep every analogous
+    function when one instance is found.
+    """
+    count = entries_count_today(session, on)
     if count >= config.max_trades_per_day:
         raise LimitBreachError(
             "max_trades",

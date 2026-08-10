@@ -47,12 +47,24 @@ def _parse_date(raw: str) -> dt.date:
     raise ValueError(f"Unrecognised bhavcopy date format: {raw!r}")
 
 
-def _to_int(raw: str) -> int:
-    return int(float(raw)) if raw.strip() else 0
+def _to_int(raw: str, *, column: str, context: str) -> int:
+    if not raw.strip():
+        raise ValueError(
+            f"{context}: blank {column}. A priced index-option row with no {column} is "
+            "unknown data, not a real zero — refusing rather than substituting a fabricated "
+            "value that would be indistinguishable from a genuine one downstream."
+        )
+    return int(float(raw))
 
 
-def _to_float(raw: str) -> float:
-    return float(raw) if raw.strip() else 0.0
+def _to_float(raw: str, *, column: str, context: str) -> float:
+    if not raw.strip():
+        raise ValueError(
+            f"{context}: blank {column}. A priced index-option row with no {column} is "
+            "unknown data, not a real zero — refusing rather than substituting a fabricated "
+            "value that would be indistinguishable from a genuine one downstream."
+        )
+    return float(raw)
 
 
 def parse_udiff_fo_csv(
@@ -86,7 +98,7 @@ def parse_udiff_fo_csv(
     reader = csv.DictReader(io.StringIO(csv_text))
     rows: list[OptionBhavRow] = []
 
-    for raw in reader:
+    for line_no, raw in enumerate(reader, start=2):  # line 1 is the header
         instrument_type = (raw.get("FinInstrmTp") or "").strip()
         if instrument_type != INDEX_OPTION_INSTRUMENT_TYPE:
             continue
@@ -99,22 +111,24 @@ def parse_udiff_fo_csv(
         if option_type not in ("CE", "PE"):
             continue
 
+        context = f"row {line_no} ({symbol} {option_type} strike={(raw.get('StrkPric') or '').strip()!r})"
+
         rows.append(
             OptionBhavRow(
                 trade_date=_parse_date(raw["TradDt"]),
                 symbol=symbol,
                 expiry=_parse_date(raw["XpryDt"]),
-                strike=_to_float(raw["StrkPric"]),
+                strike=_to_float(raw["StrkPric"], column="StrkPric", context=context),
                 option_type=option_type,  # type: ignore[arg-type]
                 exchange=exchange,
-                open=_to_float(raw["OpnPric"]),
-                high=_to_float(raw["HghPric"]),
-                low=_to_float(raw["LwPric"]),
-                close=_to_float(raw["ClsPric"]),
-                settle_price=_to_float(raw["SttlmPric"]),
-                open_interest=_to_int(raw["OpnIntrst"]),
-                change_in_oi=_to_int(raw["ChngInOpnIntrst"]),
-                volume=_to_int(raw["TtlTradgVol"]),
+                open=_to_float(raw["OpnPric"], column="OpnPric", context=context),
+                high=_to_float(raw["HghPric"], column="HghPric", context=context),
+                low=_to_float(raw["LwPric"], column="LwPric", context=context),
+                close=_to_float(raw["ClsPric"], column="ClsPric", context=context),
+                settle_price=_to_float(raw["SttlmPric"], column="SttlmPric", context=context),
+                open_interest=_to_int(raw["OpnIntrst"], column="OpnIntrst", context=context),
+                change_in_oi=_to_int(raw["ChngInOpnIntrst"], column="ChngInOpnIntrst", context=context),
+                volume=_to_int(raw["TtlTradgVol"], column="TtlTradgVol", context=context),
                 source=source,
             )
         )

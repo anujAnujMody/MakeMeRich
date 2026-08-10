@@ -71,9 +71,10 @@ from te.data.bhavcopy_nse import SOURCE as NSE_BHAV_SOURCE
 from te.data.bhavcopy_nse import ingest_bhavcopy_nse
 from te.data.charges_loader import load_charge_rate_table
 from te.data.ingest_log import already_ingested
+from te.audit.session_audit import AuditLimits, SessionAudit, audit_session
 from te.data.recorder import BarRecorder
 from te.domain.calendar import TradingCalendar
-from te.domain.clock import DEFAULT_SESSION, IST, SessionWindow, is_market_open
+from te.domain.clock import IST, SessionWindow, is_market_open
 from te.domain.costs import ChargeRateTable, CostModel
 from te.domain.geometry import (
     AbsolutePointGeometry,
@@ -86,10 +87,11 @@ from te.domain.symbols import FNO_UNDERLYING_EXCHANGES, build_future_symbol, nex
 from te.engine.contract import UNDERLYING_INDEX_EXCHANGES, ContractResolver, OptionContractResolver
 from te.engine.cycle import CycleConfig, InstrumentConfig, run_entry_cycle, run_exit_cycle
 from te.engine.state import (
+    clamp_guardrails,
     get_capital_set_at,
-    get_last_broker_relogin_day,
     get_guardrails,
     get_instrument_selections,
+    get_last_broker_relogin_day,
     get_mode,
     get_run_state,
     guardrails_defaults_from_settings,
@@ -516,6 +518,79 @@ def _run_instrument_sync(rest_client: OpenAlgoRestClient, engine: Engine) -> Non
     logger.info("instrument sync complete", rows_written=written_total)
 
 
+def run_session_audit(session_factory: sessionmaker[Session], settings: Settings) -> SessionAudit | None:
+    """Audits the session that just ended and logs the result. Returns the
+    audit (or `None` if it could not run at all).
+
+    Scheduled for 15:35 IST — after the 15:30 close and after the 15:15 hard
+    exit, so every position the day opened has resolved and the numbers are
+    final.
+
+    Why a scheduled job and not just a test: on 2026-08-07 the engine broke
+    FOUR of its own limits in a single session while the suite was green,
+    because the tests and the code shared one wrong idea about what "a trade
+    today" means. A test can only check the failures somebody thought to
+    imagine. This checks the day that actually happened, so a rule breaking in
+    a way nobody predicted still gets caught — the same evening, not weeks
+    later.
+
+    Logs at ERROR on a violation. That is deliberate: a violated risk limit is
+    not a warning, it is the engine having done something it promised it would
+    not do.
+    """
+    now = dt.datetime.now(IST)
+    try:
+        with session_factory() as session:
+            guardrails = get_guardrails(session, defaults=guardrails_defaults_from_settings(settings))
+            limits = AuditLimits(
+                max_trades_per_day=guardrails.max_trades_per_day,
+                max_concurrent_positions=guardrails.max_concurrent_positions,
+                max_daily_loss_paise=int(guardrails.max_daily_loss),
+                max_consecutive_losses=settings.paper_cycle_max_consecutive_losses,
+                max_entries_per_underlying_per_day=settings.paper_cycle_max_entries_per_underlying_per_day,
+                max_loss_per_trade_paise=settings.paper_cycle_max_loss_per_trade_paise,
+                max_lots=settings.paper_cycle_max_lots,
+            )
+            audit = audit_session(session, on=now.date(), limits=limits, now=now)
+    except Exception:
+        # Never let the audit take the scheduler down with it. An audit that
+        # crashes is a lost report; an audit that kills the job thread is a
+        # silently missing report every day after.
+        logger.exception("session audit failed to run")
+        return None
+
+    if not audit.entries:
+        logger.info("session audit: no entries today", on=audit.on.isoformat())
+        return audit
+
+    if audit.violations:
+        logger.error(
+            "SESSION AUDIT FAILED — the engine broke its own limits",
+            on=audit.on.isoformat(),
+            entries=len(audit.entries),
+            net_rupees=audit.net_paise / 100,
+            violations=[f.rule for f in audit.violations],
+        )
+        for finding in audit.violations:
+            logger.error(
+                "audit violation",
+                rule=finding.rule,
+                expected=finding.expected,
+                actual=finding.actual,
+                detail=finding.detail,
+            )
+    else:
+        logger.info(
+            "session audit clean",
+            on=audit.on.isoformat(),
+            entries=len(audit.entries),
+            net_rupees=audit.net_paise / 100,
+        )
+    for finding in audit.warnings:
+        logger.warning("audit warning", rule=finding.rule, actual=finding.actual, detail=finding.detail)
+    return audit
+
+
 def reset_daily_loss_halt(session_factory: sessionmaker[Session]) -> bool:
     """Clears yesterday's daily-loss halt so today can trade. Returns whether
     anything was cleared.
@@ -580,6 +655,22 @@ def run_nightly_training_job(
         engine,
         store,
         CostModel(charge_rate_table),
+        # The SAME geometry the entry cycle trades, not a second copy of the
+        # numbers. Labels used to be computed at a hardcoded 20% stop and 20%
+        # target — 1:1 — carrying a comment saying they "must track" two
+        # settings the live config had already stopped using. By the time it
+        # was found the engine was trading a Rs 700 rupee cap at a 10x target
+        # multiple (~1:10), so every label described a strategy that was not
+        # running, and anything trained or filtered from them was tuned for a
+        # machine that did not exist.
+        #
+        # `_exit_geometry` is the one true selector, so passing its result
+        # here is what makes the two halves incapable of drifting apart
+        # again. `run_nightly_training` takes it as a REQUIRED argument for
+        # the same reason: a default would just be the old bug with a longer
+        # fuse.
+        geometry=_exit_geometry(settings),
+        max_lots=settings.paper_cycle_max_lots or 1,
         instruments=instruments,
     )
 
@@ -590,7 +681,9 @@ def run_nightly_training_job(
 _RELOGIN_WINDOW = SessionWindow(start=dt.time(8, 40), end=dt.time(15, 30))
 
 
-def relogin_is_overdue(now: dt.datetime, last_success: dt.date | None) -> bool:
+def relogin_is_overdue(
+    now: dt.datetime, last_success: dt.date | None, calendar: TradingCalendar | None = None
+) -> bool:
     """True when today's broker login is DUE and has not happened.
 
     The catch-up check the FastAPI lifespan runs after `scheduler.start()`,
@@ -615,9 +708,18 @@ def relogin_is_overdue(now: dt.datetime, last_success: dt.date | None) -> bool:
     real credentials against Angel's rate limiter on every reload; gating on
     "a login already succeeded today" means the second and every later
     restart is a no-op, so that objection no longer applies.
+
+    `calendar` is optional for the same reason as `should_start_recorder_now`
+    above — it keeps the pure weekday form available to tests and to any
+    caller with no DB — but a live special session (Budget-day Saturday
+    trading, Diwali Muhurat) needs the broker logged in same as any other
+    session, and weekday arithmetic alone would never trigger it.
     """
     ist_now = now.astimezone(IST)
-    if ist_now.weekday() >= 5:  # no session, no broker to log in to
+    if calendar is not None:
+        if not calendar.is_trading_day(ist_now.date(), exchange="NSE"):
+            return False
+    elif ist_now.weekday() >= 5:  # no session, no broker to log in to
         return False
     if last_success == ist_now.date():
         return False
@@ -643,10 +745,11 @@ def relogin_catchup_due(session_factory: sessionmaker[Session], now: dt.datetime
     try:
         with session_factory() as session:
             last_success = get_last_broker_relogin_day(session)
+            calendar = get_calendar(session)
     except OperationalError:
         logger.warning("engine_state is not queryable yet — skipping the broker-relogin catch-up")
         return False
-    return relogin_is_overdue(now, last_success)
+    return relogin_is_overdue(now, last_success, calendar)
 
 
 def run_openalgo_relogin(settings: Settings, session_factory: sessionmaker[Session] | None = None) -> LoginResult:
@@ -942,10 +1045,6 @@ class PaperCycleRunner:
     config: CycleConfig
     max_orders_per_second: int
     settings: Settings
-    #: Fallback only. The session window actually used comes from the
-    #: stored `TradingCalendar` (see `run_once`), so a special session gets
-    #: its real hours; this stays as the shape tests construct.
-    session_window: SessionWindow = DEFAULT_SESSION
     #: Which exchange's holiday list decides whether today is a session.
     #: NSE and BSE share every holiday in the 2026 calendar, so one is
     #: enough — but it is named rather than assumed, because they have
@@ -986,10 +1085,10 @@ class PaperCycleRunner:
         # every exchange holiday ran a full day of cycles against a feed
         # that would never produce a bar, logging ordinary-looking skips.
         #
-        # The window itself comes from the calendar too, not from
-        # `self.session_window`, because Diwali Muhurat trading is a real
-        # ~1-hour EVENING session on a date the exchange is otherwise shut.
-        # Hardcoding 09:15-15:30 would idle through all of it.
+        # The window itself comes from the calendar, because Diwali Muhurat
+        # trading is a real ~1-hour EVENING session on a date the exchange
+        # is otherwise shut. Hardcoding 09:15-15:30 would idle through all
+        # of it.
         with self.session_factory() as session:
             calendar = get_calendar(session)
         window = calendar.session_window(local.date(), exchange=self.calendar_exchange)
@@ -1120,6 +1219,62 @@ class PaperCycleRunner:
         logger.debug("paper cycle ran", as_of=as_of.isoformat(), halted=halted, paused=paused)
 
 
+#: Which `AccountGuardrails` fields actually have a `Settings.paper_cycle_*`
+#: env var backing them, and that var's name. `max_position_size_pct`/
+#: `max_drawdown_pct` are deliberately excluded: they have no env-var
+#: equivalent at all (`guardrails_defaults_from_settings` seeds both from the
+#: hard ceiling, not from `settings`), so a stored value differing from that
+#: ceiling is not an ignored env var and must not be reported as one.
+_GUARDRAIL_ENV_VARS: tuple[tuple[str, str], ...] = (
+    ("capital", "TE_PAPER_CYCLE_CAPITAL_PAISE"),
+    ("max_daily_loss", "TE_PAPER_CYCLE_MAX_DAILY_LOSS_PAISE"),
+    ("max_trades_per_day", "TE_PAPER_CYCLE_MAX_TRADES_PER_DAY"),
+    ("max_concurrent_positions", "TE_PAPER_CYCLE_MAX_CONCURRENT_POSITIONS"),
+    ("risk_per_trade_pct", "TE_PAPER_CYCLE_RISK_BUDGET_PCT"),
+)
+
+
+def _warn_if_stored_guardrails_diverge_from_settings(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """`PaperCycleRunner.run_once` (and every guardrails read in this
+    module) always prefers the DB-stored guardrail over `Settings.
+    paper_cycle_*` — see `get_guardrails`. Once ANYTHING has been saved from
+    the dashboard, the corresponding `TE_PAPER_CYCLE_*` env var is silently
+    ignored for trading: it only ever seeds a brand-new database (see
+    `guardrails_defaults_from_settings`). Confirmed live:
+    `TE_PAPER_CYCLE_CAPITAL_PAISE` was set to Rs 20,000 in
+    `docker-compose.yml` while a stored Rs 50,000 governed every real paper
+    cycle, and nothing said so.
+
+    Runs once at scheduler build time (process startup), not per-cycle —
+    this is a boot-time loud-and-clear check for an operator reading logs,
+    not a repeating one. A missing `engine_state` table (a brand-new DB
+    before the API's `create_all` has run) is treated the same way
+    `relogin_catchup_due` treats it: skip silently, never crash the boot.
+    """
+    try:
+        with session_factory() as session:
+            stored = get_guardrails(session, defaults=guardrails_defaults_from_settings(settings))
+    except OperationalError:
+        logger.warning("engine_state is not queryable yet — skipping the startup guardrails mismatch check")
+        return
+
+    seeded = clamp_guardrails(guardrails_defaults_from_settings(settings))
+    for field_name, env_var in _GUARDRAIL_ENV_VARS:
+        stored_value = getattr(stored, field_name)
+        seeded_value = getattr(seeded, field_name)
+        if stored_value != seeded_value:
+            logger.warning(
+                f"guardrail mismatch at startup: the STORED value governs live trading, the {env_var} env var "
+                "does not — it only seeds a brand-new database",
+                guardrail=field_name,
+                env_var=env_var,
+                settings_value=str(seeded_value),
+                stored_value=str(stored_value),
+            )
+
+
 def build_scheduler(
     settings: Settings,
     *,
@@ -1161,6 +1316,7 @@ def build_scheduler(
     )
 
     session_factory = make_session_factory(engine)
+    _warn_if_stored_guardrails_diverge_from_settings(settings, session_factory)
     charge_rate_table = load_charge_rate_table(settings.charges_path)
     paper_cycle_runner = PaperCycleRunner(
         session_factory=session_factory,
@@ -1282,6 +1438,20 @@ def build_scheduler(
         trigger=CronTrigger(hour=8, minute=45, day_of_week="mon-fri", timezone=IST),
         id="instrument_sync",
         replace_existing=True,
+    )
+    scheduler.add_job(
+        run_session_audit,
+        args=[session_factory, settings],
+        # 15:35 IST: after the 15:30 close and after the 15:15 hard exit, so
+        # every position the day opened has resolved and nothing is still
+        # moving. `misfire_grace_time` is generous because a missed audit is
+        # a missed report — the one thing that must not happen quietly.
+        trigger=CronTrigger(hour=15, minute=35, day_of_week="mon-fri", timezone=IST),
+        id="session_audit",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=30 * 60,
     )
     scheduler.add_job(
         _run_calendar_refresh,

@@ -5,6 +5,8 @@ provably identical for the same `as_of`."""
 from __future__ import annotations
 
 import datetime as dt
+import math
+from decimal import Decimal
 from pathlib import Path
 
 import pandas as pd
@@ -12,6 +14,7 @@ import pytest
 
 from te.data.barstore import BAR_COLUMNS, BarStore
 from te.domain.clock import IST
+from te.domain.symbols import build_option_symbol
 from te.ml.dataset import build_training_set
 from te.ml.featurespec import SECONDARY_V1, FeatureSpec
 
@@ -111,6 +114,35 @@ def test_dte_computed_from_option_symbol_expiry(store: BarStore) -> None:
     as_of = dt.datetime(2026, 6, 20, 10, 0, tzinfo=IST)
     result = build_training_set(as_of, SECONDARY_V1, store, None, instrument=INSTRUMENT)
     assert result["dte"] == 10.0  # expiry 30-Jun-2026, as_of 20-Jun-2026
+
+
+def test_dte_on_an_index_instrument_uses_the_archives_real_historical_expiry_not_todays_weekday(
+    store: BarStore,
+) -> None:
+    """The bug: `_dte`'s fallback (for an INDEX instrument, which carries no
+    expiry of its own) used to resolve every `as_of` against TODAY's expiry
+    weekday table (`te.domain.symbols._WEEKLY_EXPIRY_WEEKDAY`, NIFTY ->
+    Tuesday), even for a firing from BEFORE that regime existed. NIFTY's real
+    weekly expiry on 2024-01-04 was a THURSDAY (the pre Nov-2024/Sep-2025
+    regime) — today's table wrongly resolves `as_of=2024-01-02` (a Tuesday)
+    to dte=0 (that same Tuesday), when the real contract traded until
+    2024-01-04, two days later.
+
+    The archive has a real NIFTY option recorded with that historical
+    2024-01-04 (Thursday) expiry — `_dte` must resolve `dte` from THAT, not
+    from today's calendar.
+    """
+    historical_symbol = build_option_symbol("NIFTY", dt.date(2024, 1, 4), Decimal(21500), "CE")
+    rows = [_bar(historical_symbol, dt.datetime(2024, 1, 2, 10, 0, tzinfo=IST), c=150.0, interval="1m")]
+    store.append(pd.DataFrame(rows, columns=list(BAR_COLUMNS)))
+
+    as_of = dt.datetime(2024, 1, 2, 10, 0, tzinfo=IST)  # a Tuesday
+    result = build_training_set(as_of, SECONDARY_V1, store, None, instrument="NIFTY")
+
+    assert result["dte"] == 2.0, (
+        f"got {result['dte']}: resolved against today's Tuesday expiry table instead of the archive's "
+        "real 2024-01-04 (Thursday) contract"
+    )
 
 
 def test_india_vix_level_is_computed_once_per_feature_row(
@@ -230,6 +262,80 @@ def test_rv_iv_spread_is_a_real_number_for_a_freshly_listed_contract(store: BarS
 
     result = build_training_set(as_of, spec, store, None, instrument=young_contract)
     assert not pd.isna(result["rv_iv_spread"])
+
+
+# ---------------------------------------------------------------------------
+# n=0 / thin-history: NaN ("unknown"), never a fabricated real-looking number
+# ---------------------------------------------------------------------------
+
+
+def test_iv_rank_is_nan_not_a_fabricated_midpoint_on_an_empty_store(tmp_path: Path) -> None:
+    """`honest-metrics`/`no number may be displayed that hasn't been earned`:
+    an empty VIX history must read as `NaN` ("unknown vol regime"), never as
+    `0.5` ("vol is exactly mid-range") — a real-looking value fed straight
+    into the model."""
+    empty_store = BarStore(tmp_path / "empty_bars")
+    as_of = _day(0)
+    spec = FeatureSpec(name="iv-only", version=1, columns=("iv_rank_60d",))
+
+    result = build_training_set(as_of, spec, empty_store, None, instrument=INSTRUMENT)
+
+    assert math.isnan(result["iv_rank_60d"])
+
+
+def test_iv_rank_is_nan_with_only_a_single_close(tmp_path: Path) -> None:
+    """A single VIX close cannot form a percentile rank — must stay `NaN`,
+    never silently rank the one point against itself."""
+    thin_store = BarStore(tmp_path / "thin_bars")
+    thin_store.append(pd.DataFrame([_bar(VIX_SYMBOL, _day(0), c=15.0)], columns=list(BAR_COLUMNS)))
+    as_of = _day(0) + dt.timedelta(hours=6)
+    spec = FeatureSpec(name="iv-only", version=1, columns=("iv_rank_60d",))
+
+    result = build_training_set(as_of, spec, thin_store, None, instrument=INSTRUMENT)
+
+    assert math.isnan(result["iv_rank_60d"])
+
+
+def test_india_vix_level_is_nan_on_an_empty_store(tmp_path: Path) -> None:
+    """No VIX bar recorded yet must read as `NaN`, not a fabricated level."""
+    empty_store = BarStore(tmp_path / "empty_bars")
+    as_of = _day(0)
+    spec = FeatureSpec(name="vix-only", version=1, columns=("india_vix_level",))
+
+    result = build_training_set(as_of, spec, empty_store, None, instrument=INSTRUMENT)
+
+    assert math.isnan(result["india_vix_level"])
+
+
+def test_realized_vol_leg_of_rv_iv_spread_is_nan_with_fewer_than_3_closes(tmp_path: Path) -> None:
+    """`rv_iv_spread`'s realized-vol leg needs >= 3 closes to form even one
+    log return with a defined stdev; below that it must stay `NaN` rather
+    than silently reading as `-vix` (what a fabricated `rv=0.0` would
+    produce)."""
+    thin_store = BarStore(tmp_path / "thin_bars")
+    # VIX has plenty of history (so `iv_proxy` is real); the UNDERLYING has
+    # only 2 closes — one short of `_realized_vol_pct`'s 3-close floor.
+    rows = [_bar(VIX_SYMBOL, _day(i), c=15.0) for i in range(10)]
+    rows += [_bar(UNDERLYING, _day(i), c=24_000.0 + i) for i in range(2)]
+    thin_store.append(pd.DataFrame(rows, columns=list(BAR_COLUMNS)))
+    as_of = _day(9) + dt.timedelta(hours=6)
+    spec = FeatureSpec(name="rv-only", version=1, columns=("rv_iv_spread",))
+
+    result = build_training_set(as_of, spec, thin_store, None, instrument=INSTRUMENT)
+
+    assert math.isnan(result["rv_iv_spread"])
+
+
+def test_rv_iv_spread_is_nan_on_an_entirely_empty_store(tmp_path: Path) -> None:
+    """No bars recorded for either leg: must stay `NaN`, not `-0.0` or any
+    other fabricated value."""
+    empty_store = BarStore(tmp_path / "empty_bars")
+    as_of = _day(0)
+    spec = FeatureSpec(name="rv-only", version=1, columns=("rv_iv_spread",))
+
+    result = build_training_set(as_of, spec, empty_store, None, instrument=INSTRUMENT)
+
+    assert math.isnan(result["rv_iv_spread"])
 
 
 def test_daily_close_lookbacks_yield_the_requested_number_of_trading_closes(store: BarStore) -> None:

@@ -75,29 +75,31 @@ class Settings(BaseSettings):
     paper_cycle_exchange: str = "NFO"
     paper_cycle_strategy: str = "orb"
     paper_cycle_lot_size: int = 65
-    #: Rs 30,000 — the REAL account this will trade, set 2026-08-04. Paper
-    #: trading deliberately runs at the same capital as the live account:
-    #: sized off a larger balance it takes positions that could never be
-    #: reproduced live, and on Rs 30,000 affordability is what rejects most
-    #: signals, so a paper run on anything bigger would not feel the
-    #: constraint that actually governs. Measured the same day: at this
-    #: capital `size_position` rejects roughly 85% of ORB's signals as
-    #: unaffordable — that is the honest picture, not a bug to size around.
-    #: RAISED to Rs 50,000 on 2026-08-05 by the owner. Everything downstream
-    #: is a PERCENTAGE of this number, so the rupee figures move with it and
-    #: the risk shape does not: at this file's own 5% risk default one trade
-    #: risks Rs 1,500 -> Rs 2,500, the position cap stays 50%
-    #: (Rs 15,000 -> Rs 25,000) and the drawdown halt stays 20%
-    #: (Rs 6,000 -> Rs 10,000, measured against PEAK EQUITY, which equals
-    #: capital only at the moment of a re-base). The stop and target are
-    #: percentages of the PREMIUM, not of capital, so they do not move at
-    #: all. `paper_cycle_max_daily_loss_paise` is the one absolute figure —
-    #: see its own comment, which this change forced a re-derivation of.
+    #: A SEED, nothing more: `te.engine.state.guardrails_defaults_from_settings`
+    #: turns this into the default `AccountGuardrails.capital` that
+    #: `get_guardrails` falls back to ONLY when `engine_state` holds no
+    #: `capital_paise` row yet (a brand-new database). Once anything has been
+    #: saved from the dashboard's Account Guardrails card, that stored value
+    #: wins on every read — including every real paper-cycle run
+    #: (`PaperCycleRunner.run_once` rebuilds its config from `get_guardrails`
+    #: fresh each cycle) — and this field, and any `TE_PAPER_CYCLE_CAPITAL_
+    #: PAISE` env var setting it, are both ignored for trading from then on.
+    #: `build_scheduler` logs a WARNING at startup naming both values when
+    #: they diverge, precisely so that divergence is never silent again — it
+    #: previously was: an operator set `TE_PAPER_CYCLE_CAPITAL_PAISE=2000000`
+    #: (Rs 20,000) in `docker-compose.yml` believing it controlled position
+    #: sizing, while a stored Rs 50,000 governed every real cycle.
     #:
-    #: The live DB may hold a different risk percentage than this default;
-    #: `get_guardrails` prefers the stored value, and on 2026-08-05 that was
-    #: 3% (Rs 1,500) against this file's 5%. Read the API, not this line,
-    #: for what is actually in force.
+    #: The live value is NOT this line. Read `GET /api/engine/guardrails`,
+    #: or the dashboard's Settings page, for what is actually in force. This
+    #: default (Rs 50,000) was itself hand-derived from the real account's
+    #: history: originally Rs 30,000 (set 2026-08-04, matching paper trading
+    #: to the live account so `size_position`'s affordability rejections —
+    #: measured that day at ~85% of ORB's signals — reflect the constraint
+    #: that actually governs), raised by the owner on 2026-08-05 to Rs
+    #: 50,000. That history is preserved only as the rationale for THIS
+    #: number as a seed; it says nothing about what a fresh database, or a
+    #: dashboard edit, holds today.
     paper_cycle_capital_paise: int = 5_000_000
     #: Capped by `te.engine.state.MAX_RISK_PER_TRADE_PCT` — see the ceilings
     #: comment there for the risk-of-ruin arithmetic. Shipping a default

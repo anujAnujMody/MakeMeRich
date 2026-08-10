@@ -157,6 +157,40 @@ def test_boot_reconcile_detects_position_mismatch_and_halts(session_factory, sto
         assert is_halted(session) is True
 
 
+def test_a_broker_position_the_engine_never_heard_of_halts(session_factory, store: OrderEventStore) -> None:  # noqa: ANN001
+    """The single case this module exists for, per its own docstring: "a
+    position the broker thinks we hold". An empty local store against a
+    broker-reported position — the local side of the union is empty, so this
+    only reconciles at all if the union includes the BROKER's keys too."""
+    broker = _FakeBroker(
+        position_reports=[PositionReport(symbol="NIFTY", exchange="NFO", quantity=65)],
+    )
+    reconciler = Reconciler(session_factory, store, broker)
+
+    result = reconciler.reconcile("boot")
+
+    assert result.halted is True
+    assert result.position_mismatches == [("NIFTY", 0, 65)]
+    with session_factory() as session:
+        assert is_halted(session) is True
+
+
+def test_a_locally_filled_order_the_broker_does_not_report_halts(session_factory, store: OrderEventStore) -> None:  # noqa: ANN001
+    """The other one-sided case: we hold a locally-filled position and the
+    broker reports nothing for it — `position_reports=[]`. This only
+    reconciles at all if the union includes the LOCAL side's keys too."""
+    _known_filled_order(store, client_order_id="coid-1", symbol="NIFTY", qty=65)
+    broker = _FakeBroker(position_reports=[])
+    reconciler = Reconciler(session_factory, store, broker)
+
+    result = reconciler.reconcile("boot")
+
+    assert result.halted is True
+    assert result.position_mismatches == [("NIFTY", 65, 0)]
+    with session_factory() as session:
+        assert is_halted(session) is True
+
+
 def test_continuous_mode_also_halts(session_factory, store: OrderEventStore) -> None:  # noqa: ANN001
     broker = _FakeBroker(
         order_reports=[

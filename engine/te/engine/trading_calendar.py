@@ -152,10 +152,24 @@ def refresh_calendar(
         return False
 
     calendar = from_holiday_rows(rows)
+    if calendar.dropped_rows:
+        # `te.domain.calendar` is pure and cannot log (see its module
+        # docstring) — this is the wiring layer, so the drop happens here,
+        # loudly, one row at a time. A dropped holiday row is NOT the same
+        # as "not a holiday": silence here would let it masquerade as the
+        # second, exactly the failure `TradingCalendar`'s "Failing safe"
+        # section exists to prevent.
+        for row in calendar.dropped_rows:
+            logger.warning("trading calendar row dropped — could not parse", year=target, row=row)
+        logger.warning(
+            "trading calendar refresh dropped rows",
+            year=target,
+            dropped_count=len(calendar.dropped_rows),
+        )
     with session_scope(session_factory) as session:
         years = sorted(stored_years(session) | {target})
         existing = get_calendar(session)
-        merged = _merge(existing, calendar) if existing.known else calendar
+        merged = _merge(existing, calendar, year=target) if existing.known else calendar
         set_calendar(session, merged, years=years)
 
     logger.info(
@@ -167,20 +181,66 @@ def refresh_calendar(
     return True
 
 
-def _merge(existing: TradingCalendar, fresh: TradingCalendar) -> TradingCalendar:
-    """Union of two calendars — used when a second year is fetched so the
-    engine can answer questions either side of 1 January without a gap. The
-    fresh rows win on conflict, which matters when an exchange revises a
-    holiday date mid-year (it happens; election dates move)."""
+def _merge(existing: TradingCalendar, fresh: TradingCalendar, *, year: int) -> TradingCalendar:
+    """Combines two calendars — used when a second year is fetched so the
+    engine can answer questions either side of 1 January without a gap.
+
+    Within `year`, and only for the exchanges the fresh payload actually
+    reports, that payload is AUTHORITATIVE and replaces what was stored.
+    Every other year, and every exchange the payload says nothing about, is
+    left untouched. All three halves of that are load-bearing:
+
+    * Replacing rather than unioning is what lets a holiday be WITHDRAWN. A
+      union can only ever grow, so a date the exchange later removes from
+      its list could never come back off ours, and the engine would stand
+      down on a real trading day forever.
+    * Scoping the replacement to `year` is what keeps multi-year
+      accumulation working. This function exists precisely so the engine can
+      answer questions either side of 1 January; replacing an exchange's
+      dates outright would make fetching 2027 erase every 2026 holiday, and
+      the engine would then trade straight through them.
+
+    * Restricting it to exchanges present in `fresh.closed` is what stops a
+      partial payload erasing an exchange it never mentioned. In practice
+      `from_holiday_rows` always emits all four `TRADED_EXCHANGES`, so this
+      only bites hand-constructed calendars — but "said nothing" and "said
+      none" are different claims and must not collapse into one.
+
+    `year` is passed in rather than inferred from the fresh calendar's own
+    dates because a payload can legitimately contain none — "this exchange
+    has no holidays in 2027" is a real answer, and it must still be able to
+    clear a stale 2027 entry.
+
+    `special` follows the same rule, which also preserves its per-date
+    overwrite behaviour for a revision inside `year` (it happens; election
+    dates move)."""
     exchanges = set(existing.closed) | set(fresh.closed) | set(existing.special) | set(fresh.special)
     return TradingCalendar(
         known=True,
         closed={
-            exchange: existing.closed.get(exchange, frozenset()) | fresh.closed.get(exchange, frozenset())
+            exchange: (
+                frozenset(
+                    {on for on in existing.closed.get(exchange, frozenset()) if on.year != year}
+                    | set(fresh.closed[exchange])
+                )
+                if exchange in fresh.closed
+                else existing.closed.get(exchange, frozenset())
+            )
             for exchange in exchanges
         },
         special={
-            exchange: {**existing.special.get(exchange, {}), **fresh.special.get(exchange, {})}
+            exchange: (
+                {
+                    **{
+                        on: session
+                        for on, session in existing.special.get(exchange, {}).items()
+                        if on.year != year
+                    },
+                    **fresh.special[exchange],
+                }
+                if exchange in fresh.special
+                else existing.special.get(exchange, {})
+            )
             for exchange in exchanges
         },
     )

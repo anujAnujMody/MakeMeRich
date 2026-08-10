@@ -510,7 +510,14 @@ def run_many(
         day_standdown = dict.fromkeys(strategy_names, False)
 
         as_of = first
-        while as_of <= last:
+        # `<`, not `<=` -- `LAST_ENTRY` IS the live `latest_entry` cutoff
+        # (imported from `te.backtest.replay`), and live refuses an entry at
+        # `now_ist_time >= latest_entry` (`te/engine/cycle.py:441-444`), so
+        # the boundary minute itself must be excluded, not just the minutes
+        # after it. Same fix as `te.backtest.replay._replay_one_day`
+        # (`tests/backtest/test_replay.py::
+        # test_replay_entry_cutoff_boundary_refuses_a_crossing_at_the_cutoff_minute`).
+        while as_of < last:
             ctx.as_of = as_of
             for name in strategy_names:
                 _settle(name, as_of)

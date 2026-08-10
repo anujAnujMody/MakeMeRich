@@ -138,3 +138,59 @@ def test_yesterdays_losses_do_not_carry_into_today(session_factory) -> None:
 
     with session_factory() as session:
         check_consecutive_losses(session, _config(3), on=ON + dt.timedelta(days=1))  # must not raise
+
+
+# --- IST day-boundary edges (`_day_bounds`, via `trades_today`) ----------
+#
+# `test_yesterdays_losses_do_not_carry_into_today` probes a whole day away
+# and pins neither edge of the IST trading day; every other fixture in this
+# file seeds its rows comfortably mid-day (10:00 UTC), which lands inside
+# both the buggy UTC-stamped window and the correct IST one.
+
+
+def test_a_loss_closed_just_after_ist_midnight_counts_for_that_ist_day(session_factory) -> None:
+    """00:05 IST on `ON` == 18:35 UTC on `ON - 1 day` — three straight
+    losses closed there must still trip the stand-down for `ON`."""
+    just_after_ist_midnight = dt.datetime.combine(ON - dt.timedelta(days=1), dt.time(18, 35), tzinfo=dt.UTC)
+    with session_scope(session_factory) as session:
+        for i, net in enumerate((-500, -500, -500)):
+            _trade_at(session, closed_at=just_after_ist_midnight + dt.timedelta(minutes=i), net_paise=net)
+
+    with session_factory() as session, pytest.raises(LimitBreachError):
+        check_consecutive_losses(session, _config(3), on=ON)
+
+
+def test_a_loss_closed_at_ist_market_open_counts_for_that_ist_day(session_factory) -> None:
+    """09:15 IST on `ON` (market open) == 03:45 UTC on `ON`."""
+    market_open = dt.datetime.combine(ON, dt.time(3, 45), tzinfo=dt.UTC)
+    with session_scope(session_factory) as session:
+        for i, net in enumerate((-500, -500, -500)):
+            _trade_at(session, closed_at=market_open + dt.timedelta(minutes=i), net_paise=net)
+
+    with session_factory() as session, pytest.raises(LimitBreachError):
+        check_consecutive_losses(session, _config(3), on=ON)
+
+
+def _trade_at(session: Session, *, closed_at: dt.datetime, net_paise: int) -> None:
+    """Like `_trade` above, but takes an exact `closed_at` instant rather
+    than deriving one from `ON` — needed to pin the IST day-boundary edges
+    precisely."""
+    session.add(
+        TradeRow(
+            client_order_id=f"coid-{closed_at.isoformat()}",
+            symbol="NIFTY30JUL2624500CE",
+            exchange="NFO",
+            strategy="orb",
+            direction="long_call",
+            lots=1,
+            lot_size=65,
+            entry_premium_paise=10_000,
+            exit_premium_paise=10_000 + net_paise,
+            gross_pnl_paise=net_paise,
+            costs_paise=0,
+            net_pnl_paise=net_paise,
+            exit_reason="stop" if net_paise < 0 else "target",
+            opened_at=closed_at - dt.timedelta(minutes=5),
+            closed_at=closed_at,
+        )
+    )

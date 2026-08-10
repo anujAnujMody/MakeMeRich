@@ -47,6 +47,7 @@ from scripts.label_replay_firings import MAX_HOLD, RATES_VERIFIED_FROM, barriers
 from te.data.barstore import BarStore
 from te.data.charges_loader import load_charge_rate_table
 from te.domain.costs import CostModel, select_rates
+from te.engine.scheduler import _exit_geometry
 from te.ml.barriers import ATM_SNAPSHOTS, round_trip_cost_in_index_points
 from te.ml.labeling import label_firings_from_evaluations, parse_breakout
 from te.persistence.db import make_engine, make_session_factory
@@ -89,6 +90,10 @@ def main() -> int:
     store = BarStore(settings.bar_store_path)
     session_factory = make_session_factory(make_engine(settings.database_url))
     cost_model = CostModel(select_rates(load_charge_rate_table(settings.charges_path), dt.date.today()))
+    # The geometry the LIVE engine actually trades, from the one selector
+    # that decides it — never a second copy of its branching.
+    geometry = _exit_geometry(settings)
+    max_lots = settings.paper_cycle_max_lots or 1
 
     # evaluation_id -> range width %, straight from what ORB recorded.
     with session_factory() as session:
@@ -105,7 +110,7 @@ def main() -> int:
     print(f"breakeven win rate on these 2:1 barriers: {BREAKEVEN_WIN_RATE:.1%}\n")
 
     for symbol in chosen:
-        stop, target = barriers(symbol)
+        stop, target = barriers(symbol, geometry=geometry, max_lots=max_lots)
         firings = label_firings_from_evaluations(
             session_factory,
             store,

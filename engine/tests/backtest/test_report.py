@@ -145,6 +145,31 @@ def test_stationary_bootstrap_envelope_rejects_out_of_range_percentile() -> None
         stationary_bootstrap_drawdown_envelope([1, 2, 3], percentiles=(1.5,))
 
 
+def test_stationary_bootstrap_envelope_widens_with_block_length_on_autocorrelated_pnl() -> None:
+    """The block structure is the whole reason the stationary bootstrap
+    exists over a plain iid bootstrap: `restart_probability = 1.0 /
+    expected_block_length` (`te/backtest/report.py:148`) means
+    `expected_block_length=1` degenerates into iid resampling, which
+    destroys the real clustering in this fixture (a 10-trade LOSING streak
+    followed by a 10-trade winning one) by constantly reshuffling
+    individual trades instead of preserving runs. A block length long
+    enough to hold most of the losing streak together (`10`, versus `1`)
+    must produce a materially WORSE (more negative) 95th-percentile
+    envelope, or the bootstrap is not doing anything an iid resample
+    wouldn't."""
+    net_pnls = [-100] * 10 + [100] * 10
+    short_blocks = stationary_bootstrap_drawdown_envelope(
+        net_pnls, n_simulations=3000, expected_block_length=1, seed=7
+    )
+    long_blocks = stationary_bootstrap_drawdown_envelope(
+        net_pnls, n_simulations=3000, expected_block_length=10, seed=7
+    )
+    assert long_blocks[0.95] < short_blocks[0.95], (
+        f"a block length of 10 produced a 95th-percentile envelope of {long_blocks[0.95]}, "
+        f"no worse than block length 1's {short_blocks[0.95]} -- the block structure is not engaging"
+    )
+
+
 def test_stationary_bootstrap_envelope_all_losses_bounds_the_worst_case() -> None:
     net_pnls = [-100] * 10
     envelope = stationary_bootstrap_drawdown_envelope(net_pnls, n_simulations=100, seed=1)

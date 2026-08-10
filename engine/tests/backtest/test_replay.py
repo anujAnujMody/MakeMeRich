@@ -237,6 +237,45 @@ def test_replay_does_not_enter_after_the_hard_exit_time(tmp_path: Path, session_
     assert result.firings == 0, "a post-15:20 crossing became a training sample"
 
 
+def _boundary_store(tmp_path: Path, day: dt.date, *, crossing_minute: int) -> BarStore:
+    """Flat bars through `crossing_minute - 1`, then a clean upside crossing
+    at `crossing_minute` -- so the crossing's decision point (`as_of`, one
+    minute after the crossing bar closes) lands exactly at
+    `_open(day, crossing_minute + 1)`."""
+    store = BarStore(tmp_path / "bars")
+    rows = [_bar(_open(day, m), o=100, h=101, low=99, c=100) for m in range(crossing_minute)]
+    rows.append(_bar(_open(day, crossing_minute), o=100, h=110, low=100, c=109))
+    store.append(pd.DataFrame(rows, columns=list(BAR_COLUMNS)))
+    return store
+
+
+def test_replay_entry_cutoff_boundary_refuses_a_crossing_at_the_cutoff_minute(
+    tmp_path: Path, session_factory  # noqa: ANN001
+) -> None:
+    """Live refuses an entry AT `now_ist_time >= latest_entry`
+    (`te/engine/cycle.py:441-444`) -- the boundary minute itself is refused,
+    not just the minutes after it. `DEFAULT_LAST_ENTRY` (14:35) is minute
+    320 from the 09:15 open, so a crossing whose decision point lands
+    exactly there must produce zero firings, while the same crossing one
+    minute earlier (decision point 14:34) must fire. Neither of the two
+    pre-existing cutoff tests actually exercises this boundary: the constant
+    test never runs the replay loop, and the behavioural test plants its
+    crossing 48 minutes past the cutoff."""
+    day = dt.date(2026, 6, 2)
+
+    at_cutoff = replay_orb(
+        store=_boundary_store(tmp_path, day, crossing_minute=319),
+        session_factory=session_factory, instruments={SYMBOL: EXCHANGE}, start=day, end=day,
+    )
+    assert at_cutoff.firings == 0, "a crossing whose decision point is exactly the cutoff minute still fired"
+
+    just_before_cutoff = replay_orb(
+        store=_boundary_store(tmp_path, day, crossing_minute=318),
+        session_factory=session_factory, instruments={SYMBOL: EXCHANGE}, start=day, end=day,
+    )
+    assert just_before_cutoff.firings == 1, "a crossing one minute before the cutoff should still fire"
+
+
 def test_the_opening_range_length_actually_reaches_the_rule(tmp_path: Path, session_factory) -> None:  # noqa: ANN001
     """`replay_orb(opening_range_minutes=...)` alone only moves the first
     evaluable minute — the rule is built by the registry with its DEFAULT

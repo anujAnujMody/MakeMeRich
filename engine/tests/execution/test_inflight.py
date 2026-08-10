@@ -96,8 +96,74 @@ def test_match_pending_order_matches_unique_candidate() -> None:
     assert match.venue_order_id == "v-1"
 
 
+def test_match_pending_order_accepts_exactly_at_the_window_boundary() -> None:
+    """A candidate exactly `window` away must still match — the guard is
+    `<= window`, not `< window`. A `<=` -> `<` flip would reject the exact
+    boundary with the same (silent) `None` as a genuinely-outside-window
+    candidate, and no existing test (which only probes 1s inside / 30s
+    outside a 5s window) would notice."""
+    candidates = [_report(ts=TS + dt.timedelta(seconds=5))]
+    match = match_pending_order(
+        candidates,
+        symbol="NIFTY30JUN2626500CE",
+        side="BUY",
+        quantity=65,
+        submitted_at=TS,
+        window=dt.timedelta(seconds=5),
+    )
+    assert match is not None
+    assert match.venue_order_id == "v-1"
+
+
 def test_match_pending_order_rejects_outside_window() -> None:
     candidates = [_report(ts=TS + dt.timedelta(seconds=30))]
+    match = match_pending_order(
+        candidates,
+        symbol="NIFTY30JUN2626500CE",
+        side="BUY",
+        quantity=65,
+        submitted_at=TS,
+        window=dt.timedelta(seconds=5),
+    )
+    assert match is None
+
+
+def test_match_pending_order_rejects_wrong_symbol() -> None:
+    """A candidate inside the window that differs ONLY in symbol must not
+    match — otherwise an in-flight order resolves against an unrelated
+    contract placed in the same 5-second window."""
+    candidates = [_report(symbol="BANKNIFTY30JUN2652500CE", ts=TS + dt.timedelta(seconds=1))]
+    match = match_pending_order(
+        candidates,
+        symbol="NIFTY30JUN2626500CE",
+        side="BUY",
+        quantity=65,
+        submitted_at=TS,
+        window=dt.timedelta(seconds=5),
+    )
+    assert match is None
+
+
+def test_match_pending_order_rejects_wrong_side() -> None:
+    """A candidate inside the window that differs ONLY in side must not
+    match — otherwise a BUY resolves against an unrelated SELL."""
+    candidates = [_report(side="SELL", ts=TS + dt.timedelta(seconds=1))]
+    match = match_pending_order(
+        candidates,
+        symbol="NIFTY30JUN2626500CE",
+        side="BUY",
+        quantity=65,
+        submitted_at=TS,
+        window=dt.timedelta(seconds=5),
+    )
+    assert match is None
+
+
+def test_match_pending_order_rejects_wrong_quantity() -> None:
+    """A candidate inside the window that differs ONLY in quantity must not
+    match — otherwise a 65-lot order resolves against an unrelated 195-lot
+    order."""
+    candidates = [_report(quantity=195, ts=TS + dt.timedelta(seconds=1))]
     match = match_pending_order(
         candidates,
         symbol="NIFTY30JUN2626500CE",

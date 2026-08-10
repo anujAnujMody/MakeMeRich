@@ -174,6 +174,51 @@ def test_guardrails_get_returns_env_defaults_when_unset(isolated_client) -> None
     assert body["maxTradesPerDay"] > 0
 
 
+def test_guardrails_get_reports_seed_provenance_when_nothing_saved(isolated_client) -> None:  # noqa: ANN001
+    """Every field is env/settings-seeded on a fresh DB — the exact case
+    where a `TE_PAPER_CYCLE_*` env var still governs, and the dashboard must
+    be able to show that."""
+    client, _sf = isolated_client
+    body = client.get("/api/engine/guardrails").json()
+    assert body["provenance"] == {
+        "capitalRupees": "seed",
+        "maxDailyLossRupees": "seed",
+        "maxPositionSizePct": "seed",
+        "maxDrawdownPct": "seed",
+        "maxTradesPerDay": "seed",
+        "maxConcurrentPositions": "seed",
+        "riskPerTradePct": "seed",
+    }
+
+
+def test_guardrails_get_reports_stored_provenance_after_a_save(isolated_client) -> None:  # noqa: ANN001
+    """After a dashboard save, the corresponding `TE_PAPER_CYCLE_*` env var
+    is silently ignored for trading from then on — the API must say so."""
+    client, _sf = isolated_client
+    payload = {
+        "capitalRupees": 30000,
+        "maxDailyLossRupees": 1500,
+        "maxPositionSizePct": 25,
+        "maxDrawdownPct": 10,
+        "maxTradesPerDay": 5,
+        "maxConcurrentPositions": 2,
+        "riskPerTradePct": 1.5,
+    }
+    put_response = client.put("/api/engine/guardrails", json=payload)
+    assert put_response.json()["provenance"] == {
+        "capitalRupees": "stored",
+        "maxDailyLossRupees": "stored",
+        "maxPositionSizePct": "stored",
+        "maxDrawdownPct": "stored",
+        "maxTradesPerDay": "stored",
+        "maxConcurrentPositions": "stored",
+        "riskPerTradePct": "stored",
+    }
+
+    get_response = client.get("/api/engine/guardrails")
+    assert get_response.json()["provenance"] == put_response.json()["provenance"]
+
+
 def test_guardrails_put_then_get_round_trips(isolated_client) -> None:  # noqa: ANN001
     client, _sf = isolated_client
     payload = {

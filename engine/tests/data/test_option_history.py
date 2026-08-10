@@ -146,6 +146,46 @@ def test_reloading_the_same_archive_writes_nothing_twice(archive: Path, store: B
     assert len(df) == 3
 
 
+def test_spot_cutoff_loads_the_index_series_idempotently(archive: Path, store: BarStore) -> None:
+    """`spot_cutoff` is passed by exactly one real caller
+    (`scripts/load_option_history.py`) and reached by no other test in this
+    file — every other test omits it, which routes `nifty_spot.csv` down the
+    "not a contract, skip" branch and never exercises `_spot_frame` or its
+    per-`(base, expiry)` idempotency guard at all.
+
+    The archive fixture's two expiries each carry their own `nifty_spot.csv`
+    (3 rows apiece, non-overlapping calendar days), so a `spot_cutoff` after
+    both must load 6 NIFTY index bars — and a second, identical load must
+    still find exactly 6, not 12. Consecutive expiries' spot files overlap in
+    the real archive; without per-file idempotency the same index minute
+    would be appended once per expiry that mentions it, landing twice in one
+    ORB opening range from an append-only store nothing can de-duplicate
+    afterward."""
+    cutoff = dt.date(2026, 5, 5)
+
+    first = load_option_history(archive, store, spot_cutoff=cutoff)
+    assert first.bars_written == 9 + 6  # 9 option bars (as in the no-cutoff case) + 6 spot bars
+
+    df = store.read(
+        "NIFTY",
+        dt.datetime(2020, 1, 1, tzinfo=dt.UTC),
+        dt.datetime(2030, 1, 1, tzinfo=dt.UTC),
+        "1m",
+    )
+    assert len(df) == 6
+
+    second = load_option_history(archive, store, spot_cutoff=cutoff)
+    assert second.bars_written == 0, "a re-run of the backfill must not duplicate the index series"
+
+    df_again = store.read(
+        "NIFTY",
+        dt.datetime(2020, 1, 1, tzinfo=dt.UTC),
+        dt.datetime(2030, 1, 1, tzinfo=dt.UTC),
+        "1m",
+    )
+    assert len(df_again) == 6, "reloading the same archive must not double the NIFTY partition"
+
+
 def test_resumes_after_a_partial_load(archive: Path, store: BarStore) -> None:
     """A crash mid-archive must leave the completed contracts recorded, so a
     re-run costs only the unfinished ones."""
