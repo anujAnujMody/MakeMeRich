@@ -20,6 +20,16 @@ opencode.json
 db/
 log/
 
+# OpenAlgo's Python Strategy Management folder. `docker-compose.yml` mounts
+# `./strategies` into the OpenAlgo container, whose `blueprints/python_strategy.py`
+# writes `strategies/strategy_configs.json` on start. Nothing of OURS lives here
+# any more — the legacy pre-rewrite `strategies` package was deleted on
+# 2026-08-10 (the engine's strategy on/off switches live in SQLite, see
+# `te/engine/strategy_config.py`). The directory must still EXIST as the bind
+# mount point, so keep ignoring its contents rather than deleting it.
+# ANCHORED — see the `/data/` note below for what a bare rule costs.
+/strategies/
+
 # Python build/test artifacts.
 .pytest_cache/
 .coverage

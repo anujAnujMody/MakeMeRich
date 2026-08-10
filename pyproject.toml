@@ -1,5 +1,9 @@
-[tool.pytest.ini_options]
-testpaths = ["tests"]
+# No `[tool.pytest.ini_options]` here on purpose. It used to say
+# `testpaths = ["tests"]`, pointing at the pre-rewrite suite deleted on
+# 2026-08-10. The real suite is `engine/tests`, configured by
+# `engine/pyproject.toml` and run from `engine/`. A root-level testpaths
+# entry pointing at a directory that no longer exists makes a bare `pytest`
+# here collect nothing and exit 5, which reads like "no tests failed".
 
 [tool.mypy]
 python_version = "3.11"
