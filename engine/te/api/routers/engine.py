@@ -23,6 +23,7 @@ from te.engine.state import (
     InstrumentSelection,
     get_capital_set_at,
     get_guardrails,
+    get_guardrails_provenance,
     get_instrument_selections,
     get_peak_equity_paise,
     get_run_state,
@@ -234,15 +235,36 @@ def relogin_broker(request: Request, response: Response) -> ReloginResponse:
     return ReloginResponse(success=result.ok, stage=result.stage, message=result.message)
 
 
+#: `AccountGuardrails`/`get_guardrails_provenance` field name -> this
+#: payload's camelCase field name — the one place that mapping is spelled
+#: out, so `get_account_guardrails` and any future caller can't drift.
+_GUARDRAIL_FIELD_TO_PAYLOAD_KEY: dict[str, str] = {
+    "capital": "capitalRupees",
+    "max_daily_loss": "maxDailyLossRupees",
+    "max_position_size_pct": "maxPositionSizePct",
+    "max_drawdown_pct": "maxDrawdownPct",
+    "max_trades_per_day": "maxTradesPerDay",
+    "max_concurrent_positions": "maxConcurrentPositions",
+    "risk_per_trade_pct": "riskPerTradePct",
+}
+
+
 @router.get("/guardrails", response_model=AccountGuardrailsPayload)
 def get_account_guardrails(response: Response) -> AccountGuardrailsPayload:
     """Live account guardrails (capital, risk limits) — `PaperCycleRunner`
     reads the exact same `get_guardrails` call on every cycle (see
     `te.engine.scheduler`), so what this shows is what's actually in effect,
     not a second copy that can drift. Falls back to `Settings.paper_cycle_*`
-    env-var defaults when nothing has been saved yet."""
+    env-var defaults when nothing has been saved yet — `provenance` says,
+    per field, whether that fallback is what's showing (`"seed"`) or a real
+    dashboard-saved value is (`"stored"`). Only `"stored"` is what an
+    operator changing the corresponding `TE_PAPER_CYCLE_*` env var can
+    actually expect to see reflected here; a `"seed"` field is what that env
+    var currently controls, and stops being so the moment anything on this
+    card is saved."""
     with session_factory() as session:
         guardrails = get_guardrails(session, defaults=guardrails_defaults_from_settings(settings))
+        provenance_by_field = get_guardrails_provenance(session)
     set_provenance(response, provenance="paper", sample_size=1)
     return AccountGuardrailsPayload(
         capitalRupees=float(rupees(guardrails.capital)),
@@ -252,6 +274,9 @@ def get_account_guardrails(response: Response) -> AccountGuardrailsPayload:
         maxTradesPerDay=guardrails.max_trades_per_day,
         maxConcurrentPositions=guardrails.max_concurrent_positions,
         riskPerTradePct=float(guardrails.risk_per_trade_pct),
+        provenance={
+            _GUARDRAIL_FIELD_TO_PAYLOAD_KEY[field_name]: source for field_name, source in provenance_by_field.items()
+        },
     )
 
 

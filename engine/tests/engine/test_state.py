@@ -110,6 +110,47 @@ def test_guardrails_round_trip(session_factory) -> None:  # noqa: ANN001
         assert get_guardrails(session, defaults=_DEFAULTS) == changed
 
 
+def test_guardrails_provenance_is_seed_for_every_field_on_a_fresh_db(session_factory) -> None:  # noqa: ANN001
+    from te.engine.state import get_guardrails_provenance
+
+    with session_factory() as session:
+        provenance = get_guardrails_provenance(session)
+
+    assert provenance == {
+        "capital": "seed",
+        "max_daily_loss": "seed",
+        "max_position_size_pct": "seed",
+        "max_drawdown_pct": "seed",
+        "max_trades_per_day": "seed",
+        "max_concurrent_positions": "seed",
+        "risk_per_trade_pct": "seed",
+    }
+
+
+def test_guardrails_provenance_is_stored_once_saved(session_factory) -> None:  # noqa: ANN001
+    """The exact case the API must surface: a dashboard save makes the
+    stored value authoritative, and any settings/env default for the same
+    field is from then on ignored for trading."""
+    from te.engine.state import get_guardrails_provenance
+
+    with session_factory() as session:
+        set_guardrails(session, _DEFAULTS)
+        session.commit()
+
+    with session_factory() as session:
+        provenance = get_guardrails_provenance(session)
+
+    assert provenance == {
+        "capital": "stored",
+        "max_daily_loss": "stored",
+        "max_position_size_pct": "stored",
+        "max_drawdown_pct": "stored",
+        "max_trades_per_day": "stored",
+        "max_concurrent_positions": "stored",
+        "risk_per_trade_pct": "stored",
+    }
+
+
 def test_lowering_capital_clears_the_peak_equity_watermark(session_factory) -> None:  # noqa: ANN001
     """Regression, found by review: `te.risk.limits.check_max_drawdown`'s
     peak-equity watermark tracks capital + P&L. Editing capital down with

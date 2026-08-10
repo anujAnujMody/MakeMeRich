@@ -276,6 +276,104 @@ def test_paper_cycle_job_not_registered_when_disabled(tmp_path: Path) -> None:
     engine.dispose()
 
 
+def test_build_scheduler_stored_guardrail_capital_wins_over_settings(tmp_path: Path) -> None:
+    """`PaperCycleRunner.run_once` always prefers the DB-stored guardrail
+    over `Settings.paper_cycle_*` (see `get_guardrails`). Confirmed live:
+    `TE_PAPER_CYCLE_CAPITAL_PAISE` set to Rs 20,000 in `docker-compose.yml`
+    while a stored Rs 50,000 governed every real cycle. This asserts the
+    stored value is what a freshly built runner's config would actually
+    carry, not the settings/env default."""
+    db_path = tmp_path / "guardrails.db"
+    engine = make_engine(f"sqlite:///{db_path}")
+    Base.metadata.create_all(engine)
+    session_factory = make_session_factory(engine)
+    with session_factory() as session:
+        set_guardrails(
+            session,
+            AccountGuardrails(
+                capital=Paise(5_000_000),
+                max_daily_loss=Paise(100_000),
+                max_position_size_pct=Decimal(25),
+                max_drawdown_pct=Decimal(15),
+                max_trades_per_day=20,
+                max_concurrent_positions=5,
+                risk_per_trade_pct=Decimal(1),
+            ),
+        )
+        session.commit()
+    engine.dispose()
+
+    settings = _settings(paper_cycle_capital_paise=2_000_000)
+    engine = create_engine(f"sqlite:///{db_path}")
+    _scheduler, _supervisor, runner = build_scheduler(settings, engine=engine, bar_store=BarStore(tmp_path))
+
+    with runner.session_factory() as session:
+        from te.engine.state import get_guardrails, guardrails_defaults_from_settings
+
+        guardrails = get_guardrails(session, defaults=guardrails_defaults_from_settings(settings))
+    assert guardrails.capital == Paise(5_000_000)
+    engine.dispose()
+
+
+def test_build_scheduler_warns_when_stored_capital_diverges_from_settings(tmp_path: Path) -> None:
+    """Regression for the invisible-decoy bug: an operator setting
+    `TE_PAPER_CYCLE_CAPITAL_PAISE` believing it controls position sizing gets
+    no signal that a stored guardrail overrides it. `build_scheduler` must
+    name both values and say explicitly that the stored one governs."""
+    from structlog.testing import capture_logs
+
+    db_path = tmp_path / "guardrails_warn.db"
+    engine = make_engine(f"sqlite:///{db_path}")
+    Base.metadata.create_all(engine)
+    session_factory = make_session_factory(engine)
+    with session_factory() as session:
+        set_guardrails(
+            session,
+            AccountGuardrails(
+                capital=Paise(5_000_000),
+                max_daily_loss=Paise(100_000),
+                max_position_size_pct=Decimal(25),
+                max_drawdown_pct=Decimal(15),
+                max_trades_per_day=20,
+                max_concurrent_positions=5,
+                risk_per_trade_pct=Decimal(1),
+            ),
+        )
+        session.commit()
+    engine.dispose()
+
+    settings = _settings(paper_cycle_capital_paise=2_000_000)
+    engine = create_engine(f"sqlite:///{db_path}")
+    with capture_logs() as logs:
+        build_scheduler(settings, engine=engine, bar_store=BarStore(tmp_path))
+    engine.dispose()
+
+    mismatch_logs = [e for e in logs if e.get("guardrail") == "capital"]
+    assert len(mismatch_logs) == 1
+    entry = mismatch_logs[0]
+    assert entry["log_level"] == "warning"
+    assert entry["settings_value"] == str(2_000_000)
+    assert entry["stored_value"] == str(5_000_000)
+    assert entry["env_var"] == "TE_PAPER_CYCLE_CAPITAL_PAISE"
+    assert "stored" in entry["event"].lower()
+    assert "env var" in entry["event"].lower()
+
+
+def test_build_scheduler_does_not_warn_when_stored_guardrails_match_settings(tmp_path: Path) -> None:
+    """No mismatch, no noise — a warning that fires on every boot regardless
+    of the actual values is not a check anyone will keep reading."""
+    from structlog.testing import capture_logs
+
+    settings = _settings()
+    engine = create_engine("sqlite:///:memory:")
+    with capture_logs() as logs:
+        build_scheduler(settings, engine=engine, bar_store=BarStore(tmp_path))
+    engine.dispose()
+
+    mismatch_logs = [e for e in logs if e.get("guardrail") is not None]
+    assert mismatch_logs == []
+
+
 def test_ws_recorder_supervisor_start_stop_lifecycle(tmp_path: Path) -> None:
     store = BarStore(tmp_path)
     recorder = BarRecorder(store)

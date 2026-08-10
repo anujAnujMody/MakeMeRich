@@ -10,6 +10,8 @@ on the frozen contract, e.g. `Trade.pnl`), `te.engine.state.AccountGuardrails`
 stays in `Paise` (matches `te.domain.money`'s money-typing rule) — one
 conversion point, not scattered across the router."""
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -21,6 +23,18 @@ class AccountGuardrailsPayload(BaseModel):
     maxTradesPerDay: int = Field(gt=0)
     maxConcurrentPositions: int = Field(gt=0)
     riskPerTradePct: float = Field(gt=0, le=100)
+    #: ADDITIVE ONLY — never rename/remove a field above, that is the frozen
+    #: contract this schema's module docstring describes. Per-field
+    #: `"stored"`/`"seed"` provenance (see `te.engine.state.
+    #: get_guardrails_provenance`): `"stored"` means the dashboard-saved
+    #: value governs live trading; `"seed"` means no row exists yet and the
+    #: value shown is `Settings.paper_cycle_*`-derived and WILL be silently
+    #: overridden the moment anything on this card is saved. Keyed by this
+    #: same payload's field names. `PUT` does not accept or use this field —
+    #: it is response-only, so echoing the request body back verbatim (as
+    #: `put_account_guardrails` already does via `get_account_guardrails`)
+    #: still reports the post-write truth, not a stale echo.
+    provenance: dict[str, Literal["stored", "seed"]] = Field(default_factory=dict)
 
 
 class InstrumentSelectionPayload(BaseModel):

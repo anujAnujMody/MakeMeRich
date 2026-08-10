@@ -87,10 +87,11 @@ from te.domain.symbols import FNO_UNDERLYING_EXCHANGES, build_future_symbol, nex
 from te.engine.contract import UNDERLYING_INDEX_EXCHANGES, ContractResolver, OptionContractResolver
 from te.engine.cycle import CycleConfig, InstrumentConfig, run_entry_cycle, run_exit_cycle
 from te.engine.state import (
+    clamp_guardrails,
     get_capital_set_at,
-    get_last_broker_relogin_day,
     get_guardrails,
     get_instrument_selections,
+    get_last_broker_relogin_day,
     get_mode,
     get_run_state,
     guardrails_defaults_from_settings,
@@ -1218,6 +1219,62 @@ class PaperCycleRunner:
         logger.debug("paper cycle ran", as_of=as_of.isoformat(), halted=halted, paused=paused)
 
 
+#: Which `AccountGuardrails` fields actually have a `Settings.paper_cycle_*`
+#: env var backing them, and that var's name. `max_position_size_pct`/
+#: `max_drawdown_pct` are deliberately excluded: they have no env-var
+#: equivalent at all (`guardrails_defaults_from_settings` seeds both from the
+#: hard ceiling, not from `settings`), so a stored value differing from that
+#: ceiling is not an ignored env var and must not be reported as one.
+_GUARDRAIL_ENV_VARS: tuple[tuple[str, str], ...] = (
+    ("capital", "TE_PAPER_CYCLE_CAPITAL_PAISE"),
+    ("max_daily_loss", "TE_PAPER_CYCLE_MAX_DAILY_LOSS_PAISE"),
+    ("max_trades_per_day", "TE_PAPER_CYCLE_MAX_TRADES_PER_DAY"),
+    ("max_concurrent_positions", "TE_PAPER_CYCLE_MAX_CONCURRENT_POSITIONS"),
+    ("risk_per_trade_pct", "TE_PAPER_CYCLE_RISK_BUDGET_PCT"),
+)
+
+
+def _warn_if_stored_guardrails_diverge_from_settings(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """`PaperCycleRunner.run_once` (and every guardrails read in this
+    module) always prefers the DB-stored guardrail over `Settings.
+    paper_cycle_*` — see `get_guardrails`. Once ANYTHING has been saved from
+    the dashboard, the corresponding `TE_PAPER_CYCLE_*` env var is silently
+    ignored for trading: it only ever seeds a brand-new database (see
+    `guardrails_defaults_from_settings`). Confirmed live:
+    `TE_PAPER_CYCLE_CAPITAL_PAISE` was set to Rs 20,000 in
+    `docker-compose.yml` while a stored Rs 50,000 governed every real paper
+    cycle, and nothing said so.
+
+    Runs once at scheduler build time (process startup), not per-cycle —
+    this is a boot-time loud-and-clear check for an operator reading logs,
+    not a repeating one. A missing `engine_state` table (a brand-new DB
+    before the API's `create_all` has run) is treated the same way
+    `relogin_catchup_due` treats it: skip silently, never crash the boot.
+    """
+    try:
+        with session_factory() as session:
+            stored = get_guardrails(session, defaults=guardrails_defaults_from_settings(settings))
+    except OperationalError:
+        logger.warning("engine_state is not queryable yet — skipping the startup guardrails mismatch check")
+        return
+
+    seeded = clamp_guardrails(guardrails_defaults_from_settings(settings))
+    for field_name, env_var in _GUARDRAIL_ENV_VARS:
+        stored_value = getattr(stored, field_name)
+        seeded_value = getattr(seeded, field_name)
+        if stored_value != seeded_value:
+            logger.warning(
+                f"guardrail mismatch at startup: the STORED value governs live trading, the {env_var} env var "
+                "does not — it only seeds a brand-new database",
+                guardrail=field_name,
+                env_var=env_var,
+                settings_value=str(seeded_value),
+                stored_value=str(stored_value),
+            )
+
+
 def build_scheduler(
     settings: Settings,
     *,
@@ -1259,6 +1316,7 @@ def build_scheduler(
     )
 
     session_factory = make_session_factory(engine)
+    _warn_if_stored_guardrails_diverge_from_settings(settings, session_factory)
     charge_rate_table = load_charge_rate_table(settings.charges_path)
     paper_cycle_runner = PaperCycleRunner(
         session_factory=session_factory,
